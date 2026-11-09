@@ -1,10 +1,12 @@
-//! `stonewave`: prototype of the Stonewave server CLI.
+//! `stonewave`: the Stonewave server CLI, early build.
 //!
-//! This build shows the look only: the banner, the sign-in screen, the key
-//! check, the setup progress, status and revoke. It changes nothing on the
-//! machine: no users, no files, no services, no network. See `README.md`.
+//! `doctor` is real and read only: it checks whether this server can be
+//! connected to Wave. `connect`, `status` and `revoke` are demos of the look:
+//! they change nothing on the machine (no users, no files, no services, no
+//! network). See `README.md`.
 
 mod banner;
+mod doctor;
 mod flow;
 mod style;
 mod term;
@@ -22,6 +24,7 @@ enum Command {
     Status,
     Revoke,
     Banner,
+    Doctor,
     Help,
     Version,
 }
@@ -34,18 +37,22 @@ struct Args {
     os: Option<String>,
     user: Option<String>,
     seed: Option<u64>,
+    /// `--json`: machine-readable output (doctor only), for agents.
+    json: bool,
 }
 
 const HELP: &str = "\
 Usage: stonewave [command] [options]
 
 Commands:
-  connect        Connect this server to Wave (default)
-  status         Connection, agent rights and health
-  revoke         Revoke all agent access on this server
+  doctor         Check whether this server can be connected (real, read only)
+  connect        Connect this server to Wave (default; demo, changes nothing)
+  status         Connection, agent rights and health (demo)
+  revoke         Revoke all agent access on this server (demo)
   banner         Play the banner
 
 Options:
+  --json         doctor: print one JSON object instead of the screen (for agents)
   --no-anim      Final states only (also NO_COLOR, STONEWAVE_NO_ANIM=1, TERM=dumb, pipes)
   --host <name>  Demo: host name to show
   --os <name>    Demo: OS to show
@@ -69,6 +76,7 @@ fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
         os: None,
         user: None,
         seed: None,
+        json: false,
     };
     let mut command_set = false;
     let mut it = raw.into_iter();
@@ -88,6 +96,7 @@ fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "-h" | "--help" | "help" => args.command = Command::Help,
             "-V" | "--version" => args.command = Command::Version,
             "--no-anim" => args.term.no_anim = true,
+            "--json" => args.json = true,
             "--autoplay" => args.term.autoplay = true,
             "--live" => args.term.force_live = true,
             "--record" => args.term.record = Some(value("--record")?.into()),
@@ -115,12 +124,21 @@ fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
                     "status" => Command::Status,
                     "revoke" => Command::Revoke,
                     "banner" => Command::Banner,
+                    "doctor" => Command::Doctor,
                     other => return Err(format!("unknown command {other}")),
                 };
                 command_set = true;
             }
             extra => return Err(format!("unexpected argument {extra}")),
         }
+    }
+    if args.json
+        && !matches!(
+            args.command,
+            Command::Doctor | Command::Help | Command::Version
+        )
+    {
+        return Err("--json only works with doctor".into());
     }
     Ok(args)
 }
@@ -135,13 +153,25 @@ fn main() -> ExitCode {
     };
     match args.command {
         Command::Help => {
-            println!("stonewave {VERSION} · prototype: shows the look only, changes nothing\n");
+            println!(
+                "stonewave {VERSION} · early build: doctor is real and read only, the rest is a demo that changes nothing\n"
+            );
             print!("{HELP}");
             return ExitCode::SUCCESS;
         }
         Command::Version => {
-            println!("stonewave {VERSION} (prototype)");
+            println!("stonewave {VERSION} (early build)");
             return ExitCode::SUCCESS;
+        }
+        Command::Doctor if args.json => {
+            let host = flow::Host::detect(args.host, args.os, args.user);
+            let checks = doctor::run_all(&doctor::SYSTEM);
+            println!("{}", doctor::to_json(&host.name, &checks));
+            return if doctor::passed(&checks) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            };
         }
         _ => {}
     }
@@ -161,6 +191,7 @@ fn main() -> ExitCode {
         Command::Status => flow::status(&mut term, &host),
         Command::Revoke => flow::revoke(&mut term, &host),
         Command::Banner => flow::banner_only(&mut term),
+        Command::Doctor => flow::doctor(&mut term, &host),
         Command::Help | Command::Version => unreachable!("handled above"),
     };
     // Restore the terminal (cursor, colours, raw mode) before any final message.
@@ -218,6 +249,15 @@ mod tests {
         assert!(p(&["status", "revoke"]).is_err());
         assert!(p(&["--width", "wide"]).is_err());
         assert!(p(&["deploy"]).is_err());
+    }
+
+    #[test]
+    fn json_only_for_doctor() {
+        let a = p(&["doctor", "--json"]).unwrap();
+        assert_eq!(a.command, Command::Doctor);
+        assert!(a.json);
+        assert!(p(&["status", "--json"]).is_err());
+        assert!(p(&["--json"]).is_err());
     }
 
     #[test]

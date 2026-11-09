@@ -176,7 +176,7 @@ impl Recorder {
     }
 }
 
-fn json_escape(s: &str) -> String {
+pub fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 16);
     for c in s.chars() {
         match c {

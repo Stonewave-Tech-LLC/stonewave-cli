@@ -91,12 +91,7 @@ fn read_os() -> String {
 }
 
 fn parse_os_release(text: &str) -> Option<String> {
-    let field = |key: &str| {
-        text.lines()
-            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
-            .map(|v| v.trim().trim_matches('"').to_owned())
-            .filter(|v| !v.is_empty())
-    };
+    let field = |key| crate::doctor::os_release_field(text, key);
     match (field("NAME"), field("VERSION_ID")) {
         (Some(n), Some(v)) => Some(format!("{n} {v}")),
         (Some(n), None) => Some(n),
@@ -716,6 +711,22 @@ pub fn revoke(term: &mut Term, host: &Host) -> Result<Outcome> {
     ));
     term.flush()?;
     Ok(Outcome::Done)
+}
+
+// ---------------------------------------------------------------- doctor
+
+/// `stonewave doctor`: the real, read-only checks, with the compact header.
+pub fn doctor(term: &mut Term, host: &Host) -> Result<Outcome> {
+    let m = term.mode();
+    term.blank();
+    term.line(&banner::compact(m, &host.name));
+    let checks = crate::doctor::show(term, &host.name, &crate::doctor::SYSTEM)?;
+    crate::doctor::verdict(term, &checks)?;
+    Ok(if crate::doctor::passed(&checks) {
+        Outcome::Done
+    } else {
+        Outcome::Declined
+    })
 }
 
 // ---------------------------------------------------------------- banner
