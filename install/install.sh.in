@@ -1,0 +1,85 @@
+#!/bin/sh
+# Stonewave CLI installer, version @VERSION@.
+#
+# Short on purpose, so you can read it before running it. It:
+#   1. picks the file for this CPU (x86_64 or aarch64),
+#   2. downloads it over HTTPS,
+#   3. checks its SHA-256 against the value written below (nothing is installed on a mismatch),
+#   4. installs it as /usr/local/bin/stonewave,
+#   5. runs `stonewave doctor` (read only).
+#
+# Options:
+#   --dry-run      check everything, install nothing (works without root)
+#   --from FILE    use a local file instead of downloading (still checked)
+set -eu
+
+VERSION="@VERSION@"
+BASE="https://stonewavetech.com/install/$VERSION"
+SHA256_X86_64="@SHA256_X86_64@"
+SHA256_AARCH64="@SHA256_AARCH64@"
+TARGET=/usr/local/bin/stonewave
+
+say() { printf '  %s\n' "$*"; }
+fail() {
+    printf '  stonewave install: %s\n' "$*" >&2
+    exit 1
+}
+
+dry_run=no
+from=
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --dry-run) dry_run=yes ;;
+    --from)
+        [ $# -ge 2 ] || fail "--from needs a file"
+        from=$2
+        shift
+        ;;
+    *) fail "unknown option: $1" ;;
+    esac
+    shift
+done
+
+[ "$(uname -s)" = Linux ] || fail "Linux only"
+case "$(uname -m)" in
+x86_64 | amd64) arch=x86_64 want=$SHA256_X86_64 ;;
+aarch64 | arm64) arch=aarch64 want=$SHA256_AARCH64 ;;
+*) fail "unsupported CPU: $(uname -m)" ;;
+esac
+if [ "$dry_run" = no ] && [ "$(id -u)" -ne 0 ]; then
+    fail "run as root: sudo sh install.sh (or --dry-run to only check)"
+fi
+command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is missing"
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT INT TERM
+
+if [ -n "$from" ]; then
+    cp "$from" "$tmp/stonewave" || fail "cannot read $from"
+else
+    url="$BASE/stonewave-$arch-linux"
+    say "downloading stonewave $VERSION for $arch"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --proto '=https' --tlsv1.2 -o "$tmp/stonewave" "$url" || fail "download failed: $url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --https-only -O "$tmp/stonewave" "$url" || fail "download failed: $url"
+    else
+        fail "needs curl or wget"
+    fi
+fi
+
+got=$(sha256sum "$tmp/stonewave" | cut -d' ' -f1)
+say "sha256    $got"
+say "expected  $want"
+[ "$got" = "$want" ] || fail "checksum does not match. Nothing was installed."
+say "checksum ok"
+
+if [ "$dry_run" = yes ]; then
+    say "dry run: would install $TARGET"
+    exit 0
+fi
+
+install -m 0755 "$tmp/stonewave" "$TARGET.new"
+mv -f "$TARGET.new" "$TARGET"
+say "installed $TARGET"
+exec "$TARGET" doctor
