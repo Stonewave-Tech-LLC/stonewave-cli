@@ -52,7 +52,8 @@ fi
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is missing"
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT INT TERM
+trap 'rm -rf "$tmp"' EXIT
+trap 'rm -rf "$tmp"; exit 130' INT TERM
 
 if [ -n "$from" ]; then
     cp "$from" "$tmp/stonewave" || fail "cannot read $from"
@@ -82,4 +83,7 @@ fi
 install -m 0755 "$tmp/stonewave" "$TARGET.new"
 mv -f "$TARGET.new" "$TARGET"
 say "installed $TARGET"
+# exec replaces this shell, so its EXIT trap would never run: clean up first.
+rm -rf "$tmp"
+trap - EXIT INT TERM
 exec "$TARGET" doctor

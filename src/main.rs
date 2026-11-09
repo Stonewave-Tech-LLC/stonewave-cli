@@ -165,7 +165,7 @@ fn main() -> ExitCode {
         }
         Command::Doctor if args.json => {
             let host = flow::Host::detect(args.host, args.os, args.user);
-            let checks = doctor::run_all(&doctor::System);
+            let checks = doctor::run_all(&doctor::SYSTEM);
             println!("{}", doctor::to_json(&host.name, &checks));
             return if doctor::passed(&checks) {
                 ExitCode::SUCCESS

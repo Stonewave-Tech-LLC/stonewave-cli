@@ -720,7 +720,7 @@ pub fn doctor(term: &mut Term, host: &Host) -> Result<Outcome> {
     let m = term.mode();
     term.blank();
     term.line(&banner::compact(m, &host.name));
-    let checks = crate::doctor::show(term, &host.name, &crate::doctor::System)?;
+    let checks = crate::doctor::show(term, &host.name, &crate::doctor::SYSTEM)?;
     crate::doctor::verdict(term, &checks)?;
     Ok(if crate::doctor::passed(&checks) {
         Outcome::Done

@@ -13,6 +13,12 @@ set -eu
 version=${1:?usage: scripts/release.sh <version>}
 cd "$(dirname "$0")/.."
 
+# The version ends up in sed expressions and URLs: plain semver only.
+if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+    echo "release.sh: version must look like 1.2.3 or 1.2.3-rc.1, got: $version" >&2
+    exit 1
+fi
+
 crate_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 [ "$version" = "$crate_version" ] || {
     echo "release.sh: version $version does not match Cargo.toml ($crate_version)" >&2

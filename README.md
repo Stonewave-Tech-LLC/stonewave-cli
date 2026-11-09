@@ -31,8 +31,8 @@ stonewave doctor          # checks, shown on screen
 stonewave doctor --json   # one JSON object, for agents and scripts
 ```
 
-Read only: it reads `/etc/os-release` and `/proc/self/status`, runs `uname -m`, `ssh -V`, `timedatectl show`,
-`systemctl is-active ufw` and `df`, and opens one TCP connection to `account.stonewavetech.com:443` without sending
+Read only: it reads `/etc/os-release`, `/proc/self/status` and `/etc/ufw/ufw.conf`, runs `uname -m`, `sshd -V`,
+`timedatectl show` and `df`, and opens one TCP connection to `account.stonewavetech.com:443` without sending
 anything. Exit code 0 means no check failed.
 
 | Check | Fails when |
@@ -40,8 +40,8 @@ anything. Exit code 0 means no check failed.
 | System | no `/etc/os-release` (warns on systems not tested yet) |
 | CPU | not x86_64 or aarch64 |
 | systemd | not running |
-| OpenSSH | older than 8.2 (warns when sshd is missing) |
-| Outbound | port 443 to the account service not reachable |
+| OpenSSH | the server's sshd is older than 8.2 (warns when sshd is missing) |
+| Outbound | port 443 to the account service not reachable (only warns when an HTTPS proxy is set) |
 | Root, Clock, Disk, Firewall, Stonewave | only warn or inform |
 
 ## Install (not released yet)
