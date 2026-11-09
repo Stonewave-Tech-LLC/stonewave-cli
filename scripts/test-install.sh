@@ -14,7 +14,20 @@ esac
 bin="$dir/stonewave-$own-linux"
 failed=0
 
+# Downloads and copies from Windows lose the executable bit: run doctor from a
+# private executable copy and leave the release folder as it is.
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+cp "$bin" "$tmp/stonewave"
+chmod 0755 "$tmp/stonewave"
+
 step() { printf '\n== %s\n' "$*"; }
+doctor_ok() { # 0 = all checks passed, 1 = a check failed; anything else is a broken binary
+    if [ "$1" -gt 1 ]; then
+        echo "-- FAILED: doctor exit $1"
+        failed=1
+    fi
+}
 expect() { # expect <wanted exit code> <command...>
     want=$1
     shift
@@ -29,12 +42,16 @@ expect() { # expect <wanted exit code> <command...>
 }
 
 step "doctor (read only)"
-"$bin" doctor --no-anim
-echo "-- exit $? (1 just means a check failed on this machine)"
+"$tmp/stonewave" doctor --no-anim
+got=$?
+echo "-- exit $got (1 just means a check failed on this machine)"
+doctor_ok "$got"
 
 step "doctor --json"
-"$bin" doctor --json
+"$tmp/stonewave" doctor --json
+got=$?
 echo
+doctor_ok "$got"
 
 step "install.sh --dry-run with the right file"
 expect 0 sh "$dir/install.sh" --dry-run --from "$bin"
