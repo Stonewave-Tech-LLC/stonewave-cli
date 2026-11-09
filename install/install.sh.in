@@ -14,7 +14,7 @@
 set -eu
 
 VERSION="@VERSION@"
-BASE="https://stonewavetech.com/install/$VERSION"
+BASE="@BASE@"
 SHA256_X86_64="@SHA256_X86_64@"
 SHA256_AARCH64="@SHA256_AARCH64@"
 TARGET=/usr/local/bin/stonewave

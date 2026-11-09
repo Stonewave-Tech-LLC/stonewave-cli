@@ -25,6 +25,14 @@ crate_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
     exit 1
 }
 
+# Where install.sh downloads from. Default: our website. For a release on GitHub set
+# STONEWAVE_RELEASE_BASE=https://github.com/Stonewave-Tech-LLC/stonewave-cli/releases/download/v<version>
+base=${STONEWAVE_RELEASE_BASE:-https://stonewavetech.com/install/$version}
+case "$base" in
+https://*) ;;
+*) echo "release.sh: STONEWAVE_RELEASE_BASE must start with https://" >&2; exit 1 ;;
+esac
+
 target_dir=${CARGO_TARGET_DIR:-target}
 out="dist/$version"
 rm -rf "$out"
@@ -43,6 +51,7 @@ sha_x86_64=$(sed -n 's/ .*stonewave-x86_64-linux$//p' "$out/SHA256SUMS")
 sha_aarch64=$(sed -n 's/ .*stonewave-aarch64-linux$//p' "$out/SHA256SUMS")
 
 sed -e "s/@VERSION@/$version/g" \
+    -e "s#@BASE@#$base#" \
     -e "s/@SHA256_X86_64@/$sha_x86_64/" \
     -e "s/@SHA256_AARCH64@/$sha_aarch64/" \
     install/install.sh.in >"$out/install.sh"
@@ -68,7 +77,7 @@ release $version in $out
 
 The command Wave shows (the checksum pins install.sh):
 
-  curl -fsSLO https://stonewavetech.com/install/$version/install.sh \\
+  curl -fsSLO $base/install.sh \\
     && echo "$install_sha  install.sh" | sha256sum -c - \\
     && sudo sh install.sh
 EOF
