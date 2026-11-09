@@ -4,8 +4,9 @@ The Stonewave server CLI. It connects a company's Linux servers to [Wave](https:
 "Systems"), so the company's dev agent gets **safe, scoped hands** on them: short-lived SSH certificates, only the
 rights an admin gave, every action logged with the person it was done for.
 
-> **Early build.** `stonewave doctor` is real and read only. `connect`, `status` and `revoke` only show how the
-> finished CLI will look: they change nothing on the machine. Nothing is released yet.
+> **Early build.** `stonewave doctor` is real and read only. `stonewave connect` really signs in at the Stonewave
+> account (device code, see below) but changes nothing on the machine yet. `status`, `revoke` and `connect --demo` only
+> show how the finished CLI will look.
 
 ![connect](media/connect.gif)
 
@@ -72,10 +73,27 @@ scripts/test-install.sh dist/0.1.0              # on a Linux machine: doctor + i
 With `STONEWAVE_MINISIGN_KEY` set to a minisign secret key it also signs the files. The key is never part of this
 repository; without it the release is unsigned.
 
+## Connect: sign in with a device code
+
+```bash
+stonewave connect                        # real sign-in at the account, changes nothing on this machine yet
+stonewave connect --account https://...  # another account address (or STONEWAVE_ACCOUNT_URL); https only, http only for this machine
+```
+
+`connect` asks the account for a code (RFC 8628) and shows it with four words. The admin opens the printed address,
+signed in to their Stonewave account, types the code, checks that the page shows the same four words and that the
+server name and address are right, picks the company and confirms. The CLI then receives a short token (15 minutes,
+bound to that person and company), asks the account who it belongs to, shows the company and **drops the token**: it is
+never written to disk and never printed. Setup, the server key and the daemon come in later releases.
+
+HTTP goes through the system `curl` (the install command needs it anyway), so TLS and the certificate store are the
+system's. Secrets are handed to curl on stdin, never as arguments. A plain `http://` address is only accepted for this
+machine (`127.0.0.1`, `localhost`, `::1`), for tests.
+
 ## Demo screens
 
 ```bash
-stonewave connect    # sign-in, key check, setup progress (demo)
+stonewave connect --demo   # the made-up screens: sign-in, key check, setup progress (talks to nobody)
 stonewave status     # how every later start looks (demo values)
 stonewave revoke     # the local kill switch (demo)
 stonewave banner
@@ -105,7 +123,8 @@ by `scripts/cast2gif.py` with Pillow.
 | `src/doctor.rs` | the read-only checks |
 | `src/term.rs` | terminal abilities, buffered output, raw mode, keys, recording |
 | `src/style.rs`, `src/ui.rs`, `src/banner.rs` | colours, building blocks, banner and wave animation |
-| `src/flow.rs` | the demo screens |
+| `src/connect.rs` | the real device code sign-in: account address, curl transport, protocol, wait loop |
+| `src/flow.rs` | the screens (real `connect` and the demos) |
 | `install/install.sh.in` | install script template |
 | `scripts/` | release, install test, media renderer |
 

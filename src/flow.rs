@@ -8,6 +8,7 @@
 use std::time::{Duration, Instant};
 
 use crate::banner;
+use crate::connect::{self, Account, ConnectError, Http, Pace, Wait};
 use crate::style::{ColorMode, pal};
 use crate::term::{Input, Key, Result, Term};
 use crate::ui::{
@@ -32,6 +33,8 @@ pub enum Outcome {
     Done,
     /// The person said no; nothing happened.
     Declined,
+    /// Could not finish (no answer from the account, code expired, ...); the reason was shown. Nothing was changed.
+    Failed,
 }
 
 /// The machine as shown in the host rows.
@@ -245,6 +248,209 @@ fn echo_answer(term: &mut Term, mark: usize, question: &str, yes: bool) -> Resul
 }
 
 // ---------------------------------------------------------------- connect
+
+/// The real sign-in (device code, RFC 8628) against the account. Changes nothing on this machine.
+pub fn connect_real(
+    term: &mut Term,
+    host: &Host,
+    account: &Account,
+    http: &dyn Http,
+) -> Result<Outcome> {
+    let m = term.mode();
+    banner::show(term)?;
+    term.line(&kv(
+        m,
+        INDENT,
+        "host",
+        7,
+        &format!("{} ({})", host.name, host.os),
+    ));
+    term.line(&kv(m, INDENT, "user", 7, &host.user));
+    term.line(&kv(m, INDENT, "to", 7, &account.host_text()));
+    term.blank();
+    term.flush()?;
+
+    let started = match connect::start(http, account, &host.name, &host.os) {
+        Ok(s) => s,
+        Err(e) => return fail(term, "Could not start the sign-in", &e),
+    };
+    let mark = term.mark();
+    term.line(&heading(
+        m,
+        &m.fg(pal::CYAN, "●"),
+        "Sign in to connect this server",
+    ));
+    term.line(&kv(
+        m,
+        DETAIL,
+        "Open",
+        6,
+        &m.link(pal::CYAN, &account.link_text()),
+    ));
+    term.line(&kv(
+        m,
+        DETAIL,
+        "Code",
+        6,
+        &m.fg_bold(pal::AMBER, &started.user_code),
+    ));
+    term.line(&kv(
+        m,
+        DETAIL,
+        "Words",
+        6,
+        &m.bold(&started.words.join(" · ")),
+    ));
+    term.line(&format!(
+        "{DETAIL}{}",
+        m.fg(
+            pal::GREY,
+            "The page shows the same four words. Confirm only if they match and you started this yourself."
+        )
+    ));
+    term.blank();
+    term.flush()?;
+
+    let waited = {
+        let mut pace = TermPace::new(term);
+        connect::wait_for_approval(http, account, &started, &mut pace)
+    };
+    term.show_cursor();
+    let waited = waited?;
+    term.erase_since(mark);
+    let waited = match waited {
+        Ok(w) => w,
+        Err(e) => return fail(term, "Lost the connection to the account", &e),
+    };
+    match waited.end {
+        Wait::Approved => {
+            let approved = waited.approved.expect("approved comes with the answer");
+            // Proof that the token works and who it belongs to; the token is dropped right after.
+            let company = match connect::whoami(http, account, &approved.token) {
+                Ok(name) if !name.is_empty() => name,
+                Ok(_) => approved.company_name.clone(),
+                Err(e) => return fail(term, "The account did not accept the new sign-in", &e),
+            };
+            term.line(&summary(
+                m,
+                "Signed in",
+                &format!("{company} · {}", approved.company),
+            ));
+            term.blank();
+            term.line(&format!(
+                "{DETAIL}{}",
+                m.fg(
+                    pal::GREY,
+                    "This build stops here: setup comes in a later release."
+                )
+            ));
+            term.line(&format!(
+                "{DETAIL}{}",
+                m.fg(
+                    pal::GREY,
+                    "Nothing was changed on this server, and the sign-in was not saved."
+                )
+            ));
+            term.flush()?;
+            Ok(Outcome::Done)
+        }
+        Wait::Denied => {
+            term.line(&format!(
+                "{INDENT}{} {}",
+                m.fg_bold(pal::RED, "✗"),
+                m.bold("Not connected · the sign-in was declined")
+            ));
+            term.line(&format!(
+                "{DETAIL}{}",
+                m.fg(pal::GREY, "Nothing was changed on this server.")
+            ));
+            term.flush()?;
+            Ok(Outcome::Declined)
+        }
+        Wait::Expired => {
+            term.line(&format!(
+                "{INDENT}{} {}",
+                m.fg_bold(pal::RED, "✗"),
+                m.bold("The code ran out")
+            ));
+            term.line(&format!(
+                "{DETAIL}{}",
+                m.fg(
+                    pal::GREY,
+                    "Run `sudo stonewave connect` again for a new code. Nothing was changed."
+                )
+            ));
+            term.flush()?;
+            Ok(Outcome::Failed)
+        }
+    }
+}
+
+fn fail(term: &mut Term, what: &str, e: &ConnectError) -> Result<Outcome> {
+    let m = term.mode();
+    term.line(&format!(
+        "{INDENT}{} {}",
+        m.fg_bold(pal::RED, "✗"),
+        m.bold(what)
+    ));
+    term.line(&format!("{DETAIL}{}", m.fg(pal::GREY, &e.to_string())));
+    term.line(&format!(
+        "{DETAIL}{}",
+        m.fg(pal::GREY, "Nothing was changed on this server.")
+    ));
+    term.flush()?;
+    Ok(Outcome::Failed)
+}
+
+/// Draws the waiting line and listens for Ctrl-C while the poll loop runs.
+struct TermPace<'a> {
+    term: &'a mut Term,
+    started: Instant,
+    mark: usize,
+}
+
+impl<'a> TermPace<'a> {
+    fn new(term: &'a mut Term) -> Self {
+        term.hide_cursor();
+        let mark = term.mark();
+        TermPace {
+            term,
+            started: Instant::now(),
+            mark,
+        }
+    }
+}
+
+impl Pace for TermPace<'_> {
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    fn tick(&mut self, left: Duration) -> Result<()> {
+        let m = self.term.mode();
+        if self.term.caps.live {
+            let t = if self.term.caps.animate {
+                self.started.elapsed().as_secs_f32()
+            } else {
+                0.0
+            };
+            let line = format!(
+                "{DETAIL}{}  {}",
+                wave_spinner(m, t, 5),
+                m.fg(
+                    pal::GREY,
+                    &format!("Waiting for you to confirm · code valid for {}", mmss(left))
+                )
+            );
+            self.term.repaint(self.mark, &[line]);
+            self.term.wait(Duration::from_millis(50))?;
+        } else {
+            // no terminal to draw on: wait quietly
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        Ok(())
+    }
+}
 
 pub fn connect(term: &mut Term, host: &Host, rng: &mut Rng) -> Result<Outcome> {
     let m = term.mode();
