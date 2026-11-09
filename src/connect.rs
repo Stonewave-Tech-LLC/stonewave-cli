@@ -58,16 +58,15 @@ impl fmt::Display for ConnectError {
     }
 }
 
-/// Text from outside, cut and cleaned before it reaches a terminal (no escape codes, no long lines).
+/// Text from outside, cut and cleaned before it reaches a terminal: no control or escape codes, no invisible
+/// or direction-changing characters, no long lines. Letters of any language stay (a company can be "Müller & Söhne").
 fn tame(s: &str, max: usize) -> String {
+    let bad = |c: char| {
+        c.is_control()
+            || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+    };
     s.chars()
-        .map(|c| {
-            if c.is_ascii_graphic() || c == ' ' {
-                c
-            } else {
-                '?'
-            }
-        })
+        .map(|c| if bad(c) { '?' } else { c })
         .take(max)
         .collect()
 }
@@ -412,6 +411,13 @@ pub fn poll_once(http: &dyn Http, acct: &Account, device_code: &str) -> Result<P
     let body = json!({ "grant_type": GRANT, "device_code": device_code, "client_id": CLIENT_ID })
         .to_string();
     let r = http.send("POST", &acct.url("/v1/device/token"), None, Some(&body))?;
+    if r.status >= 500 {
+        // a proxy or a restart in between: not an answer of the account, so the wait loop tries again
+        return Err(ConnectError::Network(format!(
+            "the account answered HTTP {}",
+            r.status
+        )));
+    }
     let v = json(&r)?;
     if r.status == 200 {
         return Ok(Poll::Approved(Approved {
@@ -759,6 +765,27 @@ mod tests {
             nope.unwrap_err(),
             ConnectError::Server("invalid_client".into())
         );
+    }
+
+    #[test]
+    fn tame_keeps_letters_and_drops_control_and_direction_tricks() {
+        assert_eq!(tame("Müller & Söhne GmbH", 40), "Müller & Söhne GmbH");
+        assert_eq!(tame("a\u{1b}[31mb\nc\u{202e}d", 40), "a?[31mb?c?d");
+        assert_eq!(tame("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn a_server_error_in_between_is_retried_not_fatal() {
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let bad = Ok(Reply {
+            status: 502,
+            body: "<html>Bad gateway</html>".into(),
+        });
+        let f = Fake::new(&clock, vec![bad, ok(TOKEN)]);
+        let w = wait_for_approval(&f, &acct(), &started(), &mut Clock(clock.clone(), 0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.end, Wait::Approved);
     }
 
     #[test]
