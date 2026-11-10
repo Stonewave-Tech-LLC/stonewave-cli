@@ -744,10 +744,12 @@ pub fn daemon(sys: &dyn Sys, dry: bool, version: &str) -> R<Outcome> {
     // them, and nobody else may.
     for file in [SERVER_KEY, SERVER_IDENTITY] {
         if sys.exists(file) && !ctx.matches(file, 0o600, (DAEMON_USER, DAEMON_USER)) {
+            // This folder belongs to the daemon's user: a link planted there must not make root change another file.
+            ctx.refuse_symlink(file)?;
             ctx.act(
                 format!("give {file} to {DAEMON_USER} (mode 600)"),
                 "chown",
-                &[&format!("{DAEMON_USER}:{DAEMON_USER}"), file],
+                &["-h", &format!("{DAEMON_USER}:{DAEMON_USER}"), file],
             )?;
             ctx.act(
                 format!("close {file} to everybody else"),
@@ -1585,6 +1587,25 @@ mod tests {
         );
         assert!(revoke(&fake, false, Some("Office PC")).is_err());
         assert_eq!(fake.file(TRUST).unwrap(), hand);
+    }
+
+    #[test]
+    fn a_planted_link_in_place_of_the_server_key_is_refused() {
+        let fake = Fake::new();
+        run(&fake, false, vec![]);
+        fake.set_file(SERVER_KEY, "x", 0o777, "stonewave", "stonewave");
+        fake.links.borrow_mut().insert(SERVER_KEY.to_owned());
+        fake.clear_log();
+        let err = daemon(&fake, false, "0.2.0").unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        assert!(
+            !fake
+                .commands()
+                .iter()
+                .any(|c| c.starts_with("chown") || c.starts_with("chmod")),
+            "{:?}",
+            fake.commands()
+        );
     }
 
     #[test]
