@@ -5,8 +5,9 @@ The Stonewave server CLI. It connects a company's Linux servers to [Wave](https:
 rights an admin gave, every action logged with the person it was done for.
 
 > **Early build.** `stonewave doctor` is real and read only. `stonewave connect` really signs in at the Stonewave
-> account (device code, see below) but changes nothing on the machine yet. `status`, `revoke` and `connect --demo` only
-> show how the finished CLI will look.
+> account (device code, see below) but changes nothing on the machine yet. `stonewave setup` and `stonewave revoke`
+> are real and change the server (with sudo; `--dry-run` only looks). `status` and `connect --demo` only show how the
+> finished CLI will look.
 
 ![connect](media/connect.gif)
 
@@ -90,12 +91,44 @@ HTTP goes through the system `curl` (the install command needs it anyway), so TL
 system's. Secrets are handed to curl on stdin, never as arguments. A plain `http://` address is only accepted for this
 machine (`127.0.0.1`, `localhost`, `::1`), for tests.
 
+## setup and revoke
+
+```bash
+sudo stonewave setup --dry-run                      # the plan: what would change, nothing is touched
+sudo stonewave setup --trust-file admin-keys.pub    # does it (asks first; --yes to skip the question)
+sudo stonewave revoke                               # the local kill switch, works without internet
+sudo stonewave revoke --device "Office PC"          # removes only one admin device
+```
+
+`setup` is deterministic: every step looks first and changes only what is missing, so a second run changes nothing.
+It needs the installed binary at `/usr/local/bin/stonewave` (`install.sh` puts it there) and OpenSSH on the server.
+
+| Step | What | Looks first |
+|---|---|---|
+| 0 Precheck | the `doctor` checks; a failed one stops, outbound access is only needed later | – |
+| 1 Users | `stonewave-agent` (no password, no sudo, never in `sudo`, `admin`, `wheel`, `docker`...) and `stonewave` for the daemon | user there? |
+| 2 Admin keys | `/etc/stonewave/ssh/trusted_admin_cas`: keys are added, never removed here. Only `ssh-ed25519` and `ecdsa-sha2-nistp256`, one per line, no options | key already in? |
+| 3 Agent SSH | a second `sshd` on `127.0.0.1:2222` only: certificates only, user `stonewave-agent` only, forced command `stonewave agent-shell`, no forwarding, no terminal, its own host key and revocation list. Allowed principals: `sw.read`, `sw.logs`, `sw.health`. A new config is tested with `sshd -t` before it replaces the old one. **The server's own sshd is not touched** | config the same? |
+| 4 Daemon | `stonewaved.service` as user `stonewave`, in a systemd cage (no capabilities, `ProtectSystem=strict`, only IPv4/IPv6/Unix sockets) | running, right version? |
+| 5 Firewall | reports only. This build never changes a firewall: a wrong rule can lock the admin out | – |
+| 6 Logbook | `/var/log/stonewave/audit.jsonl` and logrotate | there? |
+| 7 Health | agent sshd and daemon run, port answers, config passes `sshd -t`, disk and clock | – |
+
+The state is in `/var/lib/stonewave/state.json`. Where a step cannot go on (no OpenSSH, binary not installed, agent
+user in a powerful group) it stops and says why; what ran is in place and running setup again is safe.
+
+`revoke` stops the daemon and the agent sshd, ends the agent's sessions (only that user's processes), empties the
+trust list, and locks `stonewave-agent` (no shell, account expired). The audit log stays. `setup` opens it again.
+
+`stonewave agent-shell` is the forced command of the agent sshd. In this build it knows one operation, `health`,
+and refuses everything else (and logs both). `stonewave daemon` only keeps `/var/lib/stonewave/health.json` fresh;
+the tunnel to Wave comes later.
+
 ## Demo screens
 
 ```bash
 stonewave connect --demo   # the made-up screens: sign-in, key check, setup progress (talks to nobody)
 stonewave status     # how every later start looks (demo values)
-stonewave revoke     # the local kill switch (demo)
 stonewave banner
 ```
 
@@ -121,6 +154,9 @@ by `scripts/cast2gif.py` with Pillow.
 |---|---|
 | `src/main.rs` | arguments, commands |
 | `src/doctor.rs` | the read-only checks |
+| `src/setup.rs`, `src/realsys.rs`, `src/setup_flow.rs` | setup and revoke: steps, the real machine behind them, the screens |
+| `src/daemon.rs` | `daemon` and `agent-shell` |
+| `src/b64.rs` | base64 without a dependency |
 | `src/term.rs` | terminal abilities, buffered output, raw mode, keys, recording |
 | `src/style.rs`, `src/ui.rs`, `src/banner.rs` | colours, building blocks, banner and wave animation |
 | `src/connect.rs` | the real device code sign-in: account address, curl transport, protocol, wait loop |

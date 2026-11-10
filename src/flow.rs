@@ -1,4 +1,4 @@
-//! The screens: connect, status, revoke.
+//! The screens: connect, status, doctor.
 //!
 //! This is a demo. Values that would come from Wave (sign-in code, account,
 //! key fingerprint, health, rights) are made up, and nothing on the machine
@@ -202,7 +202,7 @@ fn yes_no_hint(m: ColorMode, question: &str) -> String {
 }
 
 /// Shows the y/n hint, waits for the answer and echoes it on the prompt line.
-fn ask(term: &mut Term, question: &str) -> Result<bool> {
+pub(crate) fn ask(term: &mut Term, question: &str) -> Result<bool> {
     let m = term.mode();
     let prompt_mark = term.mark();
     term.line(&yes_no_hint(m, question));
@@ -840,80 +840,6 @@ pub fn status(term: &mut Term, host: &Host) -> Result<Outcome> {
     term.line(&dim_note(
         m,
         "demo values · nothing was read from this machine",
-    ));
-    term.flush()?;
-    Ok(Outcome::Done)
-}
-
-// ---------------------------------------------------------------- revoke
-
-/// The local kill switch, as a demo.
-pub fn revoke(term: &mut Term, host: &Host) -> Result<Outcome> {
-    let m = term.mode();
-    let question = "Revoke?";
-    term.blank();
-    term.line(&banner::compact(m, &host.name));
-
-    let mark = term.mark();
-    term.blank();
-    term.line(&heading(
-        m,
-        &m.fg_bold(pal::AMBER, "◆"),
-        &format!("Revoke all agent access on {}?", host.name),
-    ));
-    term.line(&format!(
-        "{DETAIL}{}",
-        m.fg(
-            pal::GREY,
-            "Ends agent sessions, removes the trusted admin keys, stops the daemon"
-        )
-    ));
-    term.line(&format!(
-        "{DETAIL}{}",
-        m.fg(
-            pal::GREY,
-            "and locks stonewave-agent. The audit log stays. Works without internet."
-        )
-    ));
-    term.blank();
-    let yes = ask(term, question)?;
-    term.erase_since(mark);
-
-    if !yes {
-        term.blank();
-        term.line(&format!(
-            "{INDENT}{}",
-            m.fg(pal::GREY, "Nothing was changed.")
-        ));
-        no_terminal_note(term);
-        term.flush()?;
-        return Ok(Outcome::Declined);
-    }
-
-    let steps = vec![
-        Step::new("Agent sessions", "2 ended", 500),
-        Step::new("Admin keys", "2 removed from the trust list", 400),
-        Step::new("Daemon", "stopped and disabled", 600),
-        Step::new("Agent user", "stonewave-agent locked", 400),
-        Step::new("Audit log", "revoke noted · log kept", 300),
-    ];
-    run_steps(term, "Revoking agent access", "Agent access revoked", steps)?;
-    term.blank();
-    term.line(&kv(
-        m,
-        DETAIL,
-        "Again",
-        7,
-        &format!(
-            "{}  {}",
-            m.fg(pal::CYAN, "sudo stonewave"),
-            m.fg(pal::GREY, "connects this server again")
-        ),
-    ));
-    term.blank();
-    term.line(&dim_note(
-        m,
-        "demo finished · nothing on this machine was changed",
     ));
     term.flush()?;
     Ok(Outcome::Done)

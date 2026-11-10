@@ -3,12 +3,17 @@
 //! `doctor` is real and read only: it checks whether this server can be
 //! connected to Wave. `connect` really signs in with a device code at the
 //! Stonewave account (and changes nothing on the machine yet); `connect --demo`,
-//! `status` and `revoke` are demos of the look that talk to nobody. See `README.md`.
+//! `setup` and `revoke` change the server (with sudo; `--dry-run` only looks). `status` and `connect --demo` are demos of the look that talk to nobody. See `README.md`.
 
+mod b64;
 mod banner;
 mod connect;
+mod daemon;
 mod doctor;
 mod flow;
+mod realsys;
+mod setup;
+mod setup_flow;
 mod style;
 mod term;
 mod ui;
@@ -26,6 +31,9 @@ enum Command {
     Revoke,
     Banner,
     Doctor,
+    Setup,
+    Daemon,
+    AgentShell,
     Help,
     Version,
 }
@@ -44,6 +52,14 @@ struct Args {
     demo: bool,
     /// `--account <url>`: where the account lives (default: STONEWAVE_ACCOUNT_URL, then the Stonewave account).
     account: Option<String>,
+    /// `--dry-run`: setup and revoke only show what they would do.
+    dry_run: bool,
+    /// `--yes`: setup and revoke go ahead without asking.
+    yes: bool,
+    /// `--trust-file <file>`: setup: admin device keys to trust.
+    trust_files: Vec<String>,
+    /// `--device <name>`: revoke: only this admin device.
+    device: Option<String>,
 }
 
 const HELP: &str = "\
@@ -52,14 +68,19 @@ Usage: stonewave [command] [options]
 Commands:
   doctor         Check whether this server can be connected (real, read only)
   connect        Sign this server in to your Stonewave account (default). Changes nothing on this machine yet
+  setup          Set up this server: agent user, agent SSH, daemon, audit log (needs sudo; --dry-run only looks)
+  revoke         Revoke all agent access on this server, also without internet (needs sudo)
   status         Connection, agent rights and health (demo)
-  revoke         Revoke all agent access on this server (demo)
   banner         Play the banner
 
 Options:
   --json         doctor: print one JSON object instead of the screen (for agents)
   --account <url>  connect: address of the account (or STONEWAVE_ACCOUNT_URL); https only
   --demo         connect: play the made-up screens, talk to nobody
+  --dry-run      setup, revoke: show what would change, change nothing
+  --yes          setup, revoke: do it without asking
+  --trust-file <file>  setup: public keys of admin devices to trust (one per line)
+  --device <name>      revoke: only remove this admin device
   --no-anim      Final states only (also NO_COLOR, STONEWAVE_NO_ANIM=1, TERM=dumb, pipes)
   --host <name>  Demo: host name to show
   --os <name>    Demo: OS to show
@@ -86,6 +107,10 @@ fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
         json: false,
         demo: false,
         account: None,
+        dry_run: false,
+        yes: false,
+        trust_files: Vec::new(),
+        device: None,
     };
     let mut command_set = false;
     let mut it = raw.into_iter();
@@ -108,6 +133,10 @@ fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--json" => args.json = true,
             "--demo" => args.demo = true,
             "--account" => args.account = Some(value("--account")?),
+            "--dry-run" => args.dry_run = true,
+            "--yes" => args.yes = true,
+            "--trust-file" => args.trust_files.push(value("--trust-file")?),
+            "--device" => args.device = Some(value("--device")?),
             "--autoplay" => args.term.autoplay = true,
             "--live" => args.term.force_live = true,
             "--record" => args.term.record = Some(value("--record")?.into()),
@@ -136,6 +165,9 @@ fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
                     "revoke" => Command::Revoke,
                     "banner" => Command::Banner,
                     "doctor" => Command::Doctor,
+                    "setup" => Command::Setup,
+                    "daemon" => Command::Daemon,
+                    "agent-shell" => Command::AgentShell,
                     other => return Err(format!("unknown command {other}")),
                 };
                 command_set = true;
@@ -156,6 +188,16 @@ fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
     }
     if args.demo && args.account.is_some() {
         return Err("--demo talks to nobody, so --account makes no sense with it".into());
+    }
+    let changes_server = matches!(args.command, Command::Setup | Command::Revoke);
+    if (args.dry_run || args.yes) && !changes_server {
+        return Err("--dry-run and --yes only work with setup and revoke".into());
+    }
+    if !args.trust_files.is_empty() && args.command != Command::Setup {
+        return Err("--trust-file only works with setup".into());
+    }
+    if args.device.is_some() && args.command != Command::Revoke {
+        return Err("--device only works with revoke".into());
     }
     Ok(args)
 }
@@ -190,6 +232,8 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             };
         }
+        Command::Daemon => return daemon::run_daemon(),
+        Command::AgentShell => return daemon::run_agent_shell(),
         _ => {}
     }
 
@@ -229,10 +273,27 @@ fn main() -> ExitCode {
             }
         }
         Command::Status => flow::status(&mut term, &host),
-        Command::Revoke => flow::revoke(&mut term, &host),
+        Command::Revoke => setup_flow::revoke(
+            &mut term,
+            &host,
+            args.dry_run,
+            args.yes,
+            args.device.as_deref(),
+        ),
+        Command::Setup => setup_flow::setup(
+            &mut term,
+            &host,
+            &setup_flow::SetupArgs {
+                dry_run: args.dry_run,
+                yes: args.yes,
+                trust_files: args.trust_files,
+            },
+        ),
         Command::Banner => flow::banner_only(&mut term),
         Command::Doctor => flow::doctor(&mut term, &host),
-        Command::Help | Command::Version => unreachable!("handled above"),
+        Command::Help | Command::Version | Command::Daemon | Command::AgentShell => {
+            unreachable!("handled above")
+        }
     };
     // Restore the terminal (cursor, colours, raw mode) before any final message.
     drop(term);
