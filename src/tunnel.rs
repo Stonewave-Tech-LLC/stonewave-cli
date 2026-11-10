@@ -1,5 +1,5 @@
 //! The tunnel: `stonewaved` holds one outbound connection to the relay and does exactly four things
-//! with it (F-100 section 4):
+//! with it (the design of the server daemon):
 //!
 //! 1. keep the line (reconnect with a growing pause),
 //! 2. hand byte streams to the agent sshd on `127.0.0.1:2222`,
@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::connect::tame;
+use crate::connect::cfg_quote as quote;
 use crate::relay::{Down, MAX_DATA, ServerKey, Up, now_ms, parse_down, signed_headers};
 
 pub const AGENT_ADDR: ([u8; 4], u16) = ([127, 0, 0, 1], crate::setup::AGENT_PORT);
@@ -111,9 +111,8 @@ fn read_line(r: &mut dyn BufRead) -> Result<Option<String>, String> {
 /// The error code in a Wave error answer, if the text is one.
 pub fn error_code(text: &str) -> Option<String> {
     let v: Value = serde_json::from_str(text.trim()).ok()?;
-    v.pointer("/error/code")
-        .and_then(Value::as_str)
-        .map(|c| tame(c, 40))
+    v.get("error")?;
+    Some(crate::connect::error_code(&v))
 }
 
 /// One life of the line: connect, hello, serve frames until it ends.
@@ -151,6 +150,7 @@ pub fn run_session<T: Transport>(
     let abort: Arc<Mutex<Option<End>>> = Arc::new(Mutex::new(None));
     let (tx, rx) = mpsc::sync_channel::<Up>(256);
     let chans: Chans = Arc::new(Mutex::new(HashMap::new()));
+    let opening = Arc::new(AtomicUsize::new(0));
 
     let uploader = {
         let (t, abort, done, sess, window) = (
@@ -191,7 +191,7 @@ pub fn run_session<T: Transport>(
             continue;
         }
         match parse_down(&line) {
-            Some(Down::Open { ch }) => open_channel(s, &chans, &tx, ch),
+            Some(Down::Open { ch }) => open_channel(s, &chans, &opening, &tx, ch),
             Some(Down::Data { ch, data }) => {
                 let target = chans.lock().unwrap().get(&ch).map(|c| c.to_sshd.clone());
                 if let Some(q) = target {
@@ -230,21 +230,49 @@ pub fn run_session<T: Transport>(
 
 /// Ends a channel from our side and tells Wave, once.
 fn end_channel(chans: &Chans, tx: &SyncSender<Up>, ch: u32) {
-    if let Some(c) = chans.lock().unwrap().remove(&ch) {
+    let removed = chans.lock().unwrap().remove(&ch);
+    if let Some(c) = removed {
         close_chan(&c);
-        let _ = tx.try_send(Up::Close(ch));
+        // The close must reach Wave even when the queue is full (a big transfer): wait a little for room instead of dropping it.
+        let mut frame = Up::Close(ch);
+        for _ in 0..100 {
+            match tx.try_send(frame) {
+                Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => break,
+                Err(mpsc::TrySendError::Full(f)) => {
+                    frame = f;
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
     }
 }
 
 /// `open`: connect to the agent sshd (the fixed address) on a side thread, then answer.
-fn open_channel(s: &Settings, chans: &Chans, tx: &SyncSender<Up>, ch: u32) {
-    if chans.lock().unwrap().len() >= s.max_channels {
+fn open_channel(
+    s: &Settings,
+    chans: &Chans,
+    opening: &Arc<AtomicUsize>,
+    tx: &SyncSender<Up>,
+    ch: u32,
+) {
+    // Channels that are still connecting count too, so a burst of `open` frames cannot go past the limit.
+    if chans.lock().unwrap().len() + opening.fetch_add(1, Ordering::SeqCst) >= s.max_channels {
+        opening.fetch_sub(1, Ordering::SeqCst);
         let _ = tx.try_send(Up::OpenFailed(ch));
         return;
     }
-    let (addr, timeout, chans, tx) = (s.agent_addr, s.connect_timeout, chans.clone(), tx.clone());
+    let s_max = s.max_channels;
+    let (addr, timeout, chans, tx, opening) = (
+        s.agent_addr,
+        s.connect_timeout,
+        chans.clone(),
+        tx.clone(),
+        opening.clone(),
+    );
     thread::spawn(move || {
-        let Ok(sock) = TcpStream::connect_timeout(&addr, timeout) else {
+        let connected = TcpStream::connect_timeout(&addr, timeout);
+        opening.fetch_sub(1, Ordering::SeqCst);
+        let Ok(sock) = connected else {
             let _ = tx.send(Up::OpenFailed(ch));
             return;
         };
@@ -258,7 +286,7 @@ fn open_channel(s: &Settings, chans: &Chans, tx: &SyncSender<Up>, ch: u32) {
         let (to_sshd, from_wave) = mpsc::sync_channel::<Vec<u8>>(64);
         {
             let mut map = chans.lock().unwrap();
-            if map.contains_key(&ch) || map.len() >= 8 {
+            if map.contains_key(&ch) || map.len() >= s_max {
                 drop(map);
                 let _ = sock.shutdown(Shutdown::Both);
                 let _ = tx.send(Up::OpenFailed(ch));
@@ -430,16 +458,6 @@ pub struct CurlTransport {
     pub base: String,
     pub server_ref: String,
     pub key: ServerKey,
-}
-
-fn quote(s: &str) -> String {
-    format!(
-        "\"{}\"",
-        s.replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
-    )
 }
 
 /// The curl config of one signed request. Headers carry a signature that is useless a minute later; the

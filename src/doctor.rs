@@ -280,12 +280,51 @@ fn clock(p: &dyn Probe) -> Finding {
     }
 }
 
+/// `https://host[:port]` as host and port.
+fn host_port(base: &str) -> (String, u16) {
+    let rest = base.split_once("://").map_or(base, |x| x.1);
+    match rest.rsplit_once(':') {
+        Some((h, port)) if port.parse::<u16>().is_ok() => {
+            (h.to_owned(), port.parse().unwrap_or(443))
+        }
+        _ => (rest.to_owned(), 443),
+    }
+}
+
+/// Where the daemon of this server connects: the relay it was set up with, else the default one.
+fn relay_endpoint(p: &dyn Probe) -> (String, u16) {
+    let path = format!("{}/{}", crate::setup::VAR_LIB, crate::relay::IDENTITY_FILE);
+    let base = p
+        .read(&path)
+        .and_then(|t| crate::relay::Identity::parse(&t))
+        .map_or_else(|| crate::connect::DEFAULT_RELAY.to_owned(), |i| i.relay);
+    host_port(&base)
+}
+
 fn outbound(p: &dyn Probe) -> Finding {
     match p.connect(OUTBOUND_HOST, 443) {
-        Ok(d) => found(
-            Level::Ok,
-            format!("port 443 reachable · {} ms", d.as_millis()),
-        ),
+        Ok(d) => {
+            // The sign-in goes to the account, the daemon lives on the relay: both must be reachable. The relay is
+            // only a warning, because it may not be switched on yet.
+            let (host, port) = relay_endpoint(p);
+            match p.connect(&host, port) {
+                Ok(r) => found(
+                    Level::Ok,
+                    format!(
+                        "account {} ms · relay {} ms (port {port})",
+                        d.as_millis(),
+                        r.as_millis()
+                    ),
+                ),
+                Err(why) => found(
+                    Level::Warn,
+                    format!(
+                        "account reachable ({} ms) · relay {host}:{port} not reachable ({why}): the daemon needs it",
+                        d.as_millis()
+                    ),
+                ),
+            }
+        }
         Err(why) => {
             let proxy = ["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"]
                 .iter()
@@ -736,5 +775,21 @@ mod tests {
             "{j}"
         );
         assert_eq!(j.matches(r#""id":"#).count(), CHECKS.len());
+    }
+
+    #[test]
+    fn host_and_port_of_the_relay_address() {
+        assert_eq!(
+            host_port("https://relay.example"),
+            ("relay.example".to_owned(), 443)
+        );
+        assert_eq!(
+            host_port("http://127.0.0.1:18095"),
+            ("127.0.0.1".to_owned(), 18095)
+        );
+        assert_eq!(
+            host_port("https://relay.example:8443"),
+            ("relay.example".to_owned(), 8443)
+        );
     }
 }

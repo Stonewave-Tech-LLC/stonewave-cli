@@ -241,6 +241,32 @@ fn at_most_four_channels_and_a_channel_number_is_not_used_twice() {
 }
 
 #[test]
+fn a_burst_of_open_frames_cannot_go_past_the_limit() {
+    let (sshd, addr) = fake_sshd();
+    let r = rig(addr);
+    r.send(hello().trim());
+    let h = r.run();
+    // eight opens at once: the ones still connecting count too
+    for ch in 1..=8 {
+        r.send(&format!(r#"{{"t":"open","ch":{ch}}}"#));
+    }
+    let mut conns = Vec::new();
+    for _ in 0..4 {
+        conns.push(sshd.accept().unwrap());
+    }
+    let f = r.wait_for("all answered", |f| {
+        f.iter()
+            .filter(|x| x["t"] == "opened" || x["t"] == "open_failed")
+            .count()
+            == 8
+    });
+    assert_eq!(f.iter().filter(|x| x["t"] == "opened").count(), 4, "{f:?}");
+    assert_eq!(f.iter().filter(|x| x["t"] == "open_failed").count(), 4);
+    r.send(r#"{"t":"bye","reason":"x"}"#);
+    h.join().unwrap();
+}
+
+#[test]
 fn when_sshd_hangs_up_wave_is_told_once() {
     let (sshd, addr) = fake_sshd();
     let r = rig(addr);

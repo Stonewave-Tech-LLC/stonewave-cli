@@ -168,7 +168,7 @@ pub struct Curl {
 }
 
 /// A value inside double quotes in a curl config file.
-fn cfg_quote(s: &str) -> String {
+pub(crate) fn cfg_quote(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
     o.push('"');
     for c in s.chars() {
@@ -351,7 +351,7 @@ fn shaped(
 }
 
 /// The error code of an RFC 8628 error answer, or of the house shape `{"error": {"code": ...}}`.
-fn error_code(v: &Value) -> String {
+pub(crate) fn error_code(v: &Value) -> String {
     let e = v.get("error");
     let code = e
         .and_then(Value::as_str)

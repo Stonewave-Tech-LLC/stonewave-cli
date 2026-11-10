@@ -483,6 +483,20 @@ fn enrol_and_set_up(
                 }
             }
             term.blank();
+            if done
+                .iter()
+                .any(|r| matches!(r.outcome, setup::Outcome::Attention(_)))
+            {
+                term.line(&format!(
+                    "{INDENT}{}",
+                    m.fg(
+                        pal::RED,
+                        "Registered, but a step above needs a look (a red cross). Fix it and run `sudo stonewave setup`."
+                    )
+                ));
+                term.flush()?;
+                return Ok(Outcome::Failed);
+            }
             term.line(&format!(
                 "{INDENT}{}",
                 m.fg_bold(
