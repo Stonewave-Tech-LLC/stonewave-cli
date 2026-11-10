@@ -18,7 +18,7 @@ pub struct SetupArgs {
     pub trust_files: Vec<String>,
 }
 
-fn row(m: ColorMode, r: &StepReport, dry: bool) -> Vec<String> {
+pub(crate) fn row(m: ColorMode, r: &StepReport, dry: bool) -> Vec<String> {
     let name = format!("{:<12}", r.name);
     match &r.outcome {
         Outcome::Kept(text) => vec![format!(

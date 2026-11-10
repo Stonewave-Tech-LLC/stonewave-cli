@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use crate::banner;
 use crate::connect::{self, Account, ConnectError, Http, Pace, Wait};
+use crate::relay::{self, ServerKey};
+use crate::setup;
 use crate::style::{ColorMode, pal};
 use crate::term::{Input, Key, Result, Term};
 use crate::ui::{
@@ -250,11 +252,19 @@ fn echo_answer(term: &mut Term, mark: usize, question: &str, yes: bool) -> Resul
 // ---------------------------------------------------------------- connect
 
 /// The real sign-in (device code, RFC 8628) against the account. Changes nothing on this machine.
+/// Where to enrol after the sign-in, and how to talk to it. `None`: sign in only.
+pub struct Enrol<'a> {
+    pub relay: &'a Account,
+    pub http: &'a dyn Http,
+    pub yes: bool,
+}
+
 pub fn connect_real(
     term: &mut Term,
     host: &Host,
     account: &Account,
     http: &dyn Http,
+    enrol: Option<&Enrol<'_>>,
 ) -> Result<Outcome> {
     let m = term.mode();
     banner::show(term)?;
@@ -337,22 +347,15 @@ pub fn connect_real(
                 &format!("{company} · {}", approved.company),
             ));
             term.blank();
-            term.line(&format!(
-                "{DETAIL}{}",
-                m.fg(
-                    pal::GREY,
-                    "This build stops here: setup comes in a later release."
-                )
-            ));
-            term.line(&format!(
-                "{DETAIL}{}",
-                m.fg(
-                    pal::GREY,
-                    "Nothing was changed on this server, and the sign-in was not saved."
-                )
-            ));
-            term.flush()?;
-            Ok(Outcome::Done)
+            let Some(enrol) = enrol else {
+                term.line(&format!(
+                    "{DETAIL}{}",
+                    m.fg(pal::GREY, "Sign-in only: nothing was changed on this server, and the sign-in was not saved.")
+                ));
+                term.flush()?;
+                return Ok(Outcome::Done);
+            };
+            enrol_and_set_up(term, host, &approved, &company, enrol)
         }
         Wait::Denied => {
             term.line(&format!(
@@ -380,6 +383,126 @@ pub fn connect_real(
                     "Run `sudo stonewave connect` again for a new code. Nothing was changed."
                 )
             ));
+            term.flush()?;
+            Ok(Outcome::Failed)
+        }
+    }
+}
+
+/// After the sign-in: ask once, enrol this server's own key at the relay, save it, then run the base setup
+/// (which starts the daemon). Nothing on this machine changes before the relay has accepted the key.
+fn enrol_and_set_up(
+    term: &mut Term,
+    host: &Host,
+    approved: &connect::Approved,
+    company: &str,
+    enrol: &Enrol<'_>,
+) -> Result<Outcome> {
+    let m = term.mode();
+    term.line(&heading(
+        m,
+        &m.fg_bold(pal::AMBER, "◆"),
+        &format!("Connect {} to {company}?", host.name),
+    ));
+    for line in [
+        "Makes a key for this server and registers it with Wave, then sets up the agent user,",
+        "a localhost-only SSH, the daemon and the audit log (see `stonewave setup --dry-run`).",
+        "The daemon only connects outbound. New servers start with read-only rights for the agent.",
+    ] {
+        term.line(&format!("{DETAIL}{}", m.fg(pal::GREY, line)));
+    }
+    term.blank();
+    if !enrol.yes && !ask(term, "Connect?")? {
+        term.line(&format!(
+            "{INDENT}{}",
+            m.fg(pal::GREY, "Nothing was changed.")
+        ));
+        no_terminal_note(term);
+        term.flush()?;
+        return Ok(Outcome::Declined);
+    }
+
+    let key = ServerKey::generate();
+    let enrolled = match relay::enrol(
+        enrol.http,
+        enrol.relay,
+        &approved.token,
+        &key,
+        &host.name,
+        &host.os,
+    ) {
+        Ok(e) => e,
+        Err(e) => return fail(term, "Wave did not accept this server", &e),
+    };
+    if let Err(e) = relay::save(&relay::Paths::system(), &key, &enrolled.identity) {
+        term.line(&format!(
+            "{INDENT}{} {}",
+            m.fg_bold(pal::RED, "✗"),
+            m.bold("Could not save the server key")
+        ));
+        term.line(&format!(
+            "{DETAIL}{}",
+            m.fg(
+                pal::GREY,
+                &format!("{e} · the server is registered at Wave; run connect again")
+            )
+        ));
+        term.flush()?;
+        return Ok(Outcome::Failed);
+    }
+    term.line(&summary(
+        m,
+        "Registered",
+        &format!(
+            "{} · {} ({})",
+            enrolled.identity.name, enrolled.identity.company, enrolled.status
+        ),
+    ));
+
+    let sys = crate::realsys::RealSys;
+    let cfg = setup::Config {
+        version: crate::VERSION,
+        trust: Vec::new(),
+    };
+    let checks = crate::doctor::run_all(&crate::doctor::SYSTEM);
+    let result = setup::run_steps(&sys, false, &cfg, &checks, |_| {});
+    match result {
+        Ok(done) => {
+            for r in &done {
+                for line in crate::setup_flow::row(m, r, false) {
+                    term.line(&line);
+                }
+            }
+            term.blank();
+            term.line(&format!(
+                "{INDENT}{}",
+                m.fg_bold(
+                    pal::GREEN,
+                    "Connected. Wave shows this server within a minute."
+                )
+            ));
+            term.line(&format!(
+                "{DETAIL}{}",
+                m.fg(
+                    pal::GREY,
+                    "`stonewave status` shows the line; `sudo stonewave revoke` closes it for good."
+                )
+            ));
+            term.flush()?;
+            Ok(Outcome::Done)
+        }
+        Err((done, e)) => {
+            for r in &done {
+                for line in crate::setup_flow::row(m, r, false) {
+                    term.line(&line);
+                }
+            }
+            term.line(&format!(
+                "{INDENT}{} {}",
+                m.fg_bold(pal::RED, "✗"),
+                m.bold(&format!("Setup stopped: {e}"))
+            ));
+            term.line(&format!("{DETAIL}{}", m.fg(pal::GREY, "The server is registered. Fix the point above and run `sudo stonewave setup`; it is safe to repeat.")));
             term.flush()?;
             Ok(Outcome::Failed)
         }

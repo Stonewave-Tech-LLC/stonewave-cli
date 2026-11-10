@@ -15,6 +15,9 @@ path = "src/main.rs"
 [dependencies]
 crossterm = "0.28"
 serde_json = "1"
+ed25519-dalek = "2.1"
+sha2 = "0.10"
+getrandom = "0.2"
 
 [profile.release]
 lto = true

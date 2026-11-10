@@ -31,6 +31,8 @@ pub const SSHD_UNIT: &str = "/etc/systemd/system/stonewave-sshd.service";
 pub const DAEMON_UNIT: &str = "/etc/systemd/system/stonewaved.service";
 pub const LOGROTATE: &str = "/etc/logrotate.d/stonewave";
 pub const STATE: &str = "/var/lib/stonewave/state.json";
+pub const SERVER_KEY: &str = "/var/lib/stonewave/server.key";
+pub const SERVER_IDENTITY: &str = "/var/lib/stonewave/server.json";
 pub const AUDIT: &str = "/var/log/stonewave/audit.jsonl";
 pub const SSHD_BIN: &str = "/usr/sbin/sshd";
 
@@ -688,6 +690,22 @@ pub fn daemon(sys: &dyn Sys, dry: bool, version: &str) -> R<Outcome> {
         )));
     }
     ctx.dir(VAR_LIB, 0o750, (DAEMON_USER, DAEMON_USER))?;
+    // The server key and the identity are made by `connect` as root; the daemon runs as its own user and must be able to read
+    // them, and nobody else may.
+    for file in [SERVER_KEY, SERVER_IDENTITY] {
+        if sys.exists(file) && !ctx.matches(file, 0o600, (DAEMON_USER, DAEMON_USER)) {
+            ctx.act(
+                format!("give {file} to {DAEMON_USER} (mode 600)"),
+                "chown",
+                &[&format!("{DAEMON_USER}:{DAEMON_USER}"), file],
+            )?;
+            ctx.act(
+                format!("close {file} to everybody else"),
+                "chmod",
+                &["0600", file],
+            )?;
+        }
+    }
     let unit_changed = ctx.file(DAEMON_UNIT, &daemon_unit(), 0o644, ("root", "root"))?;
     if unit_changed {
         ctx.act("reload systemd", "systemctl", &["daemon-reload"])?;

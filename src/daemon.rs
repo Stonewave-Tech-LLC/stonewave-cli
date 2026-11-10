@@ -1,39 +1,28 @@
 //! The two long-running or forced commands on a connected server: `stonewave daemon` (the service) and
 //! `stonewave agent-shell` (the forced command of the agent sshd).
 //!
-//! Neither can run an arbitrary command. The daemon only reports health; `agent-shell` knows a fixed list
-//! of named operations (today only `health`) and refuses everything else.
+//! Neither can run an arbitrary command. The daemon keeps the line to Wave (see `tunnel.rs`) and reports
+//! health; `agent-shell` knows a fixed list of named operations (today only `health`) and refuses
+//! everything else.
 
 use std::io::Write;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::doctor;
-use crate::setup;
+use crate::connect::Account;
+use crate::relay::{self, Paths};
+use crate::tunnel::{self, CurlTransport, EXIT_REVOKED, End, Settings};
+use crate::{doctor, health, setup};
 
-const HEALTH_FILE: &str = "/var/lib/stonewave/health.json";
-const HEALTH_EVERY: Duration = Duration::from_secs(60);
+pub const HEALTH_FILE: &str = "/var/lib/stonewave/health.json";
+pub const TUNNEL_FILE: &str = "/var/lib/stonewave/tunnel.json";
 
 pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
-}
-
-fn host_name() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .map(|s| s.trim().to_owned())
-        .unwrap_or_default()
-}
-
-/// The `doctor` checks as one JSON object with a time stamp: what `health.json` and the health report hold.
-pub fn health_json() -> String {
-    let checks = doctor::run_all(&doctor::SYSTEM);
-    format!(
-        r#"{{"ts":{},"report":{}}}"#,
-        now_secs(),
-        doctor::to_json(&host_name(), &checks)
-    )
 }
 
 fn write_atomic(path: &str, text: &str) -> std::io::Result<()> {
@@ -42,13 +31,76 @@ fn write_atomic(path: &str, text: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// This build of the daemon only keeps `health.json` fresh. The tunnel to Wave comes with the relay.
+/// The health report as JSON text (the `v` of a health frame).
+pub fn health_text() -> String {
+    health::report(&doctor::SYSTEM, now_secs()).to_string()
+}
+
+/// What `stonewave status` reads: the state of the line, written whenever it changes.
+pub fn write_tunnel_state(state: &str, detail: &str) {
+    let v = serde_json::json!({ "state": state, "detail": detail, "ts": now_secs() });
+    if let Err(e) = write_atomic(TUNNEL_FILE, &(v.to_string() + "\n")) {
+        eprintln!("stonewaved: cannot write {TUNNEL_FILE}: {e}");
+    }
+}
+
 pub fn run_daemon() -> ExitCode {
-    loop {
-        if let Err(e) = write_atomic(HEALTH_FILE, &health_json()) {
+    // The report is also kept on disk for `status` and for the agent shell, whether or not Wave is reached.
+    let report: Arc<dyn Fn() -> String + Send + Sync> = Arc::new(|| {
+        let text = health_text();
+        let wrapped = format!(r#"{{"ts":{},"health":{text}}}"#, now_secs());
+        if let Err(e) = write_atomic(HEALTH_FILE, &(wrapped + "\n")) {
             eprintln!("stonewaved: cannot write {HEALTH_FILE}: {e}");
         }
-        std::thread::sleep(HEALTH_EVERY);
+        text
+    });
+
+    let Some((key, identity)) = relay::load(&Paths::system()) else {
+        eprintln!(
+            "stonewaved: this server is not connected to Wave yet (no server key); keeping the local health report only"
+        );
+        write_tunnel_state("local", "not connected: run `sudo stonewave connect`");
+        loop {
+            report();
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    };
+    let relay_addr = match Account::parse(&identity.relay) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("stonewaved: the relay address in server.json is not usable: {e}");
+            return ExitCode::from(EXIT_REVOKED);
+        }
+    };
+    let transport = Arc::new(CurlTransport {
+        base: relay_addr.base().to_owned(),
+        server_ref: identity.server_ref.clone(),
+        key,
+    });
+    eprintln!(
+        "stonewaved: {} for {} via {}",
+        identity.name,
+        identity.company,
+        relay_addr.host_text()
+    );
+    let status = |state: &str, detail: &str| {
+        eprintln!("stonewaved: {state} {detail}");
+        write_tunnel_state(state, detail);
+    };
+    match tunnel::run_forever(
+        transport,
+        &Settings::default(),
+        report,
+        &status,
+        &AtomicBool::new(false),
+    ) {
+        End::Revoked => {
+            eprintln!(
+                "stonewaved: Wave cut this server off; stopping for good (`sudo stonewave setup` to start again)"
+            );
+            ExitCode::from(EXIT_REVOKED)
+        }
+        End::Retry(_) => ExitCode::FAILURE,
     }
 }
 
@@ -70,7 +122,7 @@ pub fn run_agent_shell() -> ExitCode {
     let asked = asked.trim();
     let result = match asked {
         "health" => {
-            println!("{}", health_json());
+            println!(r#"{{"ts":{},"health":{}}}"#, now_secs(), health_text());
             "ok"
         }
         _ => {

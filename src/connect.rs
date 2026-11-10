@@ -24,6 +24,9 @@ use serde_json::{Value, json};
 
 /// Where the account lives unless `--account` or `STONEWAVE_ACCOUNT_URL` says otherwise.
 pub const DEFAULT_ACCOUNT: &str = "https://account.stonewavetech.com";
+/// Where the relay of Wave lives unless `--relay` or `STONEWAVE_RELAY_URL` says otherwise. The name is chosen, but the DNS entry only
+/// exists once Stonewave switches the relay on; until then `connect` ends with "no connection" and changes nothing.
+pub const DEFAULT_RELAY: &str = "https://relay.stonewavetech.com";
 const CLIENT_ID: &str = "stonewave-cli";
 const GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 /// Polling never goes faster than this, whatever the server says.
@@ -60,7 +63,7 @@ impl fmt::Display for ConnectError {
 
 /// Text from outside, cut and cleaned before it reaches a terminal: no control or escape codes, no invisible
 /// or direction-changing characters, no long lines. Letters of any language stay (a company can be "Müller & Söhne").
-fn tame(s: &str, max: usize) -> String {
+pub(crate) fn tame(s: &str, max: usize) -> String {
     let bad = |c: char| {
         c.is_control()
             || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
@@ -112,6 +115,11 @@ impl Account {
         Ok(Account {
             base: format!("{scheme}://{rest}"),
         })
+    }
+
+    /// `https://host[:port]`
+    pub fn base(&self) -> &str {
+        &self.base
     }
 
     pub fn url(&self, path: &str) -> String {
@@ -283,8 +291,13 @@ pub struct Started {
 pub struct Token(String);
 
 impl Token {
-    fn secret(&self) -> &str {
+    pub(crate) fn secret(&self) -> &str {
         &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(s: &str) -> Token {
+        Token(s.to_owned())
     }
 }
 
