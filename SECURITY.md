@@ -15,6 +15,8 @@ This tool will give software agents scoped access to servers, so we take reports
 
 ## What this build does not do yet
 
-`connect`, `status` and `revoke` are demos of the screens. They change nothing on the machine and talk to no server,
-so they cannot leak or grant anything. `doctor` reads system files, runs a few report-only commands and opens one TCP
+`status`, `revoke` and `connect --demo` are demos of the screens: they change nothing and talk to no server.
+`connect` talks to the Stonewave account (`POST /v1/device/code`, `POST /v1/device/token`, `GET /v1/cli/whoami`) and
+changes nothing on the machine; the token it receives is not saved or printed. It sends the host name, OS name and CLI
+version, which the admin sees on the confirmation page. `doctor` reads system files, runs a few report-only commands and opens one TCP
 connection to `account.stonewavetech.com:443` without sending data.

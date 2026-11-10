@@ -1,11 +1,12 @@
 //! `stonewave`: the Stonewave server CLI, early build.
 //!
 //! `doctor` is real and read only: it checks whether this server can be
-//! connected to Wave. `connect`, `status` and `revoke` are demos of the look:
-//! they change nothing on the machine (no users, no files, no services, no
-//! network). See `README.md`.
+//! connected to Wave. `connect` really signs in with a device code at the
+//! Stonewave account (and changes nothing on the machine yet); `connect --demo`,
+//! `status` and `revoke` are demos of the look that talk to nobody. See `README.md`.
 
 mod banner;
+mod connect;
 mod doctor;
 mod flow;
 mod style;
@@ -39,6 +40,10 @@ struct Args {
     seed: Option<u64>,
     /// `--json`: machine-readable output (doctor only), for agents.
     json: bool,
+    /// `--demo`: connect plays the old made-up screens and talks to nobody.
+    demo: bool,
+    /// `--account <url>`: where the account lives (default: STONEWAVE_ACCOUNT_URL, then the Stonewave account).
+    account: Option<String>,
 }
 
 const HELP: &str = "\
@@ -46,13 +51,15 @@ Usage: stonewave [command] [options]
 
 Commands:
   doctor         Check whether this server can be connected (real, read only)
-  connect        Connect this server to Wave (default; demo, changes nothing)
+  connect        Sign this server in to your Stonewave account (default). Changes nothing on this machine yet
   status         Connection, agent rights and health (demo)
   revoke         Revoke all agent access on this server (demo)
   banner         Play the banner
 
 Options:
   --json         doctor: print one JSON object instead of the screen (for agents)
+  --account <url>  connect: address of the account (or STONEWAVE_ACCOUNT_URL); https only
+  --demo         connect: play the made-up screens, talk to nobody
   --no-anim      Final states only (also NO_COLOR, STONEWAVE_NO_ANIM=1, TERM=dumb, pipes)
   --host <name>  Demo: host name to show
   --os <name>    Demo: OS to show
@@ -77,6 +84,8 @@ fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
         user: None,
         seed: None,
         json: false,
+        demo: false,
+        account: None,
     };
     let mut command_set = false;
     let mut it = raw.into_iter();
@@ -97,6 +106,8 @@ fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "-V" | "--version" => args.command = Command::Version,
             "--no-anim" => args.term.no_anim = true,
             "--json" => args.json = true,
+            "--demo" => args.demo = true,
+            "--account" => args.account = Some(value("--account")?),
             "--autoplay" => args.term.autoplay = true,
             "--live" => args.term.force_live = true,
             "--record" => args.term.record = Some(value("--record")?.into()),
@@ -139,6 +150,12 @@ fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
         )
     {
         return Err("--json only works with doctor".into());
+    }
+    if (args.demo || args.account.is_some()) && args.command != Command::Connect {
+        return Err("--demo and --account only work with connect".into());
+    }
+    if args.demo && args.account.is_some() {
+        return Err("--demo talks to nobody, so --account makes no sense with it".into());
     }
     Ok(args)
 }
@@ -187,7 +204,30 @@ fn main() -> ExitCode {
     let mut rng = flow::Rng::new(args.seed);
 
     let result = match args.command {
-        Command::Connect => flow::connect(&mut term, &host, &mut rng),
+        Command::Connect if args.demo => flow::connect(&mut term, &host, &mut rng),
+        Command::Connect => {
+            let raw = args
+                .account
+                .or_else(|| {
+                    std::env::var("STONEWAVE_ACCOUNT_URL")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                })
+                .unwrap_or_else(|| connect::DEFAULT_ACCOUNT.to_owned());
+            match connect::Account::parse(&raw) {
+                Ok(account) => {
+                    let http = connect::Curl {
+                        allow_plain_http: !account.is_https(),
+                    };
+                    flow::connect_real(&mut term, &host, &account, &http)
+                }
+                Err(e) => {
+                    drop(term);
+                    eprintln!("stonewave: {e}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
         Command::Status => flow::status(&mut term, &host),
         Command::Revoke => flow::revoke(&mut term, &host),
         Command::Banner => flow::banner_only(&mut term),
@@ -199,7 +239,7 @@ fn main() -> ExitCode {
 
     match result {
         Ok(Outcome::Done) => ExitCode::SUCCESS,
-        Ok(Outcome::Declined) => ExitCode::from(1),
+        Ok(Outcome::Declined | Outcome::Failed) => ExitCode::from(1),
         Err(term::Error::Interrupted) => {
             eprintln!("\n  stopped · nothing was changed");
             ExitCode::from(130)
@@ -249,6 +289,17 @@ mod tests {
         assert!(p(&["status", "revoke"]).is_err());
         assert!(p(&["--width", "wide"]).is_err());
         assert!(p(&["deploy"]).is_err());
+    }
+
+    #[test]
+    fn connect_options() {
+        let a = p(&["connect", "--account", "https://a.test"]).unwrap();
+        assert_eq!(a.account.as_deref(), Some("https://a.test"));
+        assert!(p(&["--demo"]).unwrap().demo);
+        assert!(p(&["status", "--demo"]).is_err());
+        assert!(p(&["status", "--account", "https://a.test"]).is_err());
+        assert!(p(&["--demo", "--account", "https://a.test"]).is_err());
+        assert!(p(&["connect", "--account"]).is_err());
     }
 
     #[test]
