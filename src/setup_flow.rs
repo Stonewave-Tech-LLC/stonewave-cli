@@ -19,7 +19,7 @@ pub struct SetupArgs {
 }
 
 pub(crate) fn row(m: ColorMode, r: &StepReport, dry: bool) -> Vec<String> {
-    let name = format!("{:<12}", r.name);
+    let name = format!("{:<15}", r.name);
     match &r.outcome {
         Outcome::Kept(text) => vec![format!(
             "{DETAIL}{} {}{}",
@@ -60,7 +60,10 @@ fn show(term: &mut Term, reports: &[StepReport], dry: bool) {
     }
 }
 
-fn load_trust(term: &mut Term, files: &[String]) -> std::result::Result<Vec<TrustKey>, ()> {
+pub(crate) fn load_trust(
+    term: &mut Term,
+    files: &[String],
+) -> std::result::Result<Vec<TrustKey>, ()> {
     let m = term.mode();
     let mut keys = Vec::new();
     for f in files {

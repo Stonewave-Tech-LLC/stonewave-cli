@@ -395,6 +395,7 @@ pub fn daemon_unit() -> String {
          ExecStart={BIN} daemon\n\
          Restart=always\n\
          RestartSec=5\n\
+         RestartPreventExitStatus=78\n\
          NoNewPrivileges=yes\n\
          CapabilityBoundingSet=\n\
          AmbientCapabilities=\n\
@@ -1689,6 +1690,7 @@ mod tests {
             "ProtectSystem=strict",
             "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
             "User=stonewave\n",
+            "RestartPreventExitStatus=78\n",
         ] {
             assert!(u.contains(must), "daemon unit lacks {must}");
         }

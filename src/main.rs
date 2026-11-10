@@ -89,7 +89,7 @@ Options:
   --sign-in-only connect: only sign in; register nothing, change nothing
   --dry-run      setup, revoke: show what would change, change nothing
   --yes          connect, setup, revoke: do it without asking
-  --trust-file <file>  setup: public keys of admin devices to trust (one per line)
+  --trust-file <file>  connect, setup: public keys of admin devices to trust (one per line)
   --device <name>      revoke: only remove this admin device
   --no-anim      Final states only (also NO_COLOR, STONEWAVE_NO_ANIM=1, TERM=dumb, pipes)
   --host <name>  Demo: host name to show
@@ -220,8 +220,8 @@ fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
     if (args.dry_run || args.yes) && !changes_server {
         return Err("--dry-run and --yes only work with connect, setup and revoke".into());
     }
-    if !args.trust_files.is_empty() && args.command != Command::Setup {
-        return Err("--trust-file only works with setup".into());
+    if !args.trust_files.is_empty() && !matches!(args.command, Command::Setup | Command::Connect) {
+        return Err("--trust-file only works with connect and setup".into());
     }
     if args.device.is_some() && args.command != Command::Revoke {
         return Err("--device only works with revoke".into());
@@ -318,7 +318,13 @@ fn main() -> ExitCode {
                 relay: &relay,
                 http: &relay_http,
                 yes: args.yes,
+                trust: Vec::new(),
             };
+            let trust = match flow::load_trust_files(&mut term, &args.trust_files) {
+                Ok(t) => t,
+                Err(()) => return ExitCode::from(2),
+            };
+            let enrol = flow::Enrol { trust, ..enrol };
             flow::connect_real(
                 &mut term,
                 &host,

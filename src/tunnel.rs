@@ -131,7 +131,7 @@ pub fn run_session<T: Transport>(
     };
     let first = match read_line(&mut *reader) {
         Ok(Some(l)) => l,
-        Ok(None) => return End::Retry("the relay closed the line at once".into()),
+        Ok(None) => return End::Retry("no answer from the relay (is it reachable?)".into()),
         Err(e) => return End::Retry(e),
     };
     let session = match parse_down(&first) {

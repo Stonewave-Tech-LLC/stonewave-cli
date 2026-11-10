@@ -23,7 +23,7 @@ fn age(ts: u64) -> String {
 }
 
 fn line(m: ColorMode, label: &str, value: &str) -> String {
-    kv(m, DETAIL, label, 9, value)
+    kv(m, DETAIL, label, 11, value)
 }
 
 pub fn show(term: &mut Term, host: &Host) -> Result<Outcome> {
@@ -135,7 +135,7 @@ pub fn show(term: &mut Term, host: &Host) -> Result<Outcome> {
                         c["id"].as_str().unwrap_or("?"),
                         c["detail"].as_str().unwrap_or("")
                     );
-                    term.line(&format!("{DETAIL}{:9}{}", "", m.fg(pal::AMBER, &text)));
+                    term.line(&format!("{DETAIL}{:11}{}", "", m.fg(pal::AMBER, &text)));
                 }
             }
         }

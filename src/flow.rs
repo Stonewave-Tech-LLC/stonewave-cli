@@ -257,6 +257,15 @@ pub struct Enrol<'a> {
     pub relay: &'a Account,
     pub http: &'a dyn Http,
     pub yes: bool,
+    /// Admin device keys to trust right away (until Wave hands them over, from `--trust-file`).
+    pub trust: Vec<crate::setup::TrustKey>,
+}
+
+pub fn load_trust_files(
+    term: &mut Term,
+    files: &[String],
+) -> std::result::Result<Vec<crate::setup::TrustKey>, ()> {
+    crate::setup_flow::load_trust(term, files)
 }
 
 pub fn connect_real(
@@ -462,7 +471,7 @@ fn enrol_and_set_up(
     let sys = crate::realsys::RealSys;
     let cfg = setup::Config {
         version: crate::VERSION,
-        trust: Vec::new(),
+        trust: enrol.trust.clone(),
     };
     let checks = crate::doctor::run_all(&crate::doctor::SYSTEM);
     let result = setup::run_steps(&sys, false, &cfg, &checks, |_| {});
