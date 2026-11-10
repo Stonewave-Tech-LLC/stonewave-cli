@@ -19,7 +19,7 @@ pub struct SetupArgs {
 }
 
 fn row(m: ColorMode, r: &StepReport, dry: bool) -> Vec<String> {
-    let name = format!("{:<12}", r.name);
+    let name = format!("{:<15}", r.name);
     match &r.outcome {
         Outcome::Kept(text) => vec![format!(
             "{DETAIL}{} {}{}",
