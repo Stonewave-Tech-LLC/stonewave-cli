@@ -644,6 +644,9 @@ pub fn agent_ssh(sys: &dyn Sys, dry: bool) -> R<Outcome> {
             &["-q", "-k", "-f", KRL],
         )?;
     }
+    // `sshd -t` needs its privilege separation folder. The server's own ssh service makes it only while it runs, and
+    // our unit makes it at start (`install -d`), so a first setup has to make it for the check (found on a real Ubuntu).
+    ctx.dir("/run/sshd", 0o755, ("root", "root"))?;
     let config_changed = ctx.file_checked(
         SSHD_CONFIG,
         &sshd_config(),
