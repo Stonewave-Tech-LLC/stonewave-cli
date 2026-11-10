@@ -1,4 +1,4 @@
-//! `stonewave setup` and `stonewave revoke`: the deterministic base setup of a server (F-100 section 9).
+//! `stonewave setup` and `stonewave revoke`: the deterministic base setup of a server.
 //!
 //! Every step looks first and changes only what is missing, so a second run changes nothing. All
 //! effects go through [`Sys`], so the steps run against a made-up server in the tests and, with
@@ -36,7 +36,7 @@ pub const SERVER_IDENTITY: &str = "/var/lib/stonewave/server.json";
 pub const AUDIT: &str = "/var/log/stonewave/audit.jsonl";
 pub const SSHD_BIN: &str = "/usr/sbin/sshd";
 
-/// What the agent may do right after connecting: read (D-225). More only with a signature of an admin device.
+/// What the agent may do right after connecting: read. More only with a signature of an admin device.
 pub const DEFAULT_PRINCIPALS: [&str; 3] = ["sw.read", "sw.logs", "sw.health"];
 /// Groups that would give the agent user power it must not have.
 const FORBIDDEN_GROUPS: [&str; 6] = ["sudo", "admin", "wheel", "root", "adm", "docker"];
@@ -302,6 +302,28 @@ pub fn read_trust(text: &str) -> Vec<TrustKey> {
         .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
         .filter_map(|l| parse_key_line(l, "device").ok())
         .collect()
+}
+
+/// Numbers of the lines in the trust file that stonewave cannot read (other key types, options, typos). Setup and revoke
+/// rewrite the file from what they understand, so they must not touch a file that holds something else.
+pub fn foreign_lines(text: &str) -> Vec<usize> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty() && !l.trim().starts_with('#'))
+        .filter(|(_, l)| parse_key_line(l, "device").is_err())
+        .map(|(i, _)| i + 1)
+        .collect()
+}
+
+fn foreign_message(lines: &[usize]) -> String {
+    format!(
+        "{TRUST} has line(s) {} that stonewave does not understand (not an ssh-ed25519 or ecdsa-sha2-nistp256 key without options). It was left as it is: fix or remove them by hand",
+        lines
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn render_trust(keys: &[TrustKey]) -> String {
@@ -578,7 +600,12 @@ pub fn admin_keys(sys: &dyn Sys, dry: bool, wanted: &[TrustKey]) -> R<Outcome> {
     let mut ctx = Ctx::new(sys, dry);
     ctx.dir(ETC, 0o755, ("root", "root"))?;
     ctx.dir(ETC_SSH, 0o755, ("root", "root"))?;
-    let mut keys = sys.read(TRUST).map(|t| read_trust(&t)).unwrap_or_default();
+    let existing_text = sys.read(TRUST).unwrap_or_default();
+    let foreign = foreign_lines(&existing_text);
+    if !foreign.is_empty() {
+        return Ok(Outcome::Attention(foreign_message(&foreign)));
+    }
+    let mut keys = read_trust(&existing_text);
     for k in wanted {
         if keys.iter().any(|e| e.key == k.key) {
             continue;
@@ -883,7 +910,12 @@ pub fn revoke(sys: &dyn Sys, dry: bool, device: Option<&str>) -> R<Vec<StepRepor
     let mut reports = Vec::new();
     if let Some(name) = device {
         let mut ctx = Ctx::new(sys, dry);
-        let mut keys = sys.read(TRUST).map(|t| read_trust(&t)).unwrap_or_default();
+        let text = sys.read(TRUST).unwrap_or_default();
+        let foreign = foreign_lines(&text);
+        if !foreign.is_empty() {
+            return Err(foreign_message(&foreign));
+        }
+        let mut keys = read_trust(&text);
         let before = keys.len();
         keys.retain(|k| !k.device.eq_ignore_ascii_case(name));
         if keys.len() == before {
@@ -1502,6 +1534,28 @@ mod tests {
             ),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_trust_file_with_lines_we_do_not_know_is_never_rewritten() {
+        let fake = Fake::new();
+        let a = parse_key_line(&ed25519_line(1, "Office PC"), "d").unwrap();
+        run(&fake, false, vec![a.clone()]);
+        let hand = format!(
+            "{}ssh-rsa AAAAB3NzaC1yc2E= some-old-ca\n",
+            fake.file(TRUST).unwrap()
+        );
+        fake.set_file(TRUST, &hand, 0o644, "root", "root");
+        assert_eq!(foreign_lines(&hand), vec![4]);
+        let err = run_steps(&fake, false, &cfg(vec![a]), &checks(Level::Ok), |_| {}).unwrap_err();
+        assert!(err.1.contains("Admin keys"), "{err:?}");
+        assert_eq!(
+            fake.file(TRUST).unwrap(),
+            hand,
+            "the file stays as the admin left it"
+        );
+        assert!(revoke(&fake, false, Some("Office PC")).is_err());
+        assert_eq!(fake.file(TRUST).unwrap(), hand);
     }
 
     #[test]
