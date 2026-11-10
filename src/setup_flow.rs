@@ -198,6 +198,20 @@ pub fn setup(term: &mut Term, host: &Host, args: &SetupArgs) -> Result<FlowOutco
             term.line(&format!("{INDENT}{}", m.bold("Setup")));
             show(term, &done, false);
             term.blank();
+            if done
+                .iter()
+                .any(|r| matches!(r.outcome, Outcome::Attention(_)))
+            {
+                term.line(&format!(
+                    "{INDENT}{}",
+                    m.fg(
+                        pal::RED,
+                        "Set up, but something above needs a look (a red cross). Fix it and run setup again."
+                    )
+                ));
+                term.flush()?;
+                return Ok(FlowOutcome::Failed);
+            }
             term.line(&format!(
                 "{INDENT}{}",
                 m.fg_bold(
