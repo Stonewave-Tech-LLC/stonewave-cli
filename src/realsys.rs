@@ -154,6 +154,10 @@ impl Sys for RealSys {
         TcpStream::connect_timeout(&addr, Duration::from_millis(800)).is_ok()
     }
 
+    fn is_symlink(&self, path: &str) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+    }
+
     fn euid(&self) -> u32 {
         std::fs::read_to_string("/proc/self/status")
             .ok()

@@ -68,6 +68,8 @@ pub trait Sys {
     /// Whether something listens on 127.0.0.1:port.
     fn listening(&self, port: u16) -> bool;
     fn euid(&self) -> u32;
+    /// Whether the path itself is a symbolic link (not what it points to).
+    fn is_symlink(&self, path: &str) -> bool;
 }
 
 /// One thing setup did, or would do with `--dry-run`.
@@ -120,6 +122,28 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Setup runs as root and some of the folders it works in belong to the daemon's user. A link planted there must never
+    /// make root change the owner or mode of something else, so such a path is refused.
+    fn refuse_symlink(&self, path: &str) -> R<()> {
+        if self.sys.is_symlink(path) {
+            return Err(format!(
+                "{path} is a symbolic link: refused (remove it and run again)"
+            ));
+        }
+        Ok(())
+    }
+
+    /// chown that never follows a link.
+    fn chown(&self, who: &str, path: &str) -> R<()> {
+        self.refuse_symlink(path)?;
+        let r = self.sys.run("chown", &["-h", who, path]);
+        if r.ok {
+            Ok(())
+        } else {
+            Err(format!("chown {who} {path}: {}", first_line(&r.out)))
+        }
+    }
+
     fn matches(&self, path: &str, mode: u32, owner: (&str, &str)) -> bool {
         self.sys
             .stat(path)
@@ -142,11 +166,7 @@ impl<'a> Ctx<'a> {
             return Ok(true);
         }
         self.sys.write(path, content, mode)?;
-        let who = format!("{}:{}", owner.0, owner.1);
-        let r = self.sys.run("chown", &[&who, path]);
-        if !r.ok {
-            return Err(format!("chown {who} {path}: {}", first_line(&r.out)));
-        }
+        self.chown(&format!("{}:{}", owner.0, owner.1), path)?;
         Ok(true)
     }
 
@@ -192,12 +212,9 @@ impl<'a> Ctx<'a> {
         if self.dry {
             return Ok(true);
         }
+        self.refuse_symlink(path)?;
         self.sys.mkdir(path, mode)?;
-        let who = format!("{}:{}", owner.0, owner.1);
-        let r = self.sys.run("chown", &[&who, path]);
-        if !r.ok {
-            return Err(format!("chown {who} {path}: {}", first_line(&r.out)));
-        }
+        self.chown(&format!("{}:{}", owner.0, owner.1), path)?;
         Ok(true)
     }
 }
@@ -347,6 +364,8 @@ pub fn sshd_config() -> String {
          HostKey {HOST_KEY}\n\
          PidFile /run/stonewave-sshd.pid\n\
          AllowUsers {AGENT_USER}\n\
+         AuthorizedKeysFile none\n\
+         PermitUserRC no\n\
          PermitRootLogin no\n\
          PasswordAuthentication no\n\
          KbdInteractiveAuthentication no\n\
@@ -776,10 +795,11 @@ pub fn logbook(sys: &dyn Sys, dry: bool) -> R<Outcome> {
     if !sys.exists(AUDIT) {
         ctx.file(AUDIT, "", 0o640, (AGENT_USER, DAEMON_USER))?;
     } else if !ctx.matches(AUDIT, 0o640, (AGENT_USER, DAEMON_USER)) {
+        ctx.refuse_symlink(AUDIT)?;
         ctx.act(
             format!("fix rights of {AUDIT}"),
             "chown",
-            &[&format!("{AGENT_USER}:{DAEMON_USER}"), AUDIT],
+            &["-h", &format!("{AGENT_USER}:{DAEMON_USER}"), AUDIT],
         )?;
         ctx.act(format!("fix mode of {AUDIT}"), "chmod", &["0640", AUDIT])?;
     }
@@ -1036,7 +1056,12 @@ pub fn audit(sys: &dyn Sys, dry: bool, event: &str) {
     let old = sys.read(AUDIT).unwrap_or_default();
     let mode = sys.stat(AUDIT).map_or(0o640, |s| s.mode);
     let _ = sys.write(AUDIT, &format!("{old}{line}\n"), mode);
-    let _ = sys.run("chown", &[&format!("{AGENT_USER}:{DAEMON_USER}"), AUDIT]);
+    if !sys.is_symlink(AUDIT) {
+        let _ = sys.run(
+            "chown",
+            &["-h", &format!("{AGENT_USER}:{DAEMON_USER}"), AUDIT],
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1062,6 +1087,7 @@ pub mod fake {
         pub sessions: RefCell<bool>,
         pub procs: RefCell<bool>,
         pub euid: u32,
+        pub links: RefCell<BTreeSet<String>>,
     }
 
     impl Fake {
@@ -1155,6 +1181,9 @@ pub mod fake {
         fn euid(&self) -> u32 {
             self.euid
         }
+        fn is_symlink(&self, path: &str) -> bool {
+            self.links.borrow().contains(path)
+        }
         fn run(&self, cmd: &str, args: &[&str]) -> Run {
             let ok = |out: &str| Run {
                 ok: true,
@@ -1223,7 +1252,7 @@ pub mod fake {
                     }
                     ok("")
                 }
-                ("chown", [who, path]) => {
+                ("chown", ["-h", who, path]) => {
                     let (u, g) = who.split_once(':').unwrap();
                     if let Some(f) = self.files.borrow_mut().get_mut(*path) {
                         f.2 = u.into();
@@ -1540,6 +1569,33 @@ mod tests {
     }
 
     #[test]
+    fn a_planted_symbolic_link_never_makes_root_change_something_else() {
+        let fake = Fake::new();
+        run(&fake, false, vec![]);
+        // the daemon's user owns its folder and replaces the audit log by a link
+        fake.links.borrow_mut().insert(AUDIT.to_owned());
+        fake.set_file(AUDIT, "", 0o777, "stonewave", "stonewave");
+        fake.clear_log();
+        let err = logbook(&fake, false).unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        assert!(
+            !fake
+                .commands()
+                .iter()
+                .any(|c| c.starts_with("chown") || c.starts_with("chmod")),
+            "no chown or chmod ran: {:?}",
+            fake.commands()
+        );
+        // and the same for a folder
+        fake.links.borrow_mut().insert(VAR_LOG.to_owned());
+        fake.dirs.borrow_mut().insert(
+            VAR_LOG.to_owned(),
+            (0o777, "stonewave".into(), "stonewave".into()),
+        );
+        assert!(logbook(&fake, false).is_err());
+    }
+
+    #[test]
     fn the_agent_user_may_not_sit_in_powerful_groups() {
         let fake = Fake::new();
         run(&fake, false, vec![]);
@@ -1710,6 +1766,8 @@ mod tests {
             "PasswordAuthentication no",
             "ExposeAuthInfo yes",
             "AllowTcpForwarding no",
+            "AuthorizedKeysFile none",
+            "PermitUserRC no",
             "PermitTTY no",
             "ForceCommand /usr/local/bin/stonewave agent-shell",
             "AllowUsers stonewave-agent",
