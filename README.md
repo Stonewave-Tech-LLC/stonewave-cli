@@ -101,6 +101,10 @@ Nothing on the machine changes before Wave has accepted the key. `--trust-file <
 health report; `sudo stonewave revoke` closes it for good (and Wave can cut the line from its side: the daemon then
 stops and is not restarted).
 
+For agents and scripts, `sudo stonewave status --json` prints the same facts as one JSON object (no colour, no secrets;
+`connected`, `daemon`, `agent_ssh`, `health`, ...). The exit code is 0 whenever the report could be made, whatever the state
+is; it is non-zero only when the command itself failed. Without sudo it says `"readable": false` instead of guessing.
+
 HTTP goes through the system `curl` (the install command needs it anyway), so TLS and the certificate store are the
 system's. Secrets are handed to curl on stdin, never as arguments. A plain `http://` address is only accepted for this
 machine (`127.0.0.1`, `localhost`, `::1`), for tests.

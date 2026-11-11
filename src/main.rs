@@ -82,7 +82,7 @@ Commands:
   banner         Play the banner
 
 Options:
-  --json         doctor: print one JSON object instead of the screen (for agents)
+  --json         doctor, status: print one JSON object instead of the screen (for agents and scripts)
   --account <url>  connect: address of the account (or STONEWAVE_ACCOUNT_URL); https only
   --demo         connect, status: play the made-up screens, talk to nobody
   --relay <url>  connect: address of the Wave relay (or STONEWAVE_RELAY_URL); https only
@@ -192,10 +192,13 @@ fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
     if args.json
         && !matches!(
             args.command,
-            Command::Doctor | Command::Help | Command::Version
+            Command::Doctor | Command::Status | Command::Help | Command::Version
         )
     {
-        return Err("--json only works with doctor".into());
+        return Err("--json only works with doctor and status".into());
+    }
+    if args.json && args.demo {
+        return Err("--json shows the real state; it does not combine with --demo".into());
     }
     if args.demo && !matches!(args.command, Command::Connect | Command::Status) {
         return Err("--demo only works with connect and status".into());
@@ -263,6 +266,7 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             };
         }
+        Command::Status if args.json => return status::print_json(),
         Command::Daemon => return daemon::run_daemon(),
         Command::AgentShell => return daemon::run_agent_shell(),
         _ => {}
@@ -427,12 +431,17 @@ mod tests {
     }
 
     #[test]
-    fn json_only_for_doctor() {
+    fn json_only_for_doctor_and_status() {
         let a = p(&["doctor", "--json"]).unwrap();
         assert_eq!(a.command, Command::Doctor);
         assert!(a.json);
-        assert!(p(&["status", "--json"]).is_err());
+        let a = p(&["status", "--json"]).unwrap();
+        assert_eq!(a.command, Command::Status);
+        assert!(a.json);
+        assert!(p(&["status", "--json", "--demo"]).is_err());
         assert!(p(&["--json"]).is_err());
+        assert!(p(&["connect", "--json"]).is_err());
+        assert!(p(&["setup", "--json"]).is_err());
     }
 
     #[test]
