@@ -103,7 +103,8 @@ stops and is not restarted).
 
 For agents and scripts, `sudo stonewave status --json` prints the same facts as one JSON object (no colour, no secrets;
 `connected`, `daemon`, `agent_ssh`, `health`, ...). The exit code is 0 whenever the report could be made, whatever the state
-is; it is non-zero only when the command itself failed. Without sudo it says `"readable": false` instead of guessing.
+is; it is non-zero only when the command itself failed. Without sudo it says `"readable": false` instead of guessing. `access_revoked` is the local
+`sudo stonewave revoke`; when Wave cut the line, `line.state` is `"revoked"` and `connected` is false.
 
 HTTP goes through the system `curl` (the install command needs it anyway), so TLS and the certificate store are the
 system's. Secrets are handed to curl on stdin, never as arguments. A plain `http://` address is only accepted for this
