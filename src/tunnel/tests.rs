@@ -611,3 +611,31 @@ fn an_unreachable_relay_is_a_network_error_not_a_refusal() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn one_request_never_carries_more_than_64_frames() {
+    // The relay answers `400 bad_frame` to a request with more; a burst of small frames must be split.
+    let fake = Fake {
+        stream: Mutex::new(None),
+        posts: Mutex::new(Vec::new()),
+        post_error: Mutex::new(None),
+        open_error: Mutex::new(None),
+    };
+    let (tx, rx) = mpsc::sync_channel::<Up>(512);
+    for ch in 1..=300u32 {
+        tx.send(Up::Close(ch)).unwrap();
+    }
+    drop(tx);
+    upload_loop(
+        &fake,
+        SESSION,
+        rx,
+        &Mutex::new(None),
+        &AtomicBool::new(false),
+        Duration::from_millis(40),
+    );
+    let posts = fake.posts.lock().unwrap();
+    let counts: Vec<usize> = posts.iter().map(|b| b.lines().count()).collect();
+    assert!(counts.iter().all(|n| (1..=64).contains(n)), "{counts:?}");
+    assert_eq!(counts.iter().sum::<usize>(), 300, "no frame is lost");
+}

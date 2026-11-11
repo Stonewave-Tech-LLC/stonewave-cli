@@ -350,16 +350,20 @@ fn upload_loop<T: Transport>(
     window: Duration,
 ) {
     const MAX_TEXT: usize = 48 * 1024;
+    // The relay refuses a request of more than 64 frames (`400 bad_frame`), however small they are.
+    const MAX_FRAMES: usize = 64;
     while let Ok(first) = rx.recv() {
         let mut only_health = matches!(first, Up::Health(_));
         let mut body = first.line() + "\n";
+        let mut frames = 1;
         let until = Instant::now() + window;
-        while body.len() < MAX_TEXT {
+        while body.len() < MAX_TEXT && frames < MAX_FRAMES {
             match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
                 Ok(f) => {
                     only_health &= matches!(f, Up::Health(_));
                     body.push_str(&f.line());
                     body.push('\n');
+                    frames += 1;
                 }
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
             }

@@ -61,7 +61,7 @@ A response that does not end: one JSON object per line. One stream per server; a
 
 ## `POST /v1/relay/up` (server to Wave)
 
-NDJSON body, at most 256 KiB. Frames are sent in batches (frames that come close together share one request):
+NDJSON body, at most 256 KiB and 64 frames. Frames are sent in batches (frames that come close together share one request):
 
 - `{"t":"opened","ch"}`, `{"t":"open_failed","ch"}`, `{"t":"close","ch"}`
 - `{"t":"data","ch","d"}`
