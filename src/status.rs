@@ -12,6 +12,23 @@ use crate::style::{ColorMode, pal};
 use crate::term::{Result, Term};
 use crate::ui::{DETAIL, INDENT, kv};
 
+/// What reading the state file said. `/var/lib/stonewave` is private to the daemon user, so a person without sudo gets
+/// `Denied`, which is not the same as "not set up".
+#[derive(Debug, Clone, PartialEq)]
+pub enum Access {
+    Found(serde_json::Value),
+    Missing,
+    Denied,
+}
+
+pub fn read_access(path: &str) -> Access {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).map_or(Access::Missing, Access::Found),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Access::Denied,
+        Err(_) => Access::Missing,
+    }
+}
+
 fn read_json(path: &str) -> Option<serde_json::Value> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
@@ -34,16 +51,30 @@ pub fn show(term: &mut Term, host: &Host) -> Result<Outcome> {
     term.blank();
     term.line(&banner::compact(m, &host.name));
     term.blank();
-    let Some(state) = read_json(setup::STATE) else {
-        term.line(&format!(
-            "{INDENT}{}",
-            m.fg(
-                pal::GREY,
-                "Not set up on this server. `sudo stonewave connect` connects it to Wave."
-            )
-        ));
-        term.flush()?;
-        return Ok(Outcome::Done);
+    let state = match read_access(setup::STATE) {
+        Access::Found(v) => v,
+        Access::Denied => {
+            term.line(&format!(
+                "{INDENT}{}",
+                m.fg(
+                    pal::GREY,
+                    "Needs sudo to read: the state of Stonewave is private to its own user. Run `sudo stonewave status`."
+                )
+            ));
+            term.flush()?;
+            return Ok(Outcome::Done);
+        }
+        Access::Missing => {
+            term.line(&format!(
+                "{INDENT}{}",
+                m.fg(
+                    pal::GREY,
+                    "Not set up on this server. `sudo stonewave connect` connects it to Wave."
+                )
+            ));
+            term.flush()?;
+            return Ok(Outcome::Done);
+        }
     };
     let ident = Identity::parse(
         &std::fs::read_to_string(format!("{}/{IDENTITY_FILE}", setup::VAR_LIB)).unwrap_or_default(),
@@ -167,23 +198,6 @@ const METRICS: [&str; 7] = [
     "uptime_s",
     "updates",
 ];
-
-/// What reading the state file said. `/var/lib/stonewave` is private to the daemon user, so a person
-/// without sudo sees `Denied`, which is not the same as "not set up".
-#[derive(Debug, Clone, PartialEq)]
-pub enum Access {
-    Found(Value),
-    Missing,
-    Denied,
-}
-
-fn read_access(path: &str) -> Access {
-    match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).map_or(Access::Missing, Access::Found),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Access::Denied,
-        Err(_) => Access::Missing,
-    }
-}
 
 /// Everything the report is made from, read once. The report itself is a pure function of this.
 #[derive(Debug, Clone)]
@@ -522,5 +536,39 @@ mod tests {
         assert!(!text.contains('\u{1b}'));
         assert!(!text.contains('\n'), "one physical line");
         assert!(text.contains("a?[31mb?c"));
+    }
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("sw-status-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn a_missing_file_is_not_set_up_and_a_readable_one_is_found() {
+        let p = temp("a");
+        assert_eq!(read_access(p.to_str().unwrap()), Access::Missing);
+        std::fs::write(&p, r#"{"version":"1"}"#).unwrap();
+        assert_eq!(
+            read_access(p.to_str().unwrap()),
+            Access::Found(serde_json::json!({"version": "1"}))
+        );
+        std::fs::write(&p, "not json").unwrap();
+        assert_eq!(read_access(p.to_str().unwrap()), Access::Missing);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_the_user_may_not_read_says_denied_not_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = temp("b");
+        std::fs::write(&p, "{}").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // root reads anything: then there is nothing to check here
+        if std::fs::read_to_string(&p).is_err() {
+            assert_eq!(read_access(p.to_str().unwrap()), Access::Denied);
+        }
+        let _ = std::fs::remove_file(&p);
     }
 }

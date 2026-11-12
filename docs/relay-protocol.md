@@ -55,9 +55,11 @@ A response that does not end: one JSON object per line. One stream per server; a
 | `{"t":"open","ch"}` | connect a channel to the agent SSH (at most 4 at a time) |
 | `{"t":"data","ch","d"}` | bytes for the SSH (`d` base64url, at most 16 KiB before encoding) |
 | `{"t":"close","ch"}` | end the channel |
-| `{"t":"bye","reason"}` | `revoked`: Wave cut this server off for good; the daemon exits with status 78 and systemd does not restart it. Other reasons: reconnect |
+| `{"t":"bye","reason"}` | `revoked`: Wave cut this server off for good. The daemon closes the line, waits 20 s and asks again on a new connection; if Wave says it a second time (and no healthy line came up in between), it exits with status 78 and systemd does not restart it. Other reasons: reconnect |
 
 `open` carries a channel number and nothing else. Frame types this version does not know are ignored.
+
+**Known limit.** What Wave sends down is protected by TLS only; the frames carry no signature of Wave's own and the daemon does not pin the relay's certificate. Someone who sits inside the TLS connection (an inspecting proxy that the server trusts) could send frames, and could make the daemon stop by answering `revoked` every time. The two-step `revoked` above stops a single injected frame, not a proxy that keeps answering. What an `open` or `data` frame can reach is still limited by the agent SSH, which wants a certificate the admin's device signed. Signed down-frames (or a pinned relay key) need a key of Wave's own in the contract; until then this stays a known limit.
 
 ## `POST /v1/relay/up` (server to Wave)
 

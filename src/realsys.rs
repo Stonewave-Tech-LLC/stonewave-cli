@@ -84,6 +84,35 @@ impl Sys for RealSys {
         Ok(())
     }
 
+    fn chmod_file(&self, path: &str, mode: u32) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let err = |e: std::io::Error| format!("{path}: {e}");
+            // Open first (this follows a link), then check that what is open is a regular file and the very file the path
+            // names now: a link planted before the open leads to another file (different identity), one planted after
+            // shows as a link. Only then change the mode, on the open file.
+            let file = std::fs::File::open(path).map_err(err)?;
+            let opened = file.metadata().map_err(err)?;
+            let named = std::fs::symlink_metadata(path).map_err(err)?;
+            if !opened.is_file()
+                || !named.is_file()
+                || (opened.dev(), opened.ino()) != (named.dev(), named.ino())
+            {
+                return Err(format!(
+                    "{path} is not the plain file it was a moment ago: refused"
+                ));
+            }
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(err)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, mode);
+            Err("unsupported".into())
+        }
+    }
+
     fn remove(&self, path: &str) {
         let _ = std::fs::remove_file(path);
     }
@@ -164,5 +193,50 @@ impl Sys for RealSys {
             .as_deref()
             .and_then(crate::doctor::parse_euid)
             .unwrap_or(u32::MAX)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("sw-realsys-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn mode(p: &std::path::Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn chmod_changes_a_plain_file() {
+        let d = dir("plain");
+        let f = d.join("key");
+        std::fs::write(&f, "x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        RealSys.chmod_file(f.to_str().unwrap(), 0o600).unwrap();
+        assert_eq!(mode(&f), 0o600);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn chmod_never_changes_what_a_link_points_to() {
+        let d = dir("link");
+        let target = d.join("target");
+        std::fs::write(&target, "x").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = d.join("key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(RealSys.chmod_file(link.to_str().unwrap(), 0o600).is_err());
+        assert_eq!(
+            mode(&target),
+            0o644,
+            "the file behind the link is untouched"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
