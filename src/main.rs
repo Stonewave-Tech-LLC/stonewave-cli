@@ -11,11 +11,15 @@ mod connect;
 mod daemon;
 mod doctor;
 mod flow;
+mod health;
 mod realsys;
+mod relay;
 mod setup;
 mod setup_flow;
+mod status;
 mod style;
 mod term;
+mod tunnel;
 mod ui;
 
 use std::process::ExitCode;
@@ -52,6 +56,10 @@ struct Args {
     demo: bool,
     /// `--account <url>`: where the account lives (default: STONEWAVE_ACCOUNT_URL, then the Stonewave account).
     account: Option<String>,
+    /// `--relay <url>`: where the relay lives (default: STONEWAVE_RELAY_URL, then the Stonewave relay).
+    relay: Option<String>,
+    /// `--sign-in-only`: connect signs in and stops there (nothing is registered or changed).
+    sign_in_only: bool,
     /// `--dry-run`: setup and revoke only show what they would do.
     dry_run: bool,
     /// `--yes`: setup and revoke go ahead without asking.
@@ -67,19 +75,21 @@ Usage: stonewave [command] [options]
 
 Commands:
   doctor         Check whether this server can be connected (real, read only)
-  connect        Sign this server in to your Stonewave account (default). Changes nothing on this machine yet
+  connect        Sign in with your Stonewave account, register this server with Wave and set it up (default; needs sudo)
   setup          Set up this server: agent user, agent SSH, daemon, audit log (needs sudo; --dry-run only looks)
   revoke         Revoke all agent access on this server, also without internet (needs sudo)
-  status         Connection, agent rights and health (demo)
+  status         The line to Wave, the agent SSH and the last health report (--demo: made-up screens)
   banner         Play the banner
 
 Options:
   --json         doctor: print one JSON object instead of the screen (for agents)
   --account <url>  connect: address of the account (or STONEWAVE_ACCOUNT_URL); https only
-  --demo         connect: play the made-up screens, talk to nobody
+  --demo         connect, status: play the made-up screens, talk to nobody
+  --relay <url>  connect: address of the Wave relay (or STONEWAVE_RELAY_URL); https only
+  --sign-in-only connect: only sign in; register nothing, change nothing
   --dry-run      setup, revoke: show what would change, change nothing
-  --yes          setup, revoke: do it without asking
-  --trust-file <file>  setup: public keys of admin devices to trust (one per line)
+  --yes          connect, setup, revoke: do it without asking
+  --trust-file <file>  connect, setup: public keys of admin devices to trust (one per line)
   --device <name>      revoke: only remove this admin device
   --no-anim      Final states only (also NO_COLOR, STONEWAVE_NO_ANIM=1, TERM=dumb, pipes)
   --host <name>  Demo: host name to show
@@ -107,6 +117,8 @@ fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
         json: false,
         demo: false,
         account: None,
+        relay: None,
+        sign_in_only: false,
         dry_run: false,
         yes: false,
         trust_files: Vec::new(),
@@ -133,6 +145,8 @@ fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--json" => args.json = true,
             "--demo" => args.demo = true,
             "--account" => args.account = Some(value("--account")?),
+            "--relay" => args.relay = Some(value("--relay")?),
+            "--sign-in-only" => args.sign_in_only = true,
             "--dry-run" => args.dry_run = true,
             "--yes" => args.yes = true,
             "--trust-file" => args.trust_files.push(value("--trust-file")?),
@@ -183,23 +197,40 @@ fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
     {
         return Err("--json only works with doctor".into());
     }
-    if (args.demo || args.account.is_some()) && args.command != Command::Connect {
-        return Err("--demo and --account only work with connect".into());
+    if args.demo && !matches!(args.command, Command::Connect | Command::Status) {
+        return Err("--demo only works with connect and status".into());
     }
-    if args.demo && args.account.is_some() {
-        return Err("--demo talks to nobody, so --account makes no sense with it".into());
+    if (args.account.is_some() || args.relay.is_some() || args.sign_in_only)
+        && args.command != Command::Connect
+    {
+        return Err("--account, --relay and --sign-in-only only work with connect".into());
     }
-    let changes_server = matches!(args.command, Command::Setup | Command::Revoke);
+    if args.demo
+        && (args.account.is_some() || args.relay.is_some() || args.sign_in_only || args.yes)
+    {
+        return Err("--demo talks to nobody, so --account, --relay, --sign-in-only and --yes make no sense with it".into());
+    }
+    if args.dry_run && args.command == Command::Connect {
+        return Err("connect has no --dry-run: `stonewave setup --dry-run` shows the setup, `connect --sign-in-only` only signs in".into());
+    }
+    let changes_server = matches!(
+        args.command,
+        Command::Setup | Command::Revoke | Command::Connect
+    );
     if (args.dry_run || args.yes) && !changes_server {
-        return Err("--dry-run and --yes only work with setup and revoke".into());
+        return Err("--dry-run and --yes only work with connect, setup and revoke".into());
     }
-    if !args.trust_files.is_empty() && args.command != Command::Setup {
-        return Err("--trust-file only works with setup".into());
+    if !args.trust_files.is_empty() && !matches!(args.command, Command::Setup | Command::Connect) {
+        return Err("--trust-file only works with connect and setup".into());
     }
     if args.device.is_some() && args.command != Command::Revoke {
         return Err("--device only works with revoke".into());
     }
     Ok(args)
+}
+
+fn env_url(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
 fn main() -> ExitCode {
@@ -252,27 +283,58 @@ fn main() -> ExitCode {
         Command::Connect => {
             let raw = args
                 .account
-                .or_else(|| {
-                    std::env::var("STONEWAVE_ACCOUNT_URL")
-                        .ok()
-                        .filter(|v| !v.is_empty())
-                })
+                .or_else(|| env_url("STONEWAVE_ACCOUNT_URL"))
                 .unwrap_or_else(|| connect::DEFAULT_ACCOUNT.to_owned());
-            match connect::Account::parse(&raw) {
-                Ok(account) => {
-                    let http = connect::Curl {
-                        allow_plain_http: !account.is_https(),
-                    };
-                    flow::connect_real(&mut term, &host, &account, &http)
-                }
-                Err(e) => {
+            let raw_relay = args
+                .relay
+                .or_else(|| env_url("STONEWAVE_RELAY_URL"))
+                .unwrap_or_else(|| connect::DEFAULT_RELAY.to_owned());
+            let (account, relay) = match (
+                connect::Account::parse(&raw),
+                connect::Account::parse(&raw_relay),
+            ) {
+                (Ok(a), Ok(r)) => (a, r),
+                (Err(e), _) | (_, Err(e)) => {
                     drop(term);
                     eprintln!("stonewave: {e}");
                     return ExitCode::from(2);
                 }
+            };
+            // Registering a server changes it. That needs root, and it is kinder to say so before the person signs in.
+            if !args.sign_in_only && setup::Sys::euid(&realsys::RealSys) != 0 {
+                drop(term);
+                eprintln!(
+                    "stonewave: connect sets this server up and needs root. Run `sudo stonewave connect` (or add --sign-in-only to only sign in)."
+                );
+                return ExitCode::from(2);
             }
+            let http = connect::Curl {
+                allow_plain_http: !account.is_https(),
+            };
+            let relay_http = connect::Curl {
+                allow_plain_http: !relay.is_https(),
+            };
+            let enrol = flow::Enrol {
+                relay: &relay,
+                http: &relay_http,
+                yes: args.yes,
+                trust: Vec::new(),
+            };
+            let trust = match flow::load_trust_files(&mut term, &args.trust_files) {
+                Ok(t) => t,
+                Err(()) => return ExitCode::from(2),
+            };
+            let enrol = flow::Enrol { trust, ..enrol };
+            flow::connect_real(
+                &mut term,
+                &host,
+                &account,
+                &http,
+                (!args.sign_in_only).then_some(&enrol),
+            )
         }
-        Command::Status => flow::status(&mut term, &host),
+        Command::Status if args.demo => flow::status(&mut term, &host),
+        Command::Status => status::show(&mut term, &host),
         Command::Revoke => setup_flow::revoke(
             &mut term,
             &host,
@@ -357,7 +419,8 @@ mod tests {
         let a = p(&["connect", "--account", "https://a.test"]).unwrap();
         assert_eq!(a.account.as_deref(), Some("https://a.test"));
         assert!(p(&["--demo"]).unwrap().demo);
-        assert!(p(&["status", "--demo"]).is_err());
+        assert!(p(&["status", "--demo"]).unwrap().demo);
+        assert!(p(&["doctor", "--demo"]).is_err());
         assert!(p(&["status", "--account", "https://a.test"]).is_err());
         assert!(p(&["--demo", "--account", "https://a.test"]).is_err());
         assert!(p(&["connect", "--account"]).is_err());

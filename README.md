@@ -4,10 +4,10 @@ The Stonewave server CLI. It connects a company's Linux servers to [Wave](https:
 "Systems"), so the company's dev agent gets **safe, scoped hands** on them: short-lived SSH certificates, only the
 rights an admin gave, every action logged with the person it was done for.
 
-> **Early build.** `stonewave doctor` is real and read only. `stonewave connect` really signs in at the Stonewave
-> account (device code, see below) but changes nothing on the machine yet. `stonewave setup` and `stonewave revoke`
-> are real and change the server (with sudo; `--dry-run` only looks). `status` and `connect --demo` only show how the
-> finished CLI will look.
+> **Early build.** `stonewave doctor` is read only. `stonewave connect` signs in with a device code, registers the
+> server with Wave and sets it up (needs sudo; `connect --sign-in-only` only signs in). `setup`, `revoke` and the daemon
+> are real. The Wave side is not switched on for customers yet: the relay is for Stonewave's own servers first.
+> `connect --demo` and `status --demo` only show how the finished CLI will look.
 
 ![connect](media/connect.gif)
 
@@ -77,15 +77,29 @@ repository; without it the release is unsigned.
 ## Connect: sign in with a device code
 
 ```bash
-stonewave connect                        # real sign-in at the account, changes nothing on this machine yet
-stonewave connect --account https://...  # another account address (or STONEWAVE_ACCOUNT_URL); https only, http only for this machine
+sudo stonewave connect                   # sign in, register this server with Wave, set it up
+sudo stonewave connect --account https://...  # another account address (or STONEWAVE_ACCOUNT_URL); https only, http only for this machine
 ```
 
 `connect` asks the account for a code (RFC 8628) and shows it with four words. The admin opens the printed address,
 signed in to their Stonewave account, types the code, checks that the page shows the same four words and that the
 server name and address are right, picks the company and confirms. The CLI then receives a short token (15 minutes,
 bound to that person and company), asks the account who it belongs to, shows the company and **drops the token**: it is
-never written to disk and never printed. Setup, the server key and the daemon come in later releases.
+never written to disk and never printed.
+
+With `sudo stonewave connect` that sign-in is the first step of the whole connect:
+
+1. make the server's own Ed25519 key (it stays on the server, `/var/lib/stonewave/server.key`),
+2. register its public half with Wave at the relay (`--relay <url>` or `STONEWAVE_RELAY_URL`; https only, http only for this
+   machine), proving with a signature that the key is ours and for this sign-in only,
+3. run the base setup (below), which starts the daemon,
+4. the daemon holds one **outbound** HTTPS line to Wave, reports health once a minute and hands byte streams to the agent SSH
+   on `127.0.0.1:2222`. A new server starts with no rights for the agent. See [docs/relay-protocol.md](docs/relay-protocol.md).
+
+Nothing on the machine changes before Wave has accepted the key. `--trust-file <file>` trusts admin device keys right away
+(until Wave hands them over); `--yes` skips the question. `stonewave status` shows the line, the agent SSH and the last
+health report; `sudo stonewave revoke` closes it for good (and Wave can cut the line from its side: the daemon then
+stops and is not restarted).
 
 HTTP goes through the system `curl` (the install command needs it anyway), so TLS and the certificate store are the
 system's. Secrets are handed to curl on stdin, never as arguments. A plain `http://` address is only accepted for this
@@ -121,14 +135,15 @@ user in a powerful group) it stops and says why; what ran is in place and runnin
 trust list, and locks `stonewave-agent` (no shell, account expired). The audit log stays. `setup` opens it again.
 
 `stonewave agent-shell` is the forced command of the agent sshd. In this build it knows one operation, `health`,
-and refuses everything else (and logs both). `stonewave daemon` only keeps `/var/lib/stonewave/health.json` fresh;
-the tunnel to Wave comes later.
+and refuses everything else (and logs both). `stonewave daemon` keeps the line to Wave (see
+[docs/relay-protocol.md](docs/relay-protocol.md)) and `/var/lib/stonewave/health.json` fresh. Without a server key it only
+keeps the local health report.
 
 ## Demo screens
 
 ```bash
 stonewave connect --demo   # the made-up screens: sign-in, key check, setup progress (talks to nobody)
-stonewave status     # how every later start looks (demo values)
+stonewave status --demo   # how every later start looks (made-up values)
 stonewave banner
 ```
 
@@ -153,9 +168,10 @@ by `scripts/cast2gif.py` with Pillow.
 | Path | What |
 |---|---|
 | `src/main.rs` | arguments, commands |
-| `src/doctor.rs` | the read-only checks |
+| `src/doctor.rs` | the read-only checks (account and relay reachable) |
 | `src/setup.rs`, `src/realsys.rs`, `src/setup_flow.rs` | setup and revoke: steps, the real machine behind them, the screens |
-| `src/daemon.rs` | `daemon` and `agent-shell` |
+| `src/daemon.rs`, `src/tunnel.rs`, `src/relay.rs`, `src/health.rs` | `daemon` and `agent-shell`; the line to Wave; the server key, signing and frames; the health report |
+| `src/status.rs` | `stonewave status` |
 | `src/b64.rs` | base64 without a dependency |
 | `src/term.rs` | terminal abilities, buffered output, raw mode, keys, recording |
 | `src/style.rs`, `src/ui.rs`, `src/banner.rs` | colours, building blocks, banner and wave animation |

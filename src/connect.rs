@@ -24,6 +24,9 @@ use serde_json::{Value, json};
 
 /// Where the account lives unless `--account` or `STONEWAVE_ACCOUNT_URL` says otherwise.
 pub const DEFAULT_ACCOUNT: &str = "https://account.stonewavetech.com";
+/// Where the relay of Wave lives unless `--relay` or `STONEWAVE_RELAY_URL` says otherwise. The name is chosen, but the DNS entry only
+/// exists once Stonewave switches the relay on; until then `connect` ends with "no connection" and changes nothing.
+pub const DEFAULT_RELAY: &str = "https://relay.stonewavetech.com";
 const CLIENT_ID: &str = "stonewave-cli";
 const GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 /// Polling never goes faster than this, whatever the server says.
@@ -60,7 +63,7 @@ impl fmt::Display for ConnectError {
 
 /// Text from outside, cut and cleaned before it reaches a terminal: no control or escape codes, no invisible
 /// or direction-changing characters, no long lines. Letters of any language stay (a company can be "Müller & Söhne").
-fn tame(s: &str, max: usize) -> String {
+pub(crate) fn tame(s: &str, max: usize) -> String {
     let bad = |c: char| {
         c.is_control()
             || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
@@ -114,6 +117,11 @@ impl Account {
         })
     }
 
+    /// `https://host[:port]`
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
     pub fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
     }
@@ -160,7 +168,7 @@ pub struct Curl {
 }
 
 /// A value inside double quotes in a curl config file.
-fn cfg_quote(s: &str) -> String {
+pub(crate) fn cfg_quote(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
     o.push('"');
     for c in s.chars() {
@@ -225,7 +233,8 @@ impl Http for Curl {
     ) -> Result<Reply, ConnectError> {
         let config = curl_config(method, url, bearer, body, self.allow_plain_http);
         let mut child = Command::new("curl")
-            .args(["--config", "-"])
+            // `-q` first: curl then ignores ~/.curlrc, which could add a proxy, headers or a trusted certificate.
+            .args(["-q", "--config", "-"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -283,8 +292,13 @@ pub struct Started {
 pub struct Token(String);
 
 impl Token {
-    fn secret(&self) -> &str {
+    pub(crate) fn secret(&self) -> &str {
         &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(s: &str) -> Token {
+        Token(s.to_owned())
     }
 }
 
@@ -338,7 +352,7 @@ fn shaped(
 }
 
 /// The error code of an RFC 8628 error answer, or of the house shape `{"error": {"code": ...}}`.
-fn error_code(v: &Value) -> String {
+pub(crate) fn error_code(v: &Value) -> String {
     let e = v.get("error");
     let code = e
         .and_then(Value::as_str)

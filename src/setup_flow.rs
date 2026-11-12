@@ -18,7 +18,7 @@ pub struct SetupArgs {
     pub trust_files: Vec<String>,
 }
 
-fn row(m: ColorMode, r: &StepReport, dry: bool) -> Vec<String> {
+pub(crate) fn row(m: ColorMode, r: &StepReport, dry: bool) -> Vec<String> {
     let name = format!("{:<15}", r.name);
     match &r.outcome {
         Outcome::Kept(text) => vec![format!(
@@ -60,7 +60,10 @@ fn show(term: &mut Term, reports: &[StepReport], dry: bool) {
     }
 }
 
-fn load_trust(term: &mut Term, files: &[String]) -> std::result::Result<Vec<TrustKey>, ()> {
+pub(crate) fn load_trust(
+    term: &mut Term,
+    files: &[String],
+) -> std::result::Result<Vec<TrustKey>, ()> {
     let m = term.mode();
     let mut keys = Vec::new();
     for f in files {
@@ -127,6 +130,7 @@ pub fn setup(term: &mut Term, host: &Host, args: &SetupArgs) -> Result<FlowOutco
     let cfg = Config {
         version: crate::VERSION,
         trust,
+        restart_daemon: false,
     };
     let checks = doctor::run_all(&doctor::SYSTEM);
 
