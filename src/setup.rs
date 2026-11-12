@@ -357,6 +357,19 @@ fn foreign_message(lines: &[usize]) -> String {
     )
 }
 
+/// The trust file without the keys stonewave itself manages; comments and every line it does not understand stay.
+fn without_our_keys(text: &str) -> String {
+    let mut out = String::new();
+    for l in text.lines() {
+        let t = l.trim();
+        if t.is_empty() || t.starts_with('#') || parse_key_line(l, "device").is_err() {
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn render_trust(keys: &[TrustKey]) -> String {
     let mut s = String::from(
         "# Admin devices this server trusts as certificate authorities (one public key per line).\n\
@@ -1042,12 +1055,29 @@ pub fn revoke(sys: &dyn Sys, dry: bool, device: Option<&str>) -> R<Vec<StepRepor
     // 2. Empty the trust list.
     let mut ctx = Ctx::new(sys, dry);
     let trust_text = sys.read(TRUST).unwrap_or_default();
-    // A file with hand-added lines is never rewritten (they may be someone's work), but then the kill switch
-    // is not complete: say so, do not report "empty".
+    // Hand-added lines (someone's work, or a key type stonewave does not know) are kept as they are, and the kill switch is
+    // not complete while they stand: our own keys go, the rest stays, and the step says it needs a look.
     let foreign = foreign_lines(&trust_text);
     let keys = read_trust(&trust_text);
     if !foreign.is_empty() {
-        let mut text = foreign_message(&foreign);
+        if !keys.is_empty() {
+            ctx.note(format!(
+                "remove {} admin device(s) from the trust list, keep the line(s) stonewave does not know",
+                keys.len()
+            ));
+            if !dry {
+                ctx.file(
+                    TRUST,
+                    &without_our_keys(&trust_text),
+                    0o644,
+                    ("root", "root"),
+                )?;
+            }
+        }
+        let mut text = foreign_message(&foreign).replace(
+            "It was left as it is: fix or remove them by hand",
+            "They were kept: fix or remove them by hand",
+        );
         text.push_str("; until then this server still trusts them as certificate authorities");
         reports.push(StepReport {
             name: "Admin keys",
@@ -1118,6 +1148,13 @@ pub fn revoke(sys: &dyn Sys, dry: bool, device: Option<&str>) -> R<Vec<StepRepor
         },
     });
     Ok(reports)
+}
+
+/// Whether any step wants a person to look at it (the summary must not say "revoked" then).
+pub fn needs_a_look(reports: &[StepReport]) -> bool {
+    reports
+        .iter()
+        .any(|r| matches!(r.outcome, Outcome::Attention(_)))
 }
 
 /// Appends one line to the audit log. A revoke must not fail because of the log, so the caller decides what to do with
@@ -1957,6 +1994,52 @@ ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ some-old-ca
         // everything else is still revoked
         assert!(!fake.active.borrow().contains("stonewave-sshd"));
         assert_eq!(fake.users.borrow()[AGENT_USER], "/usr/sbin/nologin");
+    }
+
+    #[test]
+    fn revoke_removes_our_keys_and_keeps_the_lines_it_does_not_know() {
+        let fake = Fake::new();
+        run(
+            &fake,
+            false,
+            vec![parse_key_line(&ed25519_line(1, "Office PC"), "d").unwrap()],
+        );
+        let foreign = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ some-old-ca";
+        let now = fake.file(TRUST).unwrap();
+        fake.files.borrow_mut().insert(
+            TRUST.into(),
+            (
+                format!(
+                    "{now}{foreign}
+"
+                ),
+                0o644,
+                "root".into(),
+                "root".into(),
+            ),
+        );
+        let r = revoke(&fake, false, None).unwrap();
+        let after = fake.file(TRUST).unwrap();
+        assert!(read_trust(&after).is_empty(), "our key is gone: {after}");
+        assert!(after.contains(foreign), "the foreign line stays: {after}");
+        assert!(after.contains("# Admin devices"), "comments stay");
+        let keys = r.iter().find(|s| s.name == "Admin keys").unwrap();
+        assert!(
+            matches!(&keys.outcome, Outcome::Attention(t) if t.contains("still trusts")),
+            "{keys:?}"
+        );
+        assert!(needs_a_look(&r));
+        // a second run changes nothing more but still says it
+        let again = revoke(&fake, false, None).unwrap();
+        assert!(needs_a_look(&again));
+        assert_eq!(fake.file(TRUST).unwrap(), after);
+    }
+
+    #[test]
+    fn a_clean_revoke_needs_no_look() {
+        let fake = Fake::new();
+        run(&fake, false, vec![]);
+        assert!(!needs_a_look(&revoke(&fake, false, None).unwrap()));
     }
 
     #[test]

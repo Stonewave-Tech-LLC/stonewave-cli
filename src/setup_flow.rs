@@ -284,7 +284,8 @@ pub fn revoke(
         term.flush()?;
         return Ok(FlowOutcome::Done);
     }
-    if !setup::has_changes(&plan) {
+    let looks = setup::needs_a_look;
+    if !setup::has_changes(&plan) && !looks(&plan) {
         term.line(&format!(
             "{INDENT}{}",
             m.fg(pal::GREY, "Nothing to revoke: it is already closed.")
@@ -305,6 +306,18 @@ pub fn revoke(
         Ok(done) => {
             show(term, &done, false);
             term.blank();
+            if looks(&done) {
+                // Not "revoked": a step above could not finish (a red cross). Say so and fail, so a script sees it.
+                term.line(&format!(
+                    "{INDENT}{}",
+                    m.fg_bold(
+                        pal::RED,
+                        "Not fully revoked: a step above needs a look. Fix it and run `sudo stonewave revoke` again."
+                    )
+                ));
+                term.flush()?;
+                return Ok(FlowOutcome::Failed);
+            }
             term.line(&format!(
                 "{INDENT}{}",
                 m.fg_bold(pal::GREEN, "Agent access revoked. The audit log stays.")
