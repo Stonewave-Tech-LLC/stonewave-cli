@@ -84,6 +84,35 @@ impl Sys for RealSys {
         Ok(())
     }
 
+    fn chmod_file(&self, path: &str, mode: u32) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let err = |e: std::io::Error| format!("{path}: {e}");
+            // Open first (this follows a link), then check that what is open is a regular file and the very file the path
+            // names now: a link planted before the open leads to another file (different identity), one planted after
+            // shows as a link. Only then change the mode, on the open file.
+            let file = std::fs::File::open(path).map_err(err)?;
+            let opened = file.metadata().map_err(err)?;
+            let named = std::fs::symlink_metadata(path).map_err(err)?;
+            if !opened.is_file()
+                || !named.is_file()
+                || (opened.dev(), opened.ino()) != (named.dev(), named.ino())
+            {
+                return Err(format!(
+                    "{path} is not the plain file it was a moment ago: refused"
+                ));
+            }
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(err)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, mode);
+            Err("unsupported".into())
+        }
+    }
+
     fn remove(&self, path: &str) {
         let _ = std::fs::remove_file(path);
     }

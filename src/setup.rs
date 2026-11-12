@@ -72,6 +72,9 @@ pub trait Sys {
     fn euid(&self) -> u32;
     /// Whether the path itself is a symbolic link (not what it points to).
     fn is_symlink(&self, path: &str) -> bool;
+    /// Sets the mode of the regular file at this path, never of whatever a link put there in the meantime: the file is opened
+    /// first and must still be the one the path names.
+    fn chmod_file(&self, path: &str, mode: u32) -> Result<(), String>;
 }
 
 /// One thing setup did, or would do with `--dry-run`.
@@ -122,6 +125,17 @@ impl<'a> Ctx<'a> {
         } else {
             Err(format!("{cmd} {}: {}", args.join(" "), first_line(&r.out)))
         }
+    }
+
+    /// chmod on an opened file, so a link swapped in after the check changes nothing else.
+    fn chmod(&mut self, what: impl Into<String>, mode: u32, path: &str) -> R<()> {
+        self.note(what);
+        if self.dry {
+            return Ok(());
+        }
+        self.sys
+            .chmod_file(path, mode)
+            .map_err(|e| format!("chmod {mode:04o} {path}: {e}"))
     }
 
     /// Setup runs as root and some of the folders it works in belong to the daemon's user. A link planted there must never
@@ -485,6 +499,8 @@ pub struct Config<'a> {
     pub version: &'a str,
     /// Keys to add to the trust list (the list on the server is never shortened here).
     pub trust: Vec<TrustKey>,
+    /// The server key or identity was just replaced (`connect`): a running daemon has the old ones in memory and must restart.
+    pub restart_daemon: bool,
 }
 
 pub const STEP_NAMES: [&str; 8] = [
@@ -733,7 +749,7 @@ pub fn agent_ssh(sys: &dyn Sys, dry: bool) -> R<Outcome> {
 }
 
 /// Step 4: the daemon service. It runs from the installed binary, so that one has to exist.
-pub fn daemon(sys: &dyn Sys, dry: bool, version: &str) -> R<Outcome> {
+pub fn daemon(sys: &dyn Sys, dry: bool, version: &str, restart: bool) -> R<Outcome> {
     let mut ctx = Ctx::new(sys, dry);
     if !sys.exists(BIN) {
         return Ok(Outcome::Attention(format!(
@@ -752,11 +768,7 @@ pub fn daemon(sys: &dyn Sys, dry: bool, version: &str) -> R<Outcome> {
                 "chown",
                 &["-h", &format!("{DAEMON_USER}:{DAEMON_USER}"), file],
             )?;
-            ctx.act(
-                format!("close {file} to everybody else"),
-                "chmod",
-                &["0600", file],
-            )?;
+            ctx.chmod(format!("close {file} to everybody else"), 0o600, file)?;
         }
     }
     let unit_changed = ctx.file(DAEMON_UNIT, &daemon_unit(), 0o644, ("root", "root"))?;
@@ -783,9 +795,9 @@ pub fn daemon(sys: &dyn Sys, dry: bool, version: &str) -> R<Outcome> {
                 return Err(format!("could not start {name}: {}", first_line(&r.out)));
             }
         }
-    } else if unit_changed || outdated {
+    } else if unit_changed || outdated || restart {
         ctx.act(
-            format!("restart {name} (new unit or new version)"),
+            format!("restart {name} (new unit, new version or new server key)"),
             "systemctl",
             &["restart", name],
         )?;
@@ -823,7 +835,7 @@ pub fn logbook(sys: &dyn Sys, dry: bool) -> R<Outcome> {
             "chown",
             &["-h", &format!("{AGENT_USER}:{DAEMON_USER}"), AUDIT],
         )?;
-        ctx.act(format!("fix mode of {AUDIT}"), "chmod", &["0640", AUDIT])?;
+        ctx.chmod(format!("fix mode of {AUDIT}"), 0o640, AUDIT)?;
     }
     ctx.file(LOGROTATE, &logrotate(), 0o644, ("root", "root"))?;
     Ok(finish(ctx, "audit log in place"))
@@ -890,7 +902,7 @@ pub fn run_steps(
             1 => users(sys, dry),
             2 => admin_keys(sys, dry, &cfg.trust),
             3 => agent_ssh(sys, dry),
-            4 => daemon(sys, dry, cfg.version),
+            4 => daemon(sys, dry, cfg.version, cfg.restart_daemon),
             5 => Ok(firewall(sys)),
             6 => logbook(sys, dry),
             _ => Ok(if dry {
@@ -1242,6 +1254,18 @@ pub mod fake {
                 .insert(path.into(), (content.into(), mode, u, g));
             Ok(())
         }
+        fn chmod_file(&self, path: &str, mode: u32) -> Result<(), String> {
+            self.log
+                .borrow_mut()
+                .push(format!("chmod {mode:04o} {path}"));
+            if self.links.borrow().contains(path) {
+                return Err("is a symbolic link".into());
+            }
+            if let Some(f) = self.files.borrow_mut().get_mut(path) {
+                f.1 = mode;
+            }
+            Ok(())
+        }
         fn mkdir(&self, path: &str, mode: u32) -> Result<(), String> {
             self.log.borrow_mut().push(format!("mkdir {path} {mode:o}"));
             let (u, g) = self
@@ -1471,6 +1495,7 @@ mod tests {
         Config {
             version: "0.2.0",
             trust,
+            restart_daemon: false,
         }
     }
 
@@ -1660,7 +1685,7 @@ mod tests {
         fake.set_file(SERVER_KEY, "x", 0o777, "stonewave", "stonewave");
         fake.links.borrow_mut().insert(SERVER_KEY.to_owned());
         fake.clear_log();
-        let err = daemon(&fake, false, "0.2.0").unwrap_err();
+        let err = daemon(&fake, false, "0.2.0", false).unwrap_err();
         assert!(err.contains("symbolic link"), "{err}");
         assert!(
             !fake
@@ -1773,6 +1798,53 @@ mod tests {
             fake.commands()
                 .iter()
                 .any(|c| c == "systemctl restart stonewaved")
+        );
+    }
+
+    #[test]
+    fn a_new_server_key_restarts_a_daemon_that_is_already_running() {
+        let fake = Fake::new();
+        run(&fake, false, vec![]);
+        assert!(fake.active.borrow().contains("stonewaved"));
+        fake.clear_log();
+        // same unit, same version: nothing to do
+        daemon(&fake, false, "0.2.0", false).unwrap();
+        assert!(
+            !fake.commands().iter().any(|c| c.contains("restart")),
+            "{:?}",
+            fake.commands()
+        );
+        // `connect` replaced the key: the daemon holds the old one in memory
+        daemon(&fake, false, "0.2.0", true).unwrap();
+        assert!(
+            fake.commands()
+                .iter()
+                .any(|c| c == "systemctl restart stonewaved"),
+            "{:?}",
+            fake.commands()
+        );
+        // a dry run only says it
+        fake.clear_log();
+        let plan = daemon(&fake, true, "0.2.0", true).unwrap();
+        assert!(matches!(plan, Outcome::Changed(_)));
+        assert!(fake.commands().is_empty());
+    }
+
+    #[test]
+    fn the_mode_is_set_on_the_opened_file_and_a_link_is_never_followed() {
+        let fake = Fake::new();
+        run(&fake, false, vec![]);
+        fake.set_file(SERVER_KEY, "x", 0o644, "root", "root");
+        fake.clear_log();
+        daemon(&fake, false, "0.2.0", false).unwrap();
+        assert_eq!(fake.stat(SERVER_KEY).unwrap().mode, 0o600);
+        assert!(
+            fake.commands()
+                .iter()
+                .any(|c| c == "chmod 0600 /var/lib/stonewave/server.key")
+                && !fake.commands().iter().any(|c| c.starts_with("run chmod")),
+            "{:?}",
+            fake.commands()
         );
     }
 
