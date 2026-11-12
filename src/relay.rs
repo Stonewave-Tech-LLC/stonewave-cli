@@ -408,7 +408,7 @@ impl Up {
 mod tests {
     use super::*;
 
-    // The same values as the relay's own test (apps/wave-api/test/relay.test.ts, "signing format vector").
+    // A fixed test vector for the signing format; the relay checks the very same values.
     const VECTOR_PUB: &str = "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw";
     const VECTOR_SIG: &str =
         "n1JH0qdPYNy9tybmEmWmRu5fc1-WOLKLskJXkEjGVEC5TBFRdWxqLkNeWGxOOKMRGX9Sl_NkZrMNiBWmTfujAg";

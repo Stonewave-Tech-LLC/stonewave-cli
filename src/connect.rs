@@ -233,7 +233,8 @@ impl Http for Curl {
     ) -> Result<Reply, ConnectError> {
         let config = curl_config(method, url, bearer, body, self.allow_plain_http);
         let mut child = Command::new("curl")
-            .args(["--config", "-"])
+            // `-q` first: curl then ignores ~/.curlrc, which could add a proxy, headers or a trusted certificate.
+            .args(["-q", "--config", "-"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -55,15 +55,22 @@ pub fn run_daemon() -> ExitCode {
         text
     });
 
-    let Some((key, identity)) = relay::load(&Paths::system()) else {
-        eprintln!(
-            "stonewaved: this server is not connected to Wave yet (no server key); keeping the local health report only"
-        );
-        write_tunnel_state("local", "not connected: run `sudo stonewave connect`");
-        loop {
-            report();
-            std::thread::sleep(Duration::from_secs(60));
+    // Without a key the daemon only keeps the local report. It looks again every round, so a server that is connected while
+    // it runs (`connect` after `setup`) goes online without anyone restarting the service.
+    let mut told = false;
+    let (key, identity) = loop {
+        if let Some(found) = relay::load(&Paths::system()) {
+            break found;
         }
+        if !told {
+            eprintln!(
+                "stonewaved: this server is not connected to Wave yet (no server key); keeping the local health report only"
+            );
+            told = true;
+        }
+        write_tunnel_state("local", "not connected: run `sudo stonewave connect`");
+        report();
+        std::thread::sleep(Duration::from_secs(60));
     };
     let relay_addr = match Account::parse(&identity.relay) {
         Ok(a) => a,

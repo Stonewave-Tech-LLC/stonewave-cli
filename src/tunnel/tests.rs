@@ -415,6 +415,7 @@ fn run_forever_keeps_trying_and_stops_when_revoked() {
     let s = Settings {
         backoff_start: Duration::from_millis(5),
         backoff_max: Duration::from_millis(10),
+        revoke_confirm: Duration::from_millis(5),
         ..Settings::default()
     };
     let states = Mutex::new(Vec::<String>::new());
@@ -428,12 +429,58 @@ fn run_forever_keeps_trying_and_stops_when_revoked() {
         &AtomicBool::new(false),
     );
     assert_eq!(end, End::Revoked);
-    assert_eq!(*t.n.lock().unwrap(), 3);
+    // two refusals on two connections: the first only starts the check
+    assert_eq!(*t.n.lock().unwrap(), 4);
     let st = states.lock().unwrap().clone();
     assert!(
         st.contains(&"reconnecting".to_owned()) && st.last().unwrap() == "revoked",
         "{st:?}"
     );
+}
+
+#[test]
+fn one_revoked_claim_that_is_not_repeated_does_not_stop_the_daemon_for_good() {
+    // An injected "bye revoked" on a live stream (TLS-inspecting proxy): the next connection is healthy and cancels it.
+    struct Once {
+        n: Mutex<u32>,
+    }
+    impl Transport for Once {
+        fn open_stream(&self) -> Result<Box<dyn BufRead + Send>, TunnelError> {
+            let mut n = self.n.lock().unwrap();
+            *n += 1;
+            match *n {
+                1 => Err(TunnelError::Refused("server_revoked".into())), // the claim
+                2 | 3 => Ok(Box::new(std::io::Cursor::new(hello().into_bytes()))), // healthy again, then the line ends
+                _ => Err(TunnelError::Refused("server_revoked".into())),
+            }
+        }
+        fn post(&self, _: &str, _: &str) -> Result<(), TunnelError> {
+            Ok(())
+        }
+    }
+    let s = Settings {
+        backoff_start: Duration::from_millis(5),
+        backoff_max: Duration::from_millis(10),
+        revoke_confirm: Duration::from_millis(5),
+        health_every: Duration::from_secs(60),
+        ..Settings::default()
+    };
+    let states = Mutex::new(Vec::<String>::new());
+    let h: Arc<dyn Fn() -> String + Send + Sync> = Arc::new(String::new);
+    let t = Arc::new(Once { n: Mutex::new(0) });
+    let end = run_forever(
+        t.clone(),
+        &s,
+        h,
+        &|st, _| states.lock().unwrap().push(st.to_owned()),
+        &AtomicBool::new(false),
+    );
+    assert_eq!(end, End::Revoked);
+    // claim (1), healthy lines (2, 3) cancel it, a new claim (4) starts the check again, 5 confirms
+    assert_eq!(*t.n.lock().unwrap(), 5);
+    let st = states.lock().unwrap().clone();
+    assert_eq!(st.iter().filter(|x| *x == "checking").count(), 2, "{st:?}");
+    assert_eq!(st.last().unwrap(), "revoked");
 }
 
 // ---------------------------------------------------------------- curl

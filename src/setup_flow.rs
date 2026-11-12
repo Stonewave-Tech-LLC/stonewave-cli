@@ -130,6 +130,7 @@ pub fn setup(term: &mut Term, host: &Host, args: &SetupArgs) -> Result<FlowOutco
     let cfg = Config {
         version: crate::VERSION,
         trust,
+        restart_daemon: false,
     };
     let checks = doctor::run_all(&doctor::SYSTEM);
 

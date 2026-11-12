@@ -43,6 +43,8 @@ pub struct Settings {
     pub batch_window: Duration,
     pub backoff_start: Duration,
     pub backoff_max: Duration,
+    /// Wave's "revoked" is believed only when a fresh connection says it again this much later (see `run_forever`).
+    pub revoke_confirm: Duration,
 }
 
 impl Default for Settings {
@@ -55,6 +57,7 @@ impl Default for Settings {
             batch_window: Duration::from_millis(40),
             backoff_start: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
+            revoke_confirm: Duration::from_secs(20),
         }
     }
 }
@@ -427,14 +430,34 @@ pub fn run_forever<T: Transport>(
     stop: &AtomicBool,
 ) -> End {
     let mut failures = 0u32;
+    // What Wave sends down is protected by TLS only (no signature of Wave's own yet, see the debts). One "revoked" that
+    // arrives on a line, however it got there, must not end the daemon for good, because systemd never restarts it
+    // after that. So the first claim only closes the line; the daemon waits and asks on a new connection, and a line that
+    // comes up healthy in between cancels the claim. A real revoke is refused again by the relay at once.
+    let claims = AtomicUsize::new(0);
     while !stop.load(Ordering::Relaxed) {
         status("connecting", "");
         let started = Instant::now();
-        let end = run_session(&t, s, &health, &|| status("connected", ""));
+        let end = run_session(&t, s, &health, &|| {
+            claims.store(0, Ordering::Relaxed);
+            status("connected", "");
+        });
         match end {
             End::Revoked => {
-                status("revoked", "Wave cut this server off");
-                return End::Revoked;
+                if claims.fetch_add(1, Ordering::Relaxed) + 1 >= 2 {
+                    status("revoked", "Wave cut this server off");
+                    return End::Revoked;
+                }
+                status(
+                    "checking",
+                    "Wave says it cut this server off; asking again on a new connection",
+                );
+                let mut left = s.revoke_confirm;
+                while left > Duration::ZERO && !stop.load(Ordering::Relaxed) {
+                    let step = left.min(Duration::from_millis(200));
+                    thread::sleep(step);
+                    left -= step;
+                }
             }
             End::Retry(why) => {
                 // A line that held for a while was healthy: start the pauses over.
@@ -507,7 +530,8 @@ pub fn curl_config(
 
 fn spawn_curl(config: &str, stdout: Stdio) -> Result<Child, TunnelError> {
     let mut child = Command::new("curl")
-        .args(["--config", "-"])
+        // `-q` first: curl then ignores ~/.curlrc, which could add a proxy, headers or a trusted certificate.
+        .args(["-q", "--config", "-"])
         .stdin(Stdio::piped())
         .stdout(stdout)
         .stderr(Stdio::null())

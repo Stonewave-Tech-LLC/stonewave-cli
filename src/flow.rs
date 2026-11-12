@@ -472,6 +472,7 @@ fn enrol_and_set_up(
     let cfg = setup::Config {
         version: crate::VERSION,
         trust: enrol.trust.clone(),
+        restart_daemon: true,
     };
     let checks = crate::doctor::run_all(&crate::doctor::SYSTEM);
     let result = setup::run_steps(&sys, false, &cfg, &checks, |_| {});
