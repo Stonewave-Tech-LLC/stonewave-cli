@@ -13,6 +13,12 @@ This tool will give software agents scoped access to servers, so we take reports
 - the `stonewave` binary: `doctor` today; setup, the daemon and the agent shell once they exist
 - the release process (`scripts/release.sh`)
 
+## Known limits
+
+- **Frames from Wave to the server are not signed** (only TLS protects them). Someone inside the TLS connection can keep the
+  daemon from holding a line, and cannot log in to anything. Details and the plan: [docs/relay-protocol.md](docs/relay-protocol.md)
+  ("Known limit").
+
 ## What this build does not do yet
 
 `status`, `revoke` and `connect --demo` are demos of the screens: they change nothing and talk to no server.

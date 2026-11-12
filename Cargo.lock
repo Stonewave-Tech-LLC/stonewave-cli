@@ -457,6 +457,7 @@ dependencies = [
  "crossterm",
  "ed25519-dalek",
  "getrandom",
+ "libc",
  "serde_json",
  "sha2",
 ]

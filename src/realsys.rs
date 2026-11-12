@@ -92,7 +92,14 @@ impl Sys for RealSys {
             // Open first (this follows a link), then check that what is open is a regular file and the very file the path
             // names now: a link planted before the open leads to another file (different identity), one planted after
             // shows as a link. Only then change the mode, on the open file.
-            let file = std::fs::File::open(path).map_err(err)?;
+            // No-follow and non-blocking: a link in the last place is refused at once instead of followed, and a FIFO planted there
+            // cannot hold root in `open` until somebody writes to it.
+            use std::os::unix::fs::OpenOptionsExt;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+                .map_err(err)?;
             let opened = file.metadata().map_err(err)?;
             let named = std::fs::symlink_metadata(path).map_err(err)?;
             if !opened.is_file()
@@ -220,6 +227,25 @@ mod tests {
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
         RealSys.chmod_file(f.to_str().unwrap(), 0o600).unwrap();
         assert_eq!(mode(&f), 0o600);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn chmod_on_a_fifo_returns_at_once_instead_of_waiting_for_a_writer() {
+        let d = dir("fifo");
+        let fifo = d.join("key");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let path = fifo.to_str().unwrap().to_owned();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(RealSys.chmod_file(&path, 0o600));
+        });
+        let answer = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("chmod_file blocked on the FIFO");
+        assert!(answer.is_err(), "a FIFO is not a plain file");
+        assert_eq!(mode(&fifo), 0o644, "untouched");
         let _ = std::fs::remove_dir_all(&d);
     }
 
