@@ -382,6 +382,7 @@ pub fn sshd_config() -> String {
          PermitTTY no\n\
          X11Forwarding no\n\
          AllowTcpForwarding no\n\
+         DisableForwarding yes\n\
          AllowAgentForwarding no\n\
          PermitTunnel no\n\
          GatewayPorts no\n\
@@ -953,11 +954,19 @@ pub fn revoke(sys: &dyn Sys, dry: bool, device: Option<&str>) -> R<Vec<StepRepor
             // sshd reads the trust list on every login: nothing to restart. Sessions this device
             // signed keep running until their certificate ends (at most one hour).
         }
-        audit(sys, dry, &format!("revoke-device {name}"));
+        let logged = audit(sys, dry, &format!("revoke-device {name}"));
         reports.push(StepReport {
             name: "Admin keys",
             outcome: Outcome::Changed(ctx.changes),
         });
+        if let Err(e) = logged {
+            reports.push(StepReport {
+                name: "Audit log",
+                outcome: Outcome::Attention(format!(
+                    "the device is removed, but the log has no line about it: {e}"
+                )),
+            });
+        }
         return Ok(reports);
     }
 
@@ -978,6 +987,7 @@ pub fn revoke(sys: &dyn Sys, dry: bool, device: Option<&str>) -> R<Vec<StepRepor
     });
 
     let mut ctx = Ctx::new(sys, dry);
+    let mut stuck: Option<String> = None;
     if user_exists(sys, AGENT_USER) {
         let sessions = sys.run("loginctl", &["list-sessions", "--no-legend"]);
         let has_session = sessions.ok && sessions.out.contains(AGENT_USER);
@@ -993,8 +1003,17 @@ pub fn revoke(sys: &dyn Sys, dry: bool, device: Option<&str>) -> R<Vec<StepRepor
             // Exactly this user's processes, nothing else.
             let procs = sys.run("pgrep", &["-u", AGENT_USER]);
             if procs.ok && !procs.out.trim().is_empty() && !dry {
-                let _ = sys.run("pkill", &["-KILL", "-u", AGENT_USER]);
-                ctx.note(format!("end the processes of {AGENT_USER}"));
+                let killed = sys.run("pkill", &["-KILL", "-u", AGENT_USER]);
+                // pkill answers "nothing matched" with a failure too, so look again instead of trusting its status.
+                let left = sys.run("pgrep", &["-u", AGENT_USER]);
+                if left.ok && !left.out.trim().is_empty() {
+                    stuck = Some(format!(
+                        "processes of {AGENT_USER} are still running after pkill ({}); end them by hand",
+                        killed.out.trim()
+                    ));
+                } else {
+                    ctx.note(format!("end the processes of {AGENT_USER}"));
+                }
             } else if dry && procs.ok && !procs.out.trim().is_empty() {
                 ctx.note(format!("end the processes of {AGENT_USER}"));
             }
@@ -1002,13 +1021,27 @@ pub fn revoke(sys: &dyn Sys, dry: bool, device: Option<&str>) -> R<Vec<StepRepor
     }
     reports.push(StepReport {
         name: "Agent sessions",
-        outcome: finish(ctx, "no agent session open"),
+        outcome: match stuck {
+            Some(text) => Outcome::Attention(text),
+            None => finish(ctx, "no agent session open"),
+        },
     });
 
     // 2. Empty the trust list.
     let mut ctx = Ctx::new(sys, dry);
-    let keys = sys.read(TRUST).map(|t| read_trust(&t)).unwrap_or_default();
-    if !keys.is_empty() {
+    let trust_text = sys.read(TRUST).unwrap_or_default();
+    // A file with hand-added lines is never rewritten (they may be someone's work), but then the kill switch
+    // is not complete: say so, do not report "empty".
+    let foreign = foreign_lines(&trust_text);
+    let keys = read_trust(&trust_text);
+    if !foreign.is_empty() {
+        let mut text = foreign_message(&foreign);
+        text.push_str("; until then this server still trusts them as certificate authorities");
+        reports.push(StepReport {
+            name: "Admin keys",
+            outcome: Outcome::Attention(text),
+        });
+    } else if !keys.is_empty() {
         ctx.note(format!(
             "remove {} admin device(s) from the trust list",
             keys.len()
@@ -1017,10 +1050,12 @@ pub fn revoke(sys: &dyn Sys, dry: bool, device: Option<&str>) -> R<Vec<StepRepor
             ctx.file(TRUST, &render_trust(&[]), 0o644, ("root", "root"))?;
         }
     }
-    reports.push(StepReport {
-        name: "Admin keys",
-        outcome: finish(ctx, "trust list already empty"),
-    });
+    if foreign.is_empty() {
+        reports.push(StepReport {
+            name: "Admin keys",
+            outcome: finish(ctx, "trust list already empty"),
+        });
+    }
 
     // 3. Lock the agent user.
     let mut ctx = Ctx::new(sys, dry);
@@ -1046,7 +1081,7 @@ pub fn revoke(sys: &dyn Sys, dry: bool, device: Option<&str>) -> R<Vec<StepRepor
     });
 
     // 4. Note it in the log, which stays.
-    audit(sys, dry, "revoke-all");
+    let logged = audit(sys, dry, "revoke-all");
     if !dry && sys.exists(STATE) {
         let mut ctx = Ctx::new(sys, false);
         let version = sys
@@ -1063,26 +1098,47 @@ pub fn revoke(sys: &dyn Sys, dry: bool, device: Option<&str>) -> R<Vec<StepRepor
     }
     reports.push(StepReport {
         name: "Audit log",
-        outcome: Outcome::Kept("revoke noted · log kept".into()),
+        outcome: match logged {
+            Ok(()) => Outcome::Kept("revoke noted · log kept".into()),
+            Err(e) => Outcome::Attention(format!(
+                "everything is revoked, but the log has no line about it: {e}"
+            )),
+        },
     });
     Ok(reports)
 }
 
-/// Appends one line to the audit log (best effort: a revoke must not fail because of the log).
-pub fn audit(sys: &dyn Sys, dry: bool, event: &str) {
+/// Appends one line to the audit log. A revoke must not fail because of the log, so the caller decides what to do with
+/// the error (revoke reports it as a step that needs a look instead of saying "done").
+pub fn audit(sys: &dyn Sys, dry: bool, event: &str) -> Result<(), String> {
     if dry || !sys.exists(AUDIT) {
-        return;
+        return Ok(());
     }
     let line = serde_json::json!({ "event": event, "by": "stonewave-cli" }).to_string();
     let old = sys.read(AUDIT).unwrap_or_default();
     let mode = sys.stat(AUDIT).map_or(0o640, |s| s.mode);
-    let _ = sys.write(AUDIT, &format!("{old}{line}\n"), mode);
+    sys.write(
+        AUDIT,
+        &format!(
+            "{old}{line}
+"
+        ),
+        mode,
+    )
+    .map_err(|e| format!("could not write {AUDIT}: {e}"))?;
     if !sys.is_symlink(AUDIT) {
-        let _ = sys.run(
+        let r = sys.run(
             "chown",
             &["-h", &format!("{AGENT_USER}:{DAEMON_USER}"), AUDIT],
         );
+        if !r.ok {
+            return Err(format!(
+                "could not give {AUDIT} back to the daemon: {}",
+                r.out.trim()
+            ));
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1105,6 +1161,8 @@ pub mod fake {
         pub no_sshd: bool,
         pub bad_sshd_config: bool,
         pub no_bin: bool,
+        pub fail_pkill: bool,
+        pub fail_write: RefCell<Option<String>>,
         pub sessions: RefCell<bool>,
         pub procs: RefCell<bool>,
         pub euid: u32,
@@ -1169,6 +1227,9 @@ pub mod fake {
         }
         fn write(&self, path: &str, content: &str, mode: u32) -> Result<(), String> {
             self.log.borrow_mut().push(format!("write {path} {mode:o}"));
+            if self.fail_write.borrow().as_deref() == Some(path) {
+                return Err("Read-only file system".into());
+            }
             let (u, g) = self
                 .files
                 .borrow()
@@ -1349,6 +1410,9 @@ pub mod fake {
                     }
                 }
                 ("pkill", _) => {
+                    if self.fail_pkill {
+                        return no("Operation not permitted");
+                    }
                     *self.procs.borrow_mut() = false;
                     ok("")
                 }
@@ -1798,6 +1862,61 @@ mod tests {
     }
 
     #[test]
+    fn revoke_flags_a_trust_file_that_holds_only_lines_it_does_not_know() {
+        let fake = Fake::new();
+        run(&fake, false, vec![]);
+        let hand = "# by hand
+ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ some-old-ca
+";
+        fake.files.borrow_mut().insert(
+            TRUST.into(),
+            (hand.into(), 0o644, "root".into(), "root".into()),
+        );
+        let r = revoke(&fake, false, None).unwrap();
+        let keys = r.iter().find(|s| s.name == "Admin keys").unwrap();
+        match &keys.outcome {
+            Outcome::Attention(t) => {
+                assert!(t.contains("line(s) 2"), "{t}");
+                assert!(t.contains("still trusts"), "{t}");
+            }
+            other => panic!("not flagged: {other:?}"),
+        }
+        assert_eq!(fake.file(TRUST).unwrap(), hand, "never rewritten");
+        // everything else is still revoked
+        assert!(!fake.active.borrow().contains("stonewave-sshd"));
+        assert_eq!(fake.users.borrow()[AGENT_USER], "/usr/sbin/nologin");
+    }
+
+    #[test]
+    fn revoke_says_so_when_the_processes_survive_pkill() {
+        let mut fake = Fake::new();
+        fake.fail_pkill = true;
+        run(&fake, false, vec![]);
+        *fake.procs.borrow_mut() = true;
+        let r = revoke(&fake, false, None).unwrap();
+        let s = r.iter().find(|s| s.name == "Agent sessions").unwrap();
+        match &s.outcome {
+            Outcome::Attention(t) => assert!(t.contains("still running"), "{t}"),
+            other => panic!("pkill failure hidden: {other:?}"),
+        }
+        // the rest of the kill switch still ran
+        assert_eq!(fake.users.borrow()[AGENT_USER], "/usr/sbin/nologin");
+    }
+
+    #[test]
+    fn revoke_says_so_when_the_log_cannot_be_written() {
+        let fake = Fake::new();
+        run(&fake, false, vec![]);
+        *fake.fail_write.borrow_mut() = Some(AUDIT.into());
+        let r = revoke(&fake, false, None).unwrap();
+        let s = r.iter().find(|s| s.name == "Audit log").unwrap();
+        match &s.outcome {
+            Outcome::Attention(t) => assert!(t.contains("no line about it"), "{t}"),
+            other => panic!("log failure hidden: {other:?}"),
+        }
+    }
+
+    #[test]
     fn generated_files_keep_the_promises_of_the_concept() {
         let c = sshd_config();
         for must in [
@@ -1806,6 +1925,7 @@ mod tests {
             "PasswordAuthentication no",
             "ExposeAuthInfo yes",
             "AllowTcpForwarding no",
+            "DisableForwarding yes",
             "AuthorizedKeysFile none",
             "PermitUserRC no",
             "PermitTTY no",
@@ -1816,6 +1936,10 @@ mod tests {
         ] {
             assert!(c.contains(must), "sshd_config lacks {must}");
         }
+        assert!(
+            c.lines().all(|l| !l.starts_with(' ')),
+            "a broken line continuation indents a directive"
+        );
         let u = daemon_unit();
         for must in [
             "NoNewPrivileges=yes",
