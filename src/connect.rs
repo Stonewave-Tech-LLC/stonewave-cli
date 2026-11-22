@@ -84,8 +84,13 @@ pub struct Account {
 
 impl Account {
     pub fn parse(raw: &str) -> Result<Account, ConnectError> {
+        Account::parse_as("account", raw)
+    }
+
+    /// The same rules for another kind of address (`what` is only used in the messages: "Wave address ...").
+    pub fn parse_as(what: &str, raw: &str) -> Result<Account, ConnectError> {
         let bad = |why: &str| {
-            ConnectError::BadAddress(format!("account address {why}: {}", tame(raw, 80)))
+            ConnectError::BadAddress(format!("{what} address {why}: {}", tame(raw, 80)))
         };
         let raw = raw.trim().trim_end_matches('/');
         let (scheme, rest) = raw.split_once("://").ok_or_else(|| bad("needs https://"))?;
@@ -149,6 +154,8 @@ impl Account {
 pub struct Reply {
     pub status: u16,
     pub body: String,
+    /// Seconds from a `Retry-After` header (capped at an hour), if the server sent one.
+    pub retry_after: Option<u64>,
 }
 
 pub trait Http {
@@ -199,6 +206,8 @@ fn curl_config(
     } else {
         "proto = \"=https\"\n"
     });
+    // the headers come first on stdout (only `Retry-After` is read), then the body, then the status line
+    c.push_str("dump-header = \"-\"\n");
     c.push_str("write-out = \"\\n%{http_code}\"\n");
     c.push_str(&format!(
         "user-agent = {}\n",
@@ -262,19 +271,44 @@ impl Http for Curl {
                 160,
             )));
         }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let (body, code) = text
-            .rsplit_once('\n')
-            .ok_or_else(|| ConnectError::Protocol("no status line".into()))?;
-        let status = code
-            .trim()
-            .parse::<u16>()
-            .map_err(|_| ConnectError::Protocol("no status code".into()))?;
-        Ok(Reply {
-            status,
-            body: body.to_owned(),
-        })
+        split_reply(&String::from_utf8_lossy(&out.stdout))
     }
+}
+
+/// curl's stdout: header block(s), a blank line, the body, a newline and the status code.
+fn split_reply(text: &str) -> Result<Reply, ConnectError> {
+    let (mut rest, code) = text
+        .rsplit_once('\n')
+        .ok_or_else(|| ConnectError::Protocol("no status line".into()))?;
+    let status = code
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| ConnectError::Protocol("no status code".into()))?;
+    let mut retry_after = None;
+    // more than one block when the server sent `100 Continue` first
+    while rest.starts_with("HTTP/") {
+        let Some((head, tail)) = rest.split_once("\r\n\r\n") else {
+            break;
+        };
+        retry_after = retry_after_of(head);
+        rest = tail;
+    }
+    Ok(Reply {
+        status,
+        body: rest.to_owned(),
+        retry_after,
+    })
+}
+
+/// Seconds of a `Retry-After` header in a header block; an HTTP date is not understood (None). At most an hour.
+fn retry_after_of(head: &str) -> Option<u64> {
+    head.lines().find_map(|l| {
+        let (name, value) = l.split_once(':')?;
+        if !name.trim().eq_ignore_ascii_case("retry-after") {
+            return None;
+        }
+        value.trim().parse::<u64>().ok().map(|s| s.min(3600))
+    })
 }
 
 // ------------------------------------------------------------------ protocol
@@ -313,6 +347,88 @@ pub struct Approved {
     pub token: Token,
     pub company: String,
     pub company_name: String,
+    /// Only for a sign-in with `purpose: "agent"`.
+    pub agent: Option<Box<AgentGrant>>,
+}
+
+/// What the account confirmed for an agent sign-in (all text is shaped or tamed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentGrant {
+    pub team: String,
+    pub team_name: String,
+    /// The agent's key in Wave (a slug); it names the files on this machine.
+    pub agent: String,
+    pub agent_name: String,
+    pub engine: String,
+    pub wave_url: Option<String>,
+}
+
+/// What the poll answer must look like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    Server,
+    Agent,
+}
+
+/// A slug as Wave makes them for agents: `^[a-z0-9][a-z0-9-]{1,39}$`.
+pub(crate) fn is_agent_slug(s: &str) -> bool {
+    (2..=40).contains(&s.len())
+        && s.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn agent_grant(v: &Value) -> Result<AgentGrant, ConnectError> {
+    let slug = |k: &str| -> Result<String, ConnectError> {
+        let s = str_field(v, k)?;
+        if !is_agent_slug(s) {
+            return Err(ConnectError::Protocol(format!(
+                "{k} has an unexpected form"
+            )));
+        }
+        Ok(s.to_owned())
+    };
+    if str_field(v, "scope")? != "agent:connect" {
+        return Err(ConnectError::Protocol(
+            "this sign-in is not for an agent".into(),
+        ));
+    }
+    if v.get("token_type").and_then(Value::as_str) != Some("Bearer") {
+        return Err(ConnectError::Protocol("token type is not Bearer".into()));
+    }
+    if v.get("expires_in").and_then(Value::as_u64).is_none() {
+        return Err(ConnectError::Protocol("field expires_in missing".into()));
+    }
+    let name = |k: &str| -> Result<String, ConnectError> {
+        let t = tame(str_field(v, k)?, 80);
+        if t.trim().is_empty() {
+            return Err(ConnectError::Protocol(format!("field {k} is empty")));
+        }
+        Ok(t)
+    };
+    let wave_url = match v.get("wave_url") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(u)) => Some(u.clone()),
+        Some(_) => {
+            return Err(ConnectError::Protocol(
+                "wave_url has an unexpected form".into(),
+            ));
+        }
+    };
+    Ok(AgentGrant {
+        team: slug("team")?,
+        team_name: name("team_name")?,
+        agent: slug("agent")?,
+        agent_name: name("agent_name")?,
+        engine: shaped(
+            str_field(v, "engine")?,
+            |c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-',
+            2,
+            30,
+            "engine",
+        )?,
+        wave_url,
+    })
 }
 
 #[derive(Debug)]
@@ -360,6 +476,14 @@ pub(crate) fn error_code(v: &Value) -> String {
     tame(code.unwrap_or("unknown_error"), 40)
 }
 
+/// What a person wants to connect as an agent (`purpose: "agent"`). Only a suggestion for the confirmation page, never a right.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Want {
+    pub engine: String,
+    pub agent_name: Option<String>,
+    pub company: Option<String>,
+}
+
 /// Starts a sign-in: the account answers with the codes and the four words.
 pub fn start(
     http: &dyn Http,
@@ -367,8 +491,31 @@ pub fn start(
     host: &str,
     os: &str,
 ) -> Result<Started, ConnectError> {
-    let body = json!({ "client_id": CLIENT_ID, "host": host, "os": os, "version": crate::VERSION })
-        .to_string();
+    start_with(http, acct, host, os, None)
+}
+
+/// [`start`], or with `want` a sign-in for an agent (`purpose` and `want` are sent only then).
+pub fn start_with(
+    http: &dyn Http,
+    acct: &Account,
+    host: &str,
+    os: &str,
+    want: Option<&Want>,
+) -> Result<Started, ConnectError> {
+    let mut body =
+        json!({ "client_id": CLIENT_ID, "host": host, "os": os, "version": crate::VERSION });
+    if let Some(w) = want {
+        let mut x = json!({ "engine": w.engine });
+        if let Some(n) = &w.agent_name {
+            x["agent_name"] = json!(n);
+        }
+        if let Some(c) = &w.company {
+            x["company"] = json!(c);
+        }
+        body["purpose"] = json!("agent");
+        body["want"] = x;
+    }
+    let body = body.to_string();
     let r = http.send("POST", &acct.url("/v1/device/code"), None, Some(&body))?;
     let v = json(&r)?;
     if r.status == 429 {
@@ -421,7 +568,18 @@ pub fn start(
 }
 
 /// One poll. RFC 8628 section 3.5 errors become [`Poll`] values; anything else is an error.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn poll_once(http: &dyn Http, acct: &Account, device_code: &str) -> Result<Poll, ConnectError> {
+    poll_once_as(http, acct, device_code, Purpose::Server)
+}
+
+/// [`poll_once`] for a sign-in of the given purpose: an agent sign-in must come back with the agent fields, checked strictly.
+pub fn poll_once_as(
+    http: &dyn Http,
+    acct: &Account,
+    device_code: &str,
+    purpose: Purpose,
+) -> Result<Poll, ConnectError> {
     let body = json!({ "grant_type": GRANT, "device_code": device_code, "client_id": CLIENT_ID })
         .to_string();
     let r = http.send("POST", &acct.url("/v1/device/token"), None, Some(&body))?;
@@ -453,6 +611,10 @@ pub fn poll_once(http: &dyn Http, acct: &Account, device_code: &str) -> Result<P
                 v.get("company_name").and_then(Value::as_str).unwrap_or(""),
                 120,
             ),
+            agent: match purpose {
+                Purpose::Server => None,
+                Purpose::Agent => Some(Box::new(agent_grant(&v)?)),
+            },
         }));
     }
     match error_code(&v).as_str() {
@@ -517,6 +679,17 @@ pub fn wait_for_approval(
     st: &Started,
     pace: &mut dyn Pace,
 ) -> Result<Result<Waited, ConnectError>, crate::term::Error> {
+    wait_for_approval_as(http, acct, st, pace, Purpose::Server)
+}
+
+/// [`wait_for_approval`] for a sign-in of the given purpose.
+pub fn wait_for_approval_as(
+    http: &dyn Http,
+    acct: &Account,
+    st: &Started,
+    pace: &mut dyn Pace,
+    purpose: Purpose,
+) -> Result<Result<Waited, ConnectError>, crate::term::Error> {
     let expires = Duration::from_secs(st.expires_in);
     let mut interval = Duration::from_secs(st.interval);
     let mut next = interval;
@@ -530,7 +703,7 @@ pub fn wait_for_approval(
             }));
         }
         if now >= next {
-            match poll_once(http, acct, &st.device_code) {
+            match poll_once_as(http, acct, &st.device_code, purpose) {
                 Ok(Poll::Pending) => failures = 0,
                 Ok(Poll::SlowDown(s)) => {
                     failures = 0;
@@ -690,12 +863,14 @@ mod tests {
         Ok(Reply {
             status: 200,
             body: body.into(),
+            retry_after: None,
         })
     }
     fn err(status: u16, code: &str) -> Result<Reply, ConnectError> {
         Ok(Reply {
             status,
             body: format!("{{\"error\":\"{code}\"}}"),
+            retry_after: None,
         })
     }
     const STARTED: &str = r#"{"device_code":"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG","user_code":"WAVE-7K4Q-X2MP","verification_uri":"https://account.test/link","expires_in":600,"interval":5,"words":["amber","river","cedar","fox"]}"#;
@@ -794,6 +969,7 @@ mod tests {
         let bad = Ok(Reply {
             status: 502,
             body: "<html>Bad gateway</html>".into(),
+            retry_after: None,
         });
         let f = Fake::new(&clock, vec![bad, ok(TOKEN)]);
         let w = wait_for_approval(&f, &acct(), &started(), &mut Clock(clock.clone(), 0))
@@ -813,7 +989,8 @@ mod tests {
         assert!(matches!(
             p(Ok(Reply {
                 status: 400,
-                body: r#"{"error":"slow_down","interval":10}"#.into()
+                body: r#"{"error":"slow_down","interval":10}"#.into(),
+                retry_after: None,
             })),
             Poll::SlowDown(10)
         ));
@@ -835,6 +1012,7 @@ mod tests {
         let house = Ok(Reply {
             status: 429,
             body: r#"{"error":{"code":"rate_limited"}}"#.into(),
+            retry_after: None,
         });
         assert!(matches!(p(house), Poll::SlowDown(_)));
     }
@@ -899,6 +1077,7 @@ mod tests {
         let slow = Ok(Reply {
             status: 400,
             body: r#"{"error":"slow_down","interval":10}"#.into(),
+            retry_after: None,
         });
         let f = Fake::new(
             &clock,
@@ -1114,5 +1293,164 @@ mod tests {
             lax.send("GET", "http://127.0.0.1:1/x", None, None),
             Err(ConnectError::Network(_))
         ));
+    }
+
+    // ---- sign-in for an agent (`purpose: "agent"`)
+
+    #[test]
+    fn the_server_sign_in_request_is_unchanged_byte_for_byte() {
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let f = Fake::new(&clock, vec![ok(STARTED)]);
+        start(&f, &acct(), "web-01", "Ubuntu 24.04").unwrap();
+        let body = f.seen.borrow()[0].3.clone().unwrap();
+        assert_eq!(
+            body,
+            format!(
+                "{{\"client_id\":\"stonewave-cli\",\"host\":\"web-01\",\"os\":\"Ubuntu 24.04\",\"version\":\"{}\"}}",
+                crate::VERSION
+            )
+        );
+    }
+
+    #[test]
+    fn the_agent_sign_in_sends_purpose_and_want() {
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let f = Fake::new(&clock, vec![ok(STARTED), ok(STARTED)]);
+        let want = Want {
+            engine: "grok".into(),
+            agent_name: Some("Grok (Mac)".into()),
+            company: None,
+        };
+        start_with(&f, &acct(), "mac", "macOS", Some(&want)).unwrap();
+        let v: Value = serde_json::from_str(f.seen.borrow()[0].3.as_ref().unwrap()).unwrap();
+        assert_eq!(v["purpose"], "agent");
+        assert_eq!(
+            v["want"],
+            json!({"engine": "grok", "agent_name": "Grok (Mac)"})
+        );
+        assert_eq!(v["client_id"], "stonewave-cli");
+        let want = Want {
+            engine: "codex".into(),
+            ..Want::default()
+        };
+        start_with(&f, &acct(), "mac", "macOS", Some(&want)).unwrap();
+        let v: Value = serde_json::from_str(f.seen.borrow()[1].3.as_ref().unwrap()).unwrap();
+        assert_eq!(v["want"], json!({"engine": "codex"}));
+    }
+
+    const AGENT_TOKEN: &str = r#"{"access_token":"aaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbb.cccccccccccccc","token_type":"Bearer","expires_in":900,"scope":"agent:connect","company":"acme","company_name":"Acme GmbH","team":"ops","team_name":"Ops","agent":"agent-demo","agent_name":"Grok (Mac)","engine":"grok","wave_url":"https://wave.test"}"#;
+
+    fn poll_agent(body: &str) -> Result<Poll, ConnectError> {
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        poll_once_as(
+            &Fake::new(&clock, vec![ok(body)]),
+            &acct(),
+            "dc",
+            Purpose::Agent,
+        )
+    }
+
+    #[test]
+    fn the_agent_answer_is_read_strictly() {
+        let Poll::Approved(a) = poll_agent(AGENT_TOKEN).unwrap() else {
+            panic!("not approved")
+        };
+        let g = a.agent.clone().expect("agent fields");
+        assert_eq!(
+            (g.team.as_str(), g.agent.as_str(), g.engine.as_str()),
+            ("ops", "agent-demo", "grok")
+        );
+        assert_eq!(g.agent_name, "Grok (Mac)");
+        assert_eq!(g.wave_url.as_deref(), Some("https://wave.test"));
+        assert!(
+            !format!("{a:?}").contains("aaaaaaaa"),
+            "the token stays secret"
+        );
+        // wave_url is optional
+        let no_url = AGENT_TOKEN.replace(",\"wave_url\":\"https://wave.test\"", "");
+        let Poll::Approved(a) = poll_agent(&no_url).unwrap() else {
+            panic!()
+        };
+        assert_eq!(a.agent.unwrap().wave_url, None);
+        // every one of these is a protocol error
+        for bad in [
+            AGENT_TOKEN.replace("agent:connect", "server:register"),
+            AGENT_TOKEN.replace("\"Bearer\"", "\"Basic\""),
+            AGENT_TOKEN.replace("\"expires_in\":900,", ""),
+            AGENT_TOKEN.replace("\"agent\":\"agent-demo\"", "\"agent\":\"Agent Demo\""),
+            AGENT_TOKEN.replace("\"agent\":\"agent-demo\"", "\"agent\":\"../etc\""),
+            AGENT_TOKEN.replace("\"agent\":\"agent-demo\"", "\"agent\":\"a\""),
+            AGENT_TOKEN.replace("\"team\":\"ops\"", "\"team\":\"OPS\""),
+            AGENT_TOKEN.replace("\"team\":\"ops\",", ""),
+            AGENT_TOKEN.replace("\"team_name\":\"Ops\"", "\"team_name\":\"\""),
+            AGENT_TOKEN.replace("\"engine\":\"grok\"", "\"engine\":\"Grok Build!\""),
+            AGENT_TOKEN.replace("\"wave_url\":\"https://wave.test\"", "\"wave_url\":5"),
+            AGENT_TOKEN.replace(
+                "\"access_token\":\"aaaaaaaaaaaaaaaa",
+                "\"access_token\":\"a b",
+            ),
+        ] {
+            assert!(
+                matches!(poll_agent(&bad), Err(ConnectError::Protocol(_))),
+                "{bad}"
+            );
+        }
+        // an answer for a server sign-in has no agent fields to demand
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let Poll::Approved(s) =
+            poll_once(&Fake::new(&clock, vec![ok(TOKEN)]), &acct(), "dc").unwrap()
+        else {
+            panic!()
+        };
+        assert!(s.agent.is_none());
+        // control characters in names are tamed
+        let tame_name = AGENT_TOKEN.replace("Grok (Mac)", "Grok\\u001b[31m");
+        let Poll::Approved(a) = poll_agent(&tame_name).unwrap() else {
+            panic!()
+        };
+        assert!(!a.agent.unwrap().agent_name.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn curl_output_is_split_into_headers_body_and_status() {
+        let r = split_reply(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 17\r\n\r\n{\"error\":1}\n429",
+        )
+        .unwrap();
+        assert_eq!(
+            (r.status, r.body.as_str(), r.retry_after),
+            (429, "{\"error\":1}", Some(17))
+        );
+        // a `100 Continue` block first
+        let r = split_reply("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 201 Created\r\n\r\n{}\n201")
+            .unwrap();
+        assert_eq!(
+            (r.status, r.body.as_str(), r.retry_after),
+            (201, "{}", None)
+        );
+        // an empty body, an HTTP date and an absurd value
+        let r = split_reply(
+            "HTTP/1.1 204 No Content\r\nretry-after: Wed, 21 Oct 2026 07:28:00 GMT\r\n\r\n\n204",
+        )
+        .unwrap();
+        assert_eq!((r.body.as_str(), r.retry_after), ("", None));
+        let r = split_reply("HTTP/1.1 429 X\r\nRETRY-AFTER: 999999\r\n\r\nx\n429").unwrap();
+        assert_eq!(r.retry_after, Some(3600));
+        assert!(split_reply("no status").is_err());
+        // the config asks curl for the headers
+        assert!(
+            curl_config("GET", "https://a.test/x", None, None, false)
+                .contains("dump-header = \"-\"")
+        );
+    }
+
+    #[test]
+    fn other_address_kinds_use_the_same_rules_with_their_own_name() {
+        assert!(Account::parse_as("Wave", "https://wave.test").is_ok());
+        assert!(Account::parse_as("Wave", "http://127.0.0.1:9").is_ok());
+        let e = Account::parse_as("Wave", "http://wave.test").unwrap_err();
+        assert!(e.to_string().starts_with("Wave address"), "{e}");
+        let e = Account::parse("http://account.test").unwrap_err();
+        assert!(e.to_string().starts_with("account address"), "{e}");
     }
 }

@@ -550,14 +550,14 @@ fn fail(term: &mut Term, what: &str, e: &ConnectError) -> Result<Outcome> {
 }
 
 /// Draws the waiting line and listens for Ctrl-C while the poll loop runs.
-struct TermPace<'a> {
+pub(crate) struct TermPace<'a> {
     term: &'a mut Term,
     started: Instant,
     mark: usize,
 }
 
 impl<'a> TermPace<'a> {
-    fn new(term: &'a mut Term) -> Self {
+    pub(crate) fn new(term: &'a mut Term) -> Self {
         term.hide_cursor();
         let mark = term.mark();
         TermPace {

@@ -615,6 +615,7 @@ mod tests {
             Ok(Reply {
                 status: self.answer.0,
                 body: self.answer.1.clone(),
+                retry_after: None,
             })
         }
     }
