@@ -17,7 +17,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use super::key::atomic_write;
+use super::key::{atomic_write, atomic_write_keep_mode};
 
 pub const BEGIN: &str = "# stonewave: begin wave";
 pub const END: &str = "# stonewave: end wave";
@@ -216,7 +216,7 @@ pub fn install(config: &Path, mcp_url: &str) -> Result<Done, FileError> {
             atomic_write(&bak, text.as_bytes(), 0o600)?;
         }
     }
-    atomic_write(config, new.as_bytes(), 0o600)?;
+    atomic_write_keep_mode(config, new.as_bytes(), 0o600)?;
     Ok(if has_block(&text) {
         Done::Replaced
     } else {
@@ -234,7 +234,7 @@ pub fn uninstall(config: &Path) -> Result<bool, FileError> {
     match remove(&text).map_err(FileError::Problem)? {
         None => Ok(false),
         Some(new) => {
-            atomic_write(config, new.as_bytes(), 0o600)?;
+            atomic_write_keep_mode(config, new.as_bytes(), 0o600)?;
             Ok(true)
         }
     }

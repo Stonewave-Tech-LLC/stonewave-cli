@@ -902,6 +902,32 @@ fn rotate_replaces_the_key_file_restarts_the_service_and_keeps_state_current() {
     assert!(!ui.text().contains("n3wN3w"));
 }
 
+#[cfg(unix)]
+#[test]
+fn rotate_writes_0600_and_0700_even_when_the_old_ones_were_loosened() {
+    use std::os::unix::fs::PermissionsExt;
+    let rotated = json!({"key": KEY2, "expires_at": "2099-05-01T00:00:00Z"}).to_string();
+    let rig = Rig::new(Os::Linux, vec![], vec![reply(200, &rotated)]);
+    connected(&rig, false);
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    std::fs::set_permissions(
+        rig.dirs.key_file("agent-demo"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    std::fs::set_permissions(&rig.dirs.config, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut ui = TestUi::new(&[]);
+    let out = rig
+        .run(&Fake::new(&[]), |ctx| {
+            manage::rotate(ctx, &mut ui, None, None)
+        })
+        .unwrap();
+    assert!(matches!(out, Outcome::Done), "{}", ui.text());
+    assert_eq!(read(&rig.dirs.key_file("agent-demo")), KEY2);
+    assert_eq!(mode(&rig.dirs.key_file("agent-demo")), 0o600);
+    assert_eq!(mode(&rig.dirs.config), 0o700);
+}
+
 #[test]
 fn rotate_with_a_dead_key_changes_nothing() {
     let rig = Rig::new(

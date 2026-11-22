@@ -342,6 +342,14 @@ pub fn rotate(
         Err(m) => return fail(ui, "Cannot rotate", &m),
     };
     // Wave revokes the old key with this call, so the new one must be writable: look first
+    // the folder is 0700 again whatever it was, and the new file will be 0600
+    if let Err(e) = key::ensure_private_dir(&ctx.dirs.config, &acl) {
+        return fail(
+            ui,
+            "Cannot rotate",
+            &format!("{}: {e}", ctx.dirs.config.display()),
+        );
+    }
     if let Err(e) = key::check_writable(&ctx.dirs.config) {
         return fail(
             ui,

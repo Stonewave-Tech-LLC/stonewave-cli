@@ -229,8 +229,8 @@ pub fn trim_lines(text: &str, keep: usize) -> Option<String> {
 pub fn follow_command(os: Os, log: &str) -> String {
     if os == Os::Windows {
         format!(
-            "Get-Content -Wait -Tail 0 -LiteralPath '{}'",
-            log.replace('\'', "''")
+            "Get-Content -Wait -Tail 0 -LiteralPath {}",
+            winproc::ps_quote(log)
         )
     } else {
         format!("tail -n 0 -F '{}'", log.replace('\'', "'\\''"))
@@ -445,6 +445,7 @@ fn install_inner(
             if dirs.win_user.is_empty() {
                 return Err("cannot tell which Windows account to run the task as".into());
             }
+            super::key::check_text("account name", &dirs.win_user)?;
             let task_file = dirs
                 .config
                 .join(format!("stonewave-wave-{}.task.xml", r.agent));
@@ -1241,8 +1242,17 @@ mod tests {
         let during = ids();
         assert!(during.contains(&first.wrapper.pid) && during.contains(&child1.pid));
         // the record is true: the start times are the real ones
-        let info = System.process_info(child1.pid).unwrap().unwrap();
-        assert_eq!((info.start, info.image.as_str()), (child1.start, "node"));
+        let start = System
+            .run(
+                "powershell",
+                &[
+                    "-NoProfile".into(),
+                    "-Command".into(),
+                    format!("(Get-Process -Id {}).StartTime.ToFileTimeUtc()", child1.pid),
+                ],
+            )
+            .unwrap();
+        assert_eq!(start.stdout.trim(), child1.start.to_string());
         // the node writes into the wake log
         std::thread::sleep(Duration::from_secs(2));
         let log = fs::read_to_string(dirs.wake_log(agent)).unwrap_or_default();

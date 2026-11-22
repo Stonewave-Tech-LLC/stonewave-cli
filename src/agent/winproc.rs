@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::exec::{Exec, ProcInfo};
+use super::exec::{End, Exec};
 use super::key::scrub;
 use super::state::ServiceRec;
 use super::station::Unit;
@@ -22,9 +22,19 @@ pub const CHILD_IMAGE: &str = "node";
 
 // ------------------------------------------------------------------ the wrapper
 
-/// A value in a PowerShell single-quoted string.
-fn ps(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+/// A value as a PowerShell single-quoted string. PowerShell takes the curly quotes U+2018 to U+201B for single quotes too, so
+/// every one of the five is doubled; nothing inside can end the string.
+pub fn ps_quote(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('\'');
+    for c in s.chars() {
+        o.push(c);
+        if matches!(c, '\'' | '\u{2018}'..='\u{201B}') {
+            o.push(c);
+        }
+    }
+    o.push('\'');
+    o
 }
 
 /// The wrapper: sets the two variables, keeps the record, starts node with its output appended to the wake log, and starts it
@@ -37,13 +47,13 @@ pub fn wrapper_script(u: &Unit<'_>, pid_file: &str) -> String {
         ),
         "$ErrorActionPreference = 'Stop'".to_owned(),
         "$ProgressPreference = 'SilentlyContinue'".to_owned(),
-        format!("$env:WAVE_MCP_URL = {}", ps(u.mcp_url)),
-        format!("$env:WAVE_AGENT_KEY_FILE = {}", ps(u.key_file)),
-        format!("$node = {}", ps(u.node)),
-        format!("$script = {}", ps(u.script)),
-        format!("$agent = {}", ps(u.agent)),
-        format!("$log = {}", ps(u.log)),
-        format!("$pidFile = {}", ps(pid_file)),
+        format!("$env:WAVE_MCP_URL = {}", ps_quote(u.mcp_url)),
+        format!("$env:WAVE_AGENT_KEY_FILE = {}", ps_quote(u.key_file)),
+        format!("$node = {}", ps_quote(u.node)),
+        format!("$script = {}", ps_quote(u.script)),
+        format!("$agent = {}", ps_quote(u.agent)),
+        format!("$log = {}", ps_quote(u.log)),
+        format!("$pidFile = {}", ps_quote(pid_file)),
         String::new(),
         "# who is running: this wrapper, and the node it started (ids and start times, no secrets)".to_owned(),
         "function Save-State($child) {".to_owned(),
@@ -149,18 +159,22 @@ pub fn parse_pid_file(text: &str) -> Option<PidFile> {
     })
 }
 
+/// What the stop script decides (kept here as plain Rust so the rule is written down and tested; the test double uses it).
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// No such process any more: nothing to do.
     Gone,
-    /// The very process that was recorded.
     Ours,
-    /// The number belongs to something else now (or cannot be told): hands off.
     Stale(String),
 }
 
-/// Is the process that runs under the recorded id the one that was recorded?
-pub fn judge(rec: &Recorded, expected_image: &str, live: Option<&ProcInfo>) -> Verdict {
+/// Is the process that runs under the recorded id the one that was recorded? Same start time AND same program name.
+#[cfg(test)]
+pub fn judge(
+    rec: &Recorded,
+    expected_image: &str,
+    live: Option<&super::exec::ProcInfo>,
+) -> Verdict {
     let Some(live) = live else {
         return Verdict::Gone;
     };
@@ -176,6 +190,23 @@ pub fn judge(rec: &Recorded, expected_image: &str, live: Option<&ProcInfo>) -> V
     Verdict::Ours
 }
 
+/// The PowerShell that checks and ends in one go, on the one process object it fetched: no such process -> `gone`; another start
+/// time or program name -> `stale: <why>` and nothing is touched; else `Stop-Process -InputObject` on that same object -> `ended`.
+/// It ends one id and names no process by name or command line.
+pub fn end_script(pid: u32, start: i64, image: &str) -> String {
+    let image = ps_quote(image);
+    format!(
+        "$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue\n\
+if (-not $p) {{ 'gone' }}\n\
+else {{\n\
+  $st = try {{ $p.StartTime.ToFileTimeUtc() }} catch {{ -1 }}\n\
+  if ($st -ne {start}) {{ 'stale: it started at another time' }}\n\
+  elseif ($p.ProcessName -ne {image}) {{ 'stale: it is ' + $p.ProcessName + ', not ' + {image} }}\n\
+  else {{ Stop-Process -InputObject $p -ErrorAction Stop; 'ended' }}\n\
+}}"
+    )
+}
+
 // ------------------------------------------------------------------ stopping
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -187,7 +218,7 @@ pub struct StopReport {
     pub problems: Vec<String>,
 }
 
-/// Ends what the wrapper recorded: node first, then the wrapper (which waits 20 seconds after a node ends before it starts the next
+/// Ends what the wrapper recorded, each with the check and the ending in one step: node first, then the wrapper (which waits 20 seconds after a node ends before it starts the next
 /// one, so it cannot start another in between). Whatever fails the check is left alone.
 pub fn stop(rec: &ServiceRec, exec: &dyn Exec) -> StopReport {
     let mut report = StopReport::default();
@@ -218,32 +249,20 @@ pub fn stop(rec: &ServiceRec, exec: &dyn Exec) -> StopReport {
     ];
     let mut clean = true;
     for (r, image, what) in targets.into_iter().flatten() {
-        match exec.process_info(r.pid) {
+        match exec.end_if_same(r.pid, r.start, image) {
+            Ok(End::Ended) => report.ended.push(r.pid),
+            Ok(End::Gone) => {}
+            Ok(End::Stale(why)) => report
+                .notes
+                .push(format!("stale pid {} ({what}), left alone: {why}", r.pid)),
             Err(e) => {
                 clean = false;
                 report.problems.push(format!(
-                    "cannot look at process {} ({what}): {}",
+                    "could not end process {} ({what}): {}",
                     r.pid,
                     scrub(&e.to_string())
                 ));
             }
-            Ok(live) => match judge(&r, image, live.as_ref()) {
-                Verdict::Gone => {}
-                Verdict::Stale(why) => report
-                    .notes
-                    .push(format!("stale pid {} ({what}), left alone: {why}", r.pid)),
-                Verdict::Ours => match exec.end_process(r.pid) {
-                    Ok(()) => report.ended.push(r.pid),
-                    Err(e) => {
-                        clean = false;
-                        report.problems.push(format!(
-                            "could not end process {} ({what}): {}",
-                            r.pid,
-                            scrub(&e.to_string())
-                        ));
-                    }
-                },
-            },
         }
     }
     if clean {
@@ -254,6 +273,7 @@ pub fn stop(rec: &ServiceRec, exec: &dyn Exec) -> StopReport {
 
 #[cfg(test)]
 mod tests {
+    use super::super::exec::ProcInfo;
     use super::super::exec::fake::Fake;
     use super::super::key::testdir::TempDir;
     use super::*;
@@ -481,5 +501,181 @@ mod tests {
             Path::new(&pid_file_of(&rec.files[0])).exists(),
             "can be tried again"
         );
+    }
+
+    /// What PowerShell makes of a single-quoted literal: the text up to the closing quote, with doubled quotes folded to one.
+    /// Any of U+0027 and U+2018 to U+201B is a quote for it. Returns the value and what is left after the literal.
+    fn lex_single_quoted(src: &str) -> (String, String) {
+        let is_quote = |c: char| matches!(c, '\'' | '\u{2018}'..='\u{201B}');
+        let mut chars = src.chars().peekable();
+        assert!(chars.next().is_some_and(is_quote), "starts with a quote");
+        let mut value = String::new();
+        while let Some(c) = chars.next() {
+            if is_quote(c) {
+                if chars.peek().copied().is_some_and(is_quote) {
+                    value.push(chars.next().unwrap());
+                    continue;
+                }
+                return (value, chars.collect());
+            }
+            value.push(c);
+        }
+        panic!("the literal never ends: {src}");
+    }
+
+    #[test]
+    fn ps_quote_doubles_every_kind_of_single_quote() {
+        for s in [
+            "plain",
+            "it's",
+            "O\u{2019}Brien",
+            "a\u{2018}b\u{201A}c\u{201B}d",
+            "x\u{2019}; calc; \u{2019}",
+            "x'; calc; '",
+            "\u{2018}\u{2019}'\u{201A}",
+            "",
+        ] {
+            let q = ps_quote(s);
+            let (value, rest) = lex_single_quoted(&q);
+            assert_eq!(rest, "", "the literal ends only at its own end: {q}");
+            assert_eq!(value.chars().count(), s.chars().count(), "{q}");
+            // every quote character of the input came back as a quote character, in order
+            let quotes = |t: &str| {
+                t.chars()
+                    .filter(|c| matches!(c, '\'' | '\u{2018}'..='\u{201B}'))
+                    .count()
+            };
+            assert_eq!(quotes(&value), quotes(s));
+        }
+        // a crafted path cannot get out of its literal
+        let crafted = ps_quote("C:\\x\u{2019}; calc; \u{2019}");
+        assert_eq!(lex_single_quoted(&crafted).1, "");
+    }
+
+    #[test]
+    fn the_wrapper_survives_a_path_with_curly_quotes_in_every_literal() {
+        let u = Unit {
+            agent: "agent-demo",
+            node: "C:\\n\u{2019}; calc; \u{2019}\\node.exe",
+            script: "C:\\s\u{2018}x.mjs",
+            mcp_url: "https://wave.test/mcp",
+            key_file: "C:\\k\u{201B}.key",
+            log: "C:\\l\u{201A}.log",
+        };
+        let w = wrapper_script(&u, "C:\\p\u{2019}.json");
+        for line in w.lines().filter(|l| {
+            l.starts_with("$node = ")
+                || l.starts_with("$script = ")
+                || l.starts_with("$log = ")
+                || l.starts_with("$pidFile = ")
+                || l.starts_with("$env:WAVE_AGENT_KEY_FILE = ")
+        }) {
+            let literal = line.split_once(" = ").unwrap().1;
+            assert_eq!(lex_single_quoted(literal).1, "", "{line}");
+        }
+    }
+
+    #[test]
+    fn the_end_script_names_one_id_and_nothing_else() {
+        let s = end_script(4242, 133_800_000_000_000_000, "node");
+        assert!(s.contains("Get-Process -Id 4242"));
+        assert!(s.contains("133800000000000000"));
+        assert!(s.contains("-ne 'node'"));
+        assert!(s.contains("Stop-Process -InputObject $p"));
+        for bad in [
+            "-Force",
+            "Win32_Process",
+            "CommandLine",
+            "Where-Object",
+            "-Name",
+            "taskkill",
+        ] {
+            assert!(!s.contains(bad), "{bad}");
+        }
+        // a program name with a curly quote cannot break out either
+        let s = end_script(4242, 1, "no\u{2019}de");
+        assert!(s.contains("'no\u{2019}\u{2019}de'"), "{s}");
+    }
+
+    /// The real PowerShell of this Windows machine reads `ps_quote` the way the lexer test says.
+    #[cfg(windows)]
+    #[test]
+    fn windows_real_powershell_reads_quoted_values_back_exactly() {
+        use super::super::exec::System;
+        for s in [
+            "O\u{2019}Brien",
+            "x\u{2019}; calc; \u{2019}",
+            "a\u{2018}b\u{201A}c\u{201B}d it's",
+            "plain",
+        ] {
+            let script = format!("([int[]][char[]]{}) -join ','", ps_quote(s));
+            let out = System
+                .run(
+                    "powershell",
+                    &[
+                        "-NoProfile".into(),
+                        "-NonInteractive".into(),
+                        "-Command".into(),
+                        script,
+                    ],
+                )
+                .unwrap();
+            assert!(out.ok, "{}", out.problem());
+            let want: Vec<String> = s.chars().map(|c| (c as u32).to_string()).collect();
+            assert_eq!(out.stdout.trim(), want.join(","), "{s}");
+        }
+    }
+
+    /// The real check-and-end script, on a process this test started itself and owns.
+    #[cfg(windows)]
+    #[test]
+    fn windows_real_end_if_same_ends_only_the_matching_process() {
+        use super::super::exec::System;
+        struct Owned(std::process::Child);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                // our own child, by its handle
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Owned(
+            std::process::Command::new("ping")
+                .args(["-n", "60", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let q = System
+            .run(
+                "powershell",
+                &[
+                    "-NoProfile".into(),
+                    "-Command".into(),
+                    format!("(Get-Process -Id {pid}).StartTime.ToFileTimeUtc().ToString() + ' ' + (Get-Process -Id {pid}).ProcessName"),
+                ],
+            )
+            .unwrap();
+        let (start, image) = q.stdout.trim().split_once(' ').unwrap();
+        let start: i64 = start.parse().unwrap();
+        assert_eq!(image.to_lowercase(), "ping");
+        // another start time, another program: left alone, still running
+        let r = System.end_if_same(pid, start + 1, "ping").unwrap();
+        assert!(
+            matches!(r, End::Stale(ref w) if w.contains("another time")),
+            "{r:?}"
+        );
+        let r = System.end_if_same(pid, start, "node").unwrap();
+        assert!(
+            matches!(r, End::Stale(ref w) if w.contains("not node")),
+            "{r:?}"
+        );
+        assert!(child.0.try_wait().unwrap().is_none(), "still running");
+        // the right one ends
+        assert_eq!(System.end_if_same(pid, start, "ping").unwrap(), End::Ended);
+        child.0.wait().unwrap();
+        // and then it is gone
+        assert_eq!(System.end_if_same(pid, start, "ping").unwrap(), End::Gone);
     }
 }

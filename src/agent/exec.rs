@@ -36,7 +36,19 @@ impl Output {
     }
 }
 
-/// What is known about a running process: when it started (FILETIME ticks) and its program name without `.exe`.
+/// What `end_if_same` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum End {
+    /// It was the recorded process and it was ended.
+    Ended,
+    /// There is no such process any more.
+    Gone,
+    /// The id belongs to another process now (or this one cannot be told): it was left alone. The text says why.
+    Stale(String),
+}
+
+#[cfg(test)]
+/// What a test double knows about a running process: when it started (FILETIME ticks) and its program name without `.exe`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcInfo {
     pub start: i64,
@@ -48,10 +60,10 @@ pub trait Exec {
     fn which(&self, name: &str) -> Option<PathBuf>;
     /// Runs a program to its end and collects what it wrote. `Err` only when it could not be started.
     fn run(&self, program: &str, args: &[String]) -> io::Result<Output>;
-    /// The process with this id, or None when there is none. Windows only; elsewhere the service managers do the stopping.
-    fn process_info(&self, pid: u32) -> io::Result<Option<ProcInfo>>;
-    /// Ends the process with this id (and nothing else). The only way this tool ends a process.
-    fn end_process(&self, pid: u32) -> io::Result<()>;
+    /// Ends the process with this id, but only if it is still the process that was recorded: same start time (FILETIME ticks) and
+    /// same program name, checked on the very process that is then ended. The only way this tool ends a process. Windows only;
+    /// elsewhere the service managers do the stopping.
+    fn end_if_same(&self, pid: u32, start: i64, image: &str) -> io::Result<End>;
 }
 
 /// The real machine.
@@ -97,52 +109,26 @@ impl Exec for System {
         None
     }
 
-    fn process_info(&self, pid: u32) -> io::Result<Option<ProcInfo>> {
-        let script = format!(
-            "$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue; if ($p) {{ $p.StartTime.ToFileTimeUtc().ToString() + ' ' + $p.ProcessName }}"
-        );
+    fn end_if_same(&self, pid: u32, start: i64, image: &str) -> io::Result<End> {
         let out = self.run(
             "powershell",
             &[
                 "-NoProfile".into(),
                 "-NonInteractive".into(),
                 "-Command".into(),
-                script,
+                super::winproc::end_script(pid, start, image),
             ],
         )?;
         if !out.ok {
             return Err(io::Error::other(out.problem()));
         }
-        let line = out.stdout.trim();
-        if line.is_empty() {
-            return Ok(None);
-        }
-        let (start, image) = line
-            .split_once(' ')
-            .ok_or_else(|| io::Error::other("unexpected answer about a process"))?;
-        let start = start
-            .parse()
-            .map_err(|_| io::Error::other("unexpected answer about a process"))?;
-        Ok(Some(ProcInfo {
-            start,
-            image: image.trim().to_owned(),
-        }))
-    }
-
-    fn end_process(&self, pid: u32) -> io::Result<()> {
-        let out = self.run(
-            "powershell",
-            &[
-                "-NoProfile".into(),
-                "-NonInteractive".into(),
-                "-Command".into(),
-                format!("Stop-Process -Id {pid} -ErrorAction Stop"),
-            ],
-        )?;
-        if out.ok {
-            Ok(())
-        } else {
-            Err(io::Error::other(out.problem()))
+        match out.stdout.trim() {
+            "ended" => Ok(End::Ended),
+            "gone" => Ok(End::Gone),
+            other => match other.strip_prefix("stale: ") {
+                Some(why) => Ok(End::Stale(crate::connect::tame(why, 120))),
+                None => Err(io::Error::other("unexpected answer about a process")),
+            },
         }
     }
 
@@ -213,7 +199,7 @@ pub mod fake {
     pub struct Fake {
         pub present: Vec<(String, PathBuf)>,
         pub calls: RefCell<Vec<(String, Vec<String>)>>,
-        /// The running processes `process_info` knows.
+        /// The running processes `end_if_same` knows.
         pub procs: RefCell<Vec<(u32, ProcInfo)>>,
         /// The ids `end_process` was asked to end, in order.
         pub ended: RefCell<Vec<u32>>,
@@ -279,22 +265,27 @@ pub mod fake {
                 .map(|(_, p)| p.clone())
         }
 
-        fn process_info(&self, pid: u32) -> io::Result<Option<ProcInfo>> {
-            Ok(self
+        fn end_if_same(&self, pid: u32, start: i64, image: &str) -> io::Result<End> {
+            if self.fail_end.borrow().contains(&pid) {
+                return Err(io::Error::other("access denied"));
+            }
+            let live = self
                 .procs
                 .borrow()
                 .iter()
                 .find(|(p, _)| *p == pid)
-                .map(|(_, i)| i.clone()))
-        }
-
-        fn end_process(&self, pid: u32) -> io::Result<()> {
-            if self.fail_end.borrow().contains(&pid) {
-                return Err(io::Error::other("access denied"));
+                .map(|(_, i)| i.clone());
+            // the same decision the PowerShell script of the real thing makes
+            let rec = super::super::winproc::Recorded { pid, start };
+            match super::super::winproc::judge(&rec, image, live.as_ref()) {
+                super::super::winproc::Verdict::Gone => Ok(End::Gone),
+                super::super::winproc::Verdict::Stale(why) => Ok(End::Stale(why)),
+                super::super::winproc::Verdict::Ours => {
+                    self.ended.borrow_mut().push(pid);
+                    self.procs.borrow_mut().retain(|(p, _)| *p != pid);
+                    Ok(End::Ended)
+                }
             }
-            self.ended.borrow_mut().push(pid);
-            self.procs.borrow_mut().retain(|(p, _)| *p != pid);
-            Ok(())
         }
 
         fn run(&self, program: &str, args: &[String]) -> io::Result<Output> {

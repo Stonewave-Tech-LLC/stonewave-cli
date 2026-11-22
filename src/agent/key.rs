@@ -82,6 +82,7 @@ fn icacls(acl: &Acl<'_>, path: &Path, dir: bool) -> io::Result<()> {
     if acl.user.is_empty() {
         return Err(io::Error::other("the user name is not known"));
     }
+    check_text("account name", acl.user).map_err(io::Error::other)?;
     let grant = if dir {
         format!("{}:(OI)(CI)F", acl.user)
     } else {
@@ -164,8 +165,18 @@ pub fn ensure_private_dir(dir: &Path, acl: &Acl<'_>) -> io::Result<()> {
     }
 }
 
-/// Writes `data` to `path` atomically. `mode` is the Unix mode of a new file (an existing file keeps its own).
+/// Writes `data` to `path` atomically, and the file has exactly `mode` afterwards (Unix), whatever mode the old file had.
 pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
+    atomic_write_inner(path, data, mode, false)
+}
+
+/// Like [`atomic_write`] for a file that is somebody else's (an engine's config): an existing file keeps its own mode,
+/// `mode` is only for a new one.
+pub fn atomic_write_keep_mode(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
+    atomic_write_inner(path, data, mode, true)
+}
+
+fn atomic_write_inner(path: &Path, data: &[u8], mode: u32, keep_existing: bool) -> io::Result<()> {
     refuse_symlink(path)?;
     let dir = path
         .parent()
@@ -175,7 +186,7 @@ pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
         .ok_or_else(|| io::Error::other("no file name"))?
         .to_string_lossy()
         .into_owned();
-    let existing_mode = fs::metadata(path).ok();
+    let existing_mode = fs::metadata(path).ok().filter(|_| keep_existing);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());
@@ -194,12 +205,16 @@ pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
     let result = (|| {
         file.write_all(data)?;
         #[cfg(unix)]
-        if let Some(m) = &existing_mode {
+        {
             use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(m.permissions().mode() & 0o777))?;
+            // exactly the wanted mode (the umask may have made the new file stricter), or the old file's own
+            let wanted = existing_mode
+                .as_ref()
+                .map_or(mode, |m| m.permissions().mode() & 0o777);
+            file.set_permissions(fs::Permissions::from_mode(wanted))?;
         }
         #[cfg(not(unix))]
-        let _ = &existing_mode;
+        let _ = (&existing_mode, mode);
         file.sync_all()?;
         drop(file);
         fs::rename(&tmp, path)
@@ -315,16 +330,40 @@ pub fn remove_if_there(path: &Path) -> io::Result<bool> {
     }
 }
 
-/// A path that stays out of the way of anything a shell or a config file could take apart.
+/// A character that cannot go safely into a service file, a script or a command line: control and invisible (format) characters,
+/// the double quote, and the curly look-alikes of the single quote that PowerShell reads as one (U+2018 to U+201B). The straight apostrophe is not in here: every writer quotes it.
+pub fn unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '"' | '\u{2018}'..='\u{201B}' | '\u{FFFD}' | '\u{AD}' | '\u{61C}' | '\u{180E}'
+                | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}' | '\u{FEFF}' | '\u{E0000}'..='\u{E007F}'
+        )
+}
+
+/// The first character of `s` that `unsafe_char` refuses, if any.
+fn first_unsafe(s: &str) -> Option<char> {
+    s.chars().find(|c| unsafe_char(*c))
+}
+
+/// A path that stays out of the way of anything a shell, a script or a config file could take apart. The straight apostrophe is
+/// allowed (every writer quotes it); the curly quotes, the double quote, control and invisible characters are refused.
 pub fn plain_path(p: &Path) -> Result<PathBuf, String> {
-    let s = p.to_string_lossy();
-    if s.chars().any(char::is_control) || s.contains('"') || s.contains('\u{FFFD}') {
-        return Err(format!(
-            "the path {} has characters that cannot be used safely in a service file",
-            scrub(&s)
-        ));
-    }
+    check_text("path", &p.to_string_lossy())?;
     Ok(p.to_path_buf())
+}
+
+/// The same check for a name that ends up in a file or a command (for example the Windows account name).
+pub fn check_text(what: &str, s: &str) -> Result<(), String> {
+    match first_unsafe(s) {
+        None => Ok(()),
+        Some(c) => Err(format!(
+            "the {what} {} has the character U+{:04X}, which cannot be used safely in a service file or script; use a {what} without it",
+            scrub(&s.replace(unsafe_char, "?")),
+            c as u32
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -552,10 +591,62 @@ mod tests {
         assert!(read_key_file(&f).is_ok());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_loosened_file_is_written_back_as_0600_but_somebody_elses_config_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = TempDir::new("loose");
+        let fake = Fake::new(&[]);
+        let acl = Acl {
+            exec: &fake,
+            user: "x",
+        };
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let f = t.path().join("agent-x.key");
+        write_private_file(&f, KEY.as_bytes(), &acl).unwrap();
+        for loose in [0o644, 0o666, 0o755, 0o400] {
+            fs::set_permissions(&f, fs::Permissions::from_mode(loose)).unwrap();
+            write_private_file(&f, b"wak_newnewnewnew", &acl).unwrap();
+            assert_eq!(mode(&f), 0o600, "after {loose:o}");
+        }
+        assert_eq!(fs::read_to_string(&f).unwrap(), "wak_newnewnewnew");
+        // the state file and the others written with atomic_write get the mode asked for
+        let g = t.path().join("state.json");
+        fs::write(&g, "{}").unwrap();
+        fs::set_permissions(&g, fs::Permissions::from_mode(0o666)).unwrap();
+        atomic_write(&g, b"{}", 0o600).unwrap();
+        assert_eq!(mode(&g), 0o600);
+        // an engine's own config is not ours to tighten or loosen
+        let c = t.path().join("config.toml");
+        fs::write(&c, "a = 1\n").unwrap();
+        fs::set_permissions(&c, fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write_keep_mode(&c, b"a = 2\n", 0o600).unwrap();
+        assert_eq!(mode(&c), 0o644);
+        let d = t.path().join("new.toml");
+        atomic_write_keep_mode(&d, b"a = 2\n", 0o600).unwrap();
+        assert_eq!(mode(&d), 0o600);
+    }
+
     #[test]
     fn plain_path_refuses_what_breaks_service_files() {
         assert!(plain_path(Path::new("/home/a b/x")).is_ok());
         assert!(plain_path(Path::new("/home/a\"b")).is_err());
         assert!(plain_path(Path::new("/home/a\nb")).is_err());
+        // the apostrophe is fine (it is quoted everywhere); the look-alikes PowerShell takes for one are not
+        assert!(plain_path(Path::new("/home/it's")).is_ok());
+        for c in [
+            '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}', '\u{200B}', '\u{202E}', '\u{FEFF}',
+            '\u{AD}', '\0',
+        ] {
+            let p = format!("/home/O{c}Brien");
+            let e = plain_path(Path::new(&p)).unwrap_err();
+            assert!(e.contains("U+"), "{e}");
+        }
+        // a crafted path is refused, and the message does not print the quote
+        let crafted = format!("C:\\x{}; calc; {}", '\u{2019}', '\u{2019}');
+        let e = plain_path(Path::new(&crafted)).unwrap_err();
+        assert!(e.contains("U+2019") && !e.contains('\u{2019}'), "{e}");
+        assert!(check_text("account name", "PC\\ada").is_ok());
+        assert!(check_text("account name", "PC\\a\u{2019}da").is_err());
     }
 }
