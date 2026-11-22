@@ -66,8 +66,14 @@ impl Exec for System {
             if dir.as_os_str().is_empty() {
                 continue;
             }
+            // On Windows a file without an extension (the shell shim npm puts next to the .cmd file) cannot be started by CreateProcess: only names that
+            // already carry a PATHEXT extension are taken as they are.
+            let lower = name.to_ascii_lowercase();
+            let has_ext = exts
+                .iter()
+                .any(|e| lower.ends_with(&e.to_ascii_lowercase()));
             let plain = dir.join(name);
-            if is_program(&plain) {
+            if (exts.is_empty() || has_ext) && is_program(&plain) {
                 return Some(plain);
             }
             for e in &exts {
