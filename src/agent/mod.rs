@@ -28,6 +28,7 @@ pub mod station;
 pub mod timefmt;
 pub mod ui;
 pub mod wave;
+pub mod winproc;
 
 #[cfg(test)]
 mod e2e_tests;

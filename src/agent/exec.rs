@@ -36,11 +36,22 @@ impl Output {
     }
 }
 
+/// What is known about a running process: when it started (FILETIME ticks) and its program name without `.exe`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcInfo {
+    pub start: i64,
+    pub image: String,
+}
+
 pub trait Exec {
     /// Where `name` lives on the PATH (with the Windows extensions), if anywhere.
     fn which(&self, name: &str) -> Option<PathBuf>;
     /// Runs a program to its end and collects what it wrote. `Err` only when it could not be started.
     fn run(&self, program: &str, args: &[String]) -> io::Result<Output>;
+    /// The process with this id, or None when there is none. Windows only; elsewhere the service managers do the stopping.
+    fn process_info(&self, pid: u32) -> io::Result<Option<ProcInfo>>;
+    /// Ends the process with this id (and nothing else). The only way this tool ends a process.
+    fn end_process(&self, pid: u32) -> io::Result<()>;
 }
 
 /// The real machine.
@@ -84,6 +95,55 @@ impl Exec for System {
             }
         }
         None
+    }
+
+    fn process_info(&self, pid: u32) -> io::Result<Option<ProcInfo>> {
+        let script = format!(
+            "$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue; if ($p) {{ $p.StartTime.ToFileTimeUtc().ToString() + ' ' + $p.ProcessName }}"
+        );
+        let out = self.run(
+            "powershell",
+            &[
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                script,
+            ],
+        )?;
+        if !out.ok {
+            return Err(io::Error::other(out.problem()));
+        }
+        let line = out.stdout.trim();
+        if line.is_empty() {
+            return Ok(None);
+        }
+        let (start, image) = line
+            .split_once(' ')
+            .ok_or_else(|| io::Error::other("unexpected answer about a process"))?;
+        let start = start
+            .parse()
+            .map_err(|_| io::Error::other("unexpected answer about a process"))?;
+        Ok(Some(ProcInfo {
+            start,
+            image: image.trim().to_owned(),
+        }))
+    }
+
+    fn end_process(&self, pid: u32) -> io::Result<()> {
+        let out = self.run(
+            "powershell",
+            &[
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                format!("Stop-Process -Id {pid} -ErrorAction Stop"),
+            ],
+        )?;
+        if out.ok {
+            Ok(())
+        } else {
+            Err(io::Error::other(out.problem()))
+        }
     }
 
     fn run(&self, program: &str, args: &[String]) -> io::Result<Output> {
@@ -153,6 +213,12 @@ pub mod fake {
     pub struct Fake {
         pub present: Vec<(String, PathBuf)>,
         pub calls: RefCell<Vec<(String, Vec<String>)>>,
+        /// The running processes `process_info` knows.
+        pub procs: RefCell<Vec<(u32, ProcInfo)>>,
+        /// The ids `end_process` was asked to end, in order.
+        pub ended: RefCell<Vec<u32>>,
+        /// Ids that cannot be ended.
+        pub fail_end: RefCell<Vec<u32>>,
         script: Script,
     }
 
@@ -183,6 +249,9 @@ pub mod fake {
                     .map(|n| ((*n).to_owned(), PathBuf::from(format!("/fake/bin/{n}"))))
                     .collect(),
                 calls: RefCell::new(Vec::new()),
+                procs: RefCell::new(Vec::new()),
+                ended: RefCell::new(Vec::new()),
+                fail_end: RefCell::new(Vec::new()),
                 script: Box::new(|_, _| None),
             }
         }
@@ -208,6 +277,24 @@ pub mod fake {
                 .iter()
                 .find(|(n, _)| n == name)
                 .map(|(_, p)| p.clone())
+        }
+
+        fn process_info(&self, pid: u32) -> io::Result<Option<ProcInfo>> {
+            Ok(self
+                .procs
+                .borrow()
+                .iter()
+                .find(|(p, _)| *p == pid)
+                .map(|(_, i)| i.clone()))
+        }
+
+        fn end_process(&self, pid: u32) -> io::Result<()> {
+            if self.fail_end.borrow().contains(&pid) {
+                return Err(io::Error::other("access denied"));
+            }
+            self.ended.borrow_mut().push(pid);
+            self.procs.borrow_mut().retain(|(p, _)| *p != pid);
+            Ok(())
         }
 
         fn run(&self, program: &str, args: &[String]) -> io::Result<Output> {
