@@ -234,14 +234,16 @@ async function runStream(o, w) {
       const res = await o.fetch(url, { headers: { authorization: `Bearer ${o.key}`, accept: 'text/event-stream' }, redirect: 'error', signal: ac.signal });
       if (res.status === 404 || res.status === 405) { await res.body?.cancel?.(); await pause(o.streamMissingMs ?? 600_000); continue; }
       if (res.status !== 200 || !res.body) { await res.body?.cancel?.(); throw new Error('refused'); }
-      w.up = true; w.wake(); arm();                                  // one look at the inbox now: whatever came while the stream was away
+      arm();                                                         // the line counts as UP only with its first bytes (Wave sends one at once): a proxy that holds the body back sends headers only, and then polling must go on
       const started = Date.now();
       const reader = res.body.getReader(), dec = new TextDecoder();
       let buf = '', bye = false;
       for (;;) {
         const { value, done } = await reader.read();
         if (done) break;
-        arm(); buf += dec.decode(value, { stream: true });
+        arm();
+        if (!w.up) { w.up = true; w.wake(); }                          // one look at the inbox now: whatever came while the stream was away
+        buf += dec.decode(value, { stream: true });
         if (buf.length > 65_536) buf = buf.slice(-65_536);          // a hostile line without an end must not grow without limit
         let i;
         while ((i = buf.indexOf('\n\n')) >= 0) {

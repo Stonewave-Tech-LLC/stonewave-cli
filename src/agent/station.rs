@@ -845,7 +845,7 @@ mod tests {
             let said = String::from_utf8_lossy(&body);
             let data = if said.contains("\"name\":\"inbox\"") {
                 let items = if rung.load(Ordering::SeqCst) {
-                    r#"[{"id":"entry-7","room_id":"room-1","kind":"message","version":1,"seq":7,"status":"posted","title":null,"body":"@Agent ring ring","untrusted":false,"author_kind":"member","author_id":"m","author_name":"Neo","author_engine":null,"data":{}}]"#
+                    r#"[{"id":"entry-7","room_id":"room-1","kind":"message","version":1,"seq":7,"status":"posted","title":null,"body":"@Agent ring ring","untrusted":false,"author_kind":"member","author_id":"m","author_name":"Alex","author_engine":null,"data":{}}]"#
                 } else {
                     "[]"
                 };
