@@ -170,13 +170,13 @@ the last 1000 lines when the service is installed again). A running session foll
 |---|---|
 | Linux | `~/.config/systemd/user/stonewave-wave-<agent>.service` (`systemctl --user enable --now`); to keep it running while you are logged out, run `loginctl enable-linger <user>` yourself, it is only suggested |
 | macOS | `~/Library/LaunchAgents/tech.stonewave.wave.<agent>.plist` (`launchctl bootstrap gui/<uid>`) |
-| Windows | a scheduled task `StonewaveWave-<agent>` at logon, made from a task definition (no admin needed), running a small `.cmd` wrapper without a window |
+| Windows | a scheduled task `StonewaveWave-<agent>` at logon, made from a task definition (no admin needed), running a small PowerShell wrapper (hidden window) that keeps node running and records its own process id and node's, with start times, in a file with no secrets; `disconnect`, `rotate` and a second `connect` end exactly those two processes by id, after checking that each id still has the same start time and program name (otherwise it says "stale pid, left alone" and does nothing to it) |
 
 If Node.js is missing, `connect` still finishes and says the wake service is missing and why.
 
 **What was and was not tested.** The protocol, the files, the rights, the Codex block, the argument lists for `claude`/`grok`/`codex`
 and the text of the three service files are covered by tests, including the real `curl` against a local stand-in for the account
-and Wave. The Windows task, `icacls` and the key rights were also run on a real Windows machine. **launchd and systemd units were
+and Wave. The Windows task (create, run, restart, delete, with the process ids compared before and after), `icacls` and the key rights were also run on a real Windows machine. **launchd and systemd units were
 only checked as text and as the commands that would be run; they have not been started on a Mac or a Linux machine. The Codex block
 follows its documentation but has not been run against Codex, and `claude mcp add` has not been run by this tool on a machine
 with Claude Code.** Grok 1.0.62 was seen to fill the `${WAVE_AGENT_KEY}` header in from its environment (against a local test server, not against Wave itself).

@@ -47,8 +47,11 @@ This tool will give software agents scoped access to servers, so we take reports
   `mcp remove` commands, and `~/.codex/config.toml` only inside the marked block.
 - The optional wake service runs `node` with the bundled `fleet-watch.mjs` as your user (systemd `--user`, a LaunchAgent, or a
   scheduled task at logon). It reads the key from the key file, asks Wave's MCP address for what was addressed to the agent, and writes
-  one line per new thing to a private log. On Windows, stopping the service also stops the batch file and node processes that belong to
-  this one service (found by the batch file's path and by the script with this agent's session name), because the Task Scheduler's own
-  stop leaves them running.
+  one line per new thing to a private log. On Windows the task runs a small PowerShell wrapper written by this tool; the wrapper keeps node running and records, in a file
+  next to it that holds no secret, its own process id and start time and node's. Stopping the service (`disconnect`, `rotate`, a
+  repeated `connect`) ends exactly those two processes by id, node first, and only after checking that an id still belongs to the same
+  process (same start time and the expected program name, `powershell` or `node`); an id that fails the check is left alone and
+  reported as stale. No process is ever ended by its name or its command line, and on Linux and macOS only `systemctl --user` and
+  `launchctl` are used on this tool's own unit or label.
 - `status` and `doctor` read local files and run report-only commands; `doctor` also opens one TCP connection to
   `account.stonewavetech.com:443` without sending data.
