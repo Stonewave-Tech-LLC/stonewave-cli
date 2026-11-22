@@ -486,6 +486,9 @@ pub fn connect(ctx: &Ctx<'_>, ui: &mut dyn Ui, o: &ConnectOpts) -> Result<Outcom
             st.service = Some(done.rec.clone());
         }
         save(&st, ui);
+        for n in &done.notes {
+            ui.note(n);
+        }
         match done.problem {
             None => {
                 let log = ctx.dirs.wake_log(&agent);

@@ -17,6 +17,7 @@ use super::dirs::{Dirs, Os, text};
 use super::exec::Exec;
 use super::key::{Acl, atomic_write, ensure_private_dir, plain_path, scrub};
 use super::state::ServiceRec;
+use super::winproc;
 
 pub const SCRIPT: &str = include_str!("../../assets/fleet-watch.mjs");
 pub const MIN_NODE_MAJOR: u32 = 18;
@@ -166,77 +167,20 @@ pub fn launchd_plist(u: &Unit<'_>) -> String {
 
 // ------------------------------------------------------------------ Windows
 
-/// A value inside double quotes in a batch file: `%` is doubled (it expands even inside quotes). A double quote cannot be
-/// escaped there, so values with one are refused before this is called (see `plain_path`).
-fn cmd_quoted(s: &str) -> String {
-    s.replace('%', "%%")
-}
-
-pub fn windows_wrapper(u: &Unit<'_>) -> String {
-    let log = cmd_quoted(u.log);
-    format!(
-        "@echo off\r\n\
-rem Wake service of the Wave agent {agent}, made by stonewave. Runs at logon, output goes to the wake log.\r\n\
-set \"WAVE_MCP_URL={url}\"\r\n\
-set \"WAVE_AGENT_KEY_FILE={keyfile}\"\r\n\
-:run\r\n\
-\"{node}\" \"{script}\" --session \"{session}\" >> \"{log}\" 2>&1\r\n\
-ping -n 21 127.0.0.1 >nul\r\n\
-goto run\r\n",
-        agent = u.agent,
-        url = cmd_quoted(u.mcp_url),
-        keyfile = cmd_quoted(u.key_file),
-        node = cmd_quoted(u.node),
-        script = cmd_quoted(u.script),
-        session = cmd_quoted(u.agent),
-    )
-}
-
-/// The task definition: at logon of this user, with the rights of this user, no time limit, no window (`conhost --headless`).
+/// The task definition: at logon of this user, with the rights of this user, no time limit, PowerShell with a hidden window.
 /// `schtasks /Create /SC ONLOGON` needs an elevated shell, a task made from a definition like this one does not.
 pub fn windows_task_xml(user: &str, wrapper: &str) -> String {
-    let (user, wrapper) = (xml_escape(user), xml_escape(wrapper));
+    let user = xml_escape(user);
+    let arguments = xml_escape(&winproc::task_arguments(wrapper));
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
 <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n\
   <Triggers>\r\n    <LogonTrigger>\r\n      <Enabled>true</Enabled>\r\n      <UserId>{user}</UserId>\r\n    </LogonTrigger>\r\n  </Triggers>\r\n\
   <Principals>\r\n    <Principal id=\"Author\">\r\n      <UserId>{user}</UserId>\r\n      <LogonType>InteractiveToken</LogonType>\r\n      <RunLevel>LeastPrivilege</RunLevel>\r\n    </Principal>\r\n  </Principals>\r\n\
   <Settings>\r\n    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n    <StartWhenAvailable>true</StartWhenAvailable>\r\n    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n    <Enabled>true</Enabled>\r\n  </Settings>\r\n\
-  <Actions Context=\"Author\">\r\n    <Exec>\r\n      <Command>conhost.exe</Command>\r\n      <Arguments>--headless cmd.exe /c \"{wrapper}\"</Arguments>\r\n    </Exec>\r\n  </Actions>\r\n\
+  <Actions Context=\"Author\">\r\n    <Exec>\r\n      <Command>powershell.exe</Command>\r\n      <Arguments>{arguments}</Arguments>\r\n    </Exec>\r\n  </Actions>\r\n\
 </Task>\r\n"
     )
-}
-
-/// PowerShell that stops the programs a stopped task leaves behind: `schtasks /End` ends the task's first process only, so the
-/// batch file and node would go on. Only processes of this one service are named: the batch file's own path, and this
-/// script with this session name.
-pub fn windows_stop_script(wrapper: &str, agent: &str) -> String {
-    let q = |s: &str| s.replace('\'', "''");
-    format!(
-        "$w = '{}'; $s = '--session \"{}\"'; Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -and ($_.CommandLine.Contains($w) -or ($_.CommandLine.Contains('fleet-watch.mjs') -and $_.CommandLine.Contains($s))) }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}",
-        q(wrapper),
-        q(agent)
-    )
-}
-
-/// Ends the task and what it started.
-fn windows_stop(rec: &ServiceRec, exec: &dyn Exec) {
-    let _ = exec.run(
-        "schtasks",
-        &["/End".to_owned(), "/TN".to_owned(), rec.name.clone()],
-    );
-    let agent = rec.name.strip_prefix("StonewaveWave-").unwrap_or("");
-    if let (Some(wrapper), false) = (rec.files.first(), agent.is_empty()) {
-        let _ = exec.run(
-            "powershell",
-            &[
-                "-NoProfile".to_owned(),
-                "-NonInteractive".to_owned(),
-                "-Command".to_owned(),
-                windows_stop_script(wrapper, agent),
-            ],
-        );
-    }
 }
 
 /// What `schtasks /XML` reads: UTF-16 little endian with a byte order mark.
@@ -376,6 +320,8 @@ pub fn write_script(dirs: &Dirs) -> io::Result<PathBuf> {
 pub struct Installed {
     pub rec: ServiceRec,
     pub problem: Option<String>,
+    /// Things worth telling (a stale process id that was left alone).
+    pub notes: Vec<String>,
 }
 
 pub struct Request<'a> {
@@ -406,14 +352,21 @@ pub fn install(r: &Request<'_>, acl: &Acl<'_>) -> Installed {
         name: String::new(),
         files: Vec::new(),
     };
-    let result = install_inner(r, acl, &mut rec);
+    let mut notes = Vec::new();
+    let result = install_inner(r, acl, &mut rec, &mut notes);
     Installed {
         rec,
         problem: result.err(),
+        notes,
     }
 }
 
-fn install_inner(r: &Request<'_>, acl: &Acl<'_>, rec: &mut ServiceRec) -> Result<(), String> {
+fn install_inner(
+    r: &Request<'_>,
+    acl: &Acl<'_>,
+    rec: &mut ServiceRec,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
     let dirs = r.dirs;
     let script = write_script(dirs)
         .map_err(|e| format!("cannot write the wake script: {}", scrub(&e.to_string())))?;
@@ -478,9 +431,12 @@ fn install_inner(r: &Request<'_>, acl: &Acl<'_>, rec: &mut ServiceRec) -> Result
         }
         Os::Windows => {
             let name = task_name(r.agent);
-            let file = dirs.config.join(format!("stonewave-wave-{}.cmd", r.agent));
+            let file = dirs.config.join(format!("stonewave-wave-{}.ps1", r.agent));
             plain_path(&file)?;
-            atomic_write(&file, windows_wrapper(&unit).as_bytes(), 0o644).map_err(|e| {
+            let pid_file = winproc::pid_file_of(&text(&file));
+            plain_path(Path::new(&pid_file))?;
+            let wrapper = winproc::wrapper_script(&unit, &pid_file);
+            atomic_write(&file, &winproc::script_bytes(&wrapper), 0o644).map_err(|e| {
                 format!("cannot write {}: {}", file.display(), scrub(&e.to_string()))
             })?;
             rec.kind = "schtasks".into();
@@ -502,8 +458,12 @@ fn install_inner(r: &Request<'_>, acl: &Acl<'_>, rec: &mut ServiceRec) -> Result
                 )
             })?;
             rec.files.push(text(&task_file));
-            // a task that runs already is stopped first (the result does not matter)
-            windows_stop(rec, r.exec);
+            // a service that runs already is stopped first: the processes it recorded, checked one by one
+            let stopped = winproc::stop(rec, r.exec);
+            notes.extend(stopped.notes);
+            if let Some(p) = stopped.problems.into_iter().next() {
+                return Err(p);
+            }
             let args = schtasks_create_args(&name, &text(&task_file));
             let out = r
                 .exec
@@ -556,17 +516,22 @@ pub fn status(rec: &ServiceRec, exec: &dyn Exec) -> ServiceStatus {
 }
 
 /// Makes a running service read the key file again (the script reads it once, when it starts).
-pub fn restart(rec: &ServiceRec, exec: &dyn Exec) -> Result<(), String> {
+/// Returns what is worth telling (a stale process id that was left alone).
+pub fn restart(rec: &ServiceRec, exec: &dyn Exec) -> Result<Vec<String>, String> {
     match rec.kind.as_str() {
-        "systemd" => run_ok(exec, "systemctl", &["--user", "restart", &rec.name]),
+        "systemd" => run_ok(exec, "systemctl", &["--user", "restart", &rec.name]).map(|()| vec![]),
         "launchd" => run_ok(
             exec,
             "launchctl",
             &["kickstart", "-k", &format!("gui/{}/{}", uid(), rec.name)],
-        ),
+        )
+        .map(|()| vec![]),
         "schtasks" => {
-            windows_stop(rec, exec);
-            run_ok(exec, "schtasks", &["/Run", "/TN", &rec.name])
+            let stopped = winproc::stop(rec, exec);
+            if let Some(p) = stopped.problems.into_iter().next() {
+                return Err(p);
+            }
+            run_ok(exec, "schtasks", &["/Run", "/TN", &rec.name]).map(|()| stopped.notes)
         }
         other => Err(format!("unknown service kind {other}")),
     }
@@ -576,6 +541,8 @@ pub fn restart(rec: &ServiceRec, exec: &dyn Exec) -> Result<(), String> {
 pub struct Removal {
     pub removed: Vec<String>,
     pub problems: Vec<String>,
+    /// Things worth telling (a stale process id that was left alone).
+    pub notes: Vec<String>,
 }
 
 /// Stops the service and removes the files recorded for it.
@@ -599,7 +566,11 @@ pub fn uninstall(rec: &ServiceRec, exec: &dyn Exec) -> Removal {
             vec!["bootout".into(), format!("gui/{}/{}", uid(), rec.name)],
         ),
         "schtasks" => {
-            windows_stop(rec, exec);
+            let stopped = winproc::stop(rec, exec);
+            out.removed
+                .extend(stopped.ended.iter().map(|p| format!("process {p}")));
+            out.notes.extend(stopped.notes);
+            out.problems.extend(stopped.problems);
             let del = exec.run(
                 "schtasks",
                 &[
@@ -805,32 +776,6 @@ mod tests {
     }
 
     #[test]
-    fn windows_wrapper_text_and_quoting() {
-        let w = windows_wrapper(&unit(
-            "C:\\Program Files\\nodejs\\node.exe",
-            "C:\\Users\\a b\\AppData\\Roaming\\wave\\fleet-watch.mjs",
-            "C:\\Users\\a b\\AppData\\Local\\wave\\agent-demo.wake.log",
-            "C:\\Users\\a b\\AppData\\Roaming\\wave\\agent-demo.key",
-        ));
-        assert!(w.contains("set \"WAVE_MCP_URL=https://wave.test/mcp\"\r\n"));
-        assert!(w.contains(
-            "set \"WAVE_AGENT_KEY_FILE=C:\\Users\\a b\\AppData\\Roaming\\wave\\agent-demo.key\"\r\n"
-        ));
-        assert!(w.contains("\"C:\\Program Files\\nodejs\\node.exe\" \"C:\\Users\\a b\\AppData\\Roaming\\wave\\fleet-watch.mjs\" --session \"agent-demo\" >> \"C:\\Users\\a b\\AppData\\Local\\wave\\agent-demo.wake.log\" 2>&1\r\n"), "{w}");
-        assert!(w.contains("goto run"));
-        assert!(!w.replace("\r\n", "").contains('\n'), "only CRLF line ends");
-        // percent signs would be expanded by cmd; ampersands and carets inside quotes are literal
-        let tricky = windows_wrapper(&unit(
-            "C:\\n&n^\\100%\\node.exe",
-            "C:\\s.mjs",
-            "C:\\l.log",
-            "C:\\k",
-        ));
-        assert!(tricky.contains("\"C:\\n&n^\\100%%\\node.exe\""), "{tricky}");
-        assert!(!w.contains("wak_"));
-    }
-
-    #[test]
     fn schtasks_arguments_and_the_task_definition() {
         assert_eq!(
             schtasks_create_args("StonewaveWave-agent-demo", "C:\\a b\\x.task.xml"),
@@ -843,18 +788,19 @@ mod tests {
                 "/F"
             ]
         );
-        let x = windows_task_xml("PC\\ada", "C:\\Users\\a & b\\x.cmd");
+        let x = windows_task_xml("PC\\ada", "C:\\Users\\a & b\\x.ps1");
         assert!(x.contains("<LogonTrigger>"));
         assert!(x.contains("<UserId>PC\\ada</UserId>"));
         assert!(x.contains("<RunLevel>LeastPrivilege</RunLevel>"));
         assert!(x.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
-        assert!(x.contains("<Command>conhost.exe</Command>"));
+        assert!(x.contains("<Command>powershell.exe</Command>"));
         assert!(
             x.contains(
-                "<Arguments>--headless cmd.exe /c \"C:\\Users\\a &amp; b\\x.cmd\"</Arguments>"
+                "<Arguments>-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File &quot;C:\\Users\\a &amp; b\\x.ps1&quot;</Arguments>"
             ),
             "{x}"
         );
+        assert!(!x.contains("conhost") && !x.contains("cmd.exe"));
         assert!(!x.contains("wak_"));
         let b = utf16le_with_bom("A\u{e4}");
         assert_eq!(b, vec![0xFF, 0xFE, b'A', 0, 0xE4, 0]);
@@ -986,21 +932,27 @@ mod tests {
                 }
                 Os::Windows => {
                     assert_eq!(done.rec.kind, "schtasks");
-                    assert_eq!(lines[0], "schtasks /End /TN StonewaveWave-agent-demo");
                     assert!(
-                        lines[1]
-                            .starts_with("powershell -NoProfile -NonInteractive -Command $w = '"),
-                        "{lines:?}"
-                    );
-                    assert!(
-                        lines[2].starts_with("schtasks /Create /TN StonewaveWave-agent-demo /XML ")
-                            && lines[2].ends_with(".task.xml /F"),
+                        lines[0].starts_with("schtasks /Create /TN StonewaveWave-agent-demo /XML ")
+                            && lines[0].ends_with(".task.xml /F"),
                         "{lines:?}"
                     );
                     assert_eq!(done.rec.files.len(), 2);
                     let raw = fs::read(&done.rec.files[1]).unwrap();
                     assert_eq!(&raw[..2], &[0xFF, 0xFE], "UTF-16 with a byte order mark");
-                    assert_eq!(lines[3], "schtasks /Run /TN StonewaveWave-agent-demo");
+                    assert_eq!(lines[1], "schtasks /Run /TN StonewaveWave-agent-demo");
+                    assert_eq!(
+                        lines.len(),
+                        2,
+                        "no process is ended by a command: {lines:?}"
+                    );
+                    assert!(done.rec.files[0].ends_with(".ps1"));
+                    let ps1 = fs::read(&done.rec.files[0]).unwrap();
+                    assert_eq!(
+                        &ps1[..3],
+                        &[0xEF, 0xBB, 0xBF],
+                        "a UTF-8 script with a byte order mark"
+                    );
                 }
             }
             // the script is on disk, the log exists, nothing holds a key
@@ -1077,32 +1029,41 @@ mod tests {
     }
 
     #[test]
-    fn schtasks_uninstall_ends_and_deletes() {
+    fn schtasks_uninstall_ends_only_recorded_processes_and_deletes_the_task() {
+        let t = TempDir::new("schun");
+        let wrapper = t.path().join("stonewave-wave-agent-demo.ps1");
+        fs::write(&wrapper, "x").unwrap();
+        let w = wrapper.to_string_lossy().into_owned();
+        fs::write(
+            winproc::pid_file_of(&w),
+            r#"{"version":1,"wrapper":{"pid":4242,"start":100,"image":"powershell"},"child":{"pid":5252,"start":200,"image":"node"}}"#,
+        )
+        .unwrap();
         let rec = ServiceRec {
             kind: "schtasks".into(),
             name: "StonewaveWave-agent-demo".into(),
-            files: vec!["C:\\Users\\a b\\wave\\x.cmd".into()],
+            files: vec![w],
         };
         let fake = Fake::new(&[]);
+        let proc = |start, image: &str| crate::agent::exec::ProcInfo {
+            start,
+            image: image.into(),
+        };
+        fake.procs
+            .borrow_mut()
+            .push((4242, proc(100, "powershell")));
+        // the recorded node id belongs to another process now: left alone
+        fake.procs.borrow_mut().push((5252, proc(999, "node")));
         let r = uninstall(&rec, &fake);
-        assert!(r.problems.is_empty());
-        let lines = fake.lines();
-        assert_eq!(lines.len(), 3, "{lines:?}");
-        assert_eq!(lines[0], "schtasks /End /TN StonewaveWave-agent-demo");
-        assert!(lines[1].starts_with("powershell -NoProfile -NonInteractive -Command "));
-        assert_eq!(lines[2], "schtasks /Delete /TN StonewaveWave-agent-demo /F");
-        // what the stop script names: this batch file, and this script with this session
-        let ps = windows_stop_script("C:\\Users\\it's\\x.cmd", "agent-demo");
-        assert!(
-            ps.starts_with("$w = 'C:\\Users\\it''s\\x.cmd'; $s = '--session \"agent-demo\"';"),
-            "{ps}"
+        assert!(r.problems.is_empty(), "{:?}", r.problems);
+        assert_eq!(*fake.ended.borrow(), vec![4242]);
+        assert_eq!(r.notes.len(), 1);
+        assert!(r.notes[0].starts_with("stale pid 5252"), "{:?}", r.notes);
+        // the only command run is the task's deletion: no /End, no taskkill, no pattern
+        assert_eq!(
+            fake.lines(),
+            vec!["schtasks /Delete /TN StonewaveWave-agent-demo /F"]
         );
-        assert!(
-            ps.contains("$_.ProcessId -ne $PID"),
-            "the stopper does not stop itself"
-        );
-        assert!(ps.contains("fleet-watch.mjs"));
-        assert!(!ps.contains("wak_"));
         // delete fails and the task is still there: a problem; task gone already: fine
         let stuck =
             Fake::new(&[]).with(|_, a| (a[0] == "/Delete").then(|| fail_out("Access is denied.")));
@@ -1114,13 +1075,133 @@ mod tests {
         assert!(uninstall(&rec, &gone).problems.is_empty());
     }
 
-    /// Against the real Task Scheduler and icacls of this Windows machine: `cargo test -- --ignored windows_real`.
-    /// Makes a task for the current user (named for this test), starts it, restarts it and deletes it again.
+    #[test]
+    fn restart_of_a_task_ends_the_recorded_processes_then_runs_it() {
+        let t = TempDir::new("schre");
+        let wrapper = t.path().join("stonewave-wave-agent-demo.ps1");
+        let w = wrapper.to_string_lossy().into_owned();
+        fs::write(
+            winproc::pid_file_of(&w),
+            r#"{"version":1,"wrapper":{"pid":4242,"start":100,"image":"powershell"},"child":{"pid":5252,"start":200,"image":"node"}}"#,
+        )
+        .unwrap();
+        let rec = ServiceRec {
+            kind: "schtasks".into(),
+            name: "StonewaveWave-agent-demo".into(),
+            files: vec![w],
+        };
+        let fake = Fake::new(&[]);
+        for (pid, start, image) in [(4242, 100, "powershell"), (5252, 200, "node")] {
+            fake.procs.borrow_mut().push((
+                pid,
+                crate::agent::exec::ProcInfo {
+                    start,
+                    image: image.into(),
+                },
+            ));
+        }
+        assert_eq!(restart(&rec, &fake).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            *fake.ended.borrow(),
+            vec![5252, 4242],
+            "node first, then the wrapper"
+        );
+        assert_eq!(
+            fake.lines(),
+            vec!["schtasks /Run /TN StonewaveWave-agent-demo"]
+        );
+    }
+
+    #[test]
+    fn systemd_and_launchd_are_stopped_only_through_their_own_managers() {
+        // every command the two managers get, on install, restart and uninstall: their own tool, our own unit or label
+        let rec_sd = ServiceRec {
+            kind: "systemd".into(),
+            name: "stonewave-wave-agent-demo.service".into(),
+            files: vec![],
+        };
+        let rec_ld = ServiceRec {
+            kind: "launchd".into(),
+            name: "tech.stonewave.wave.agent-demo".into(),
+            files: vec![],
+        };
+        for rec in [&rec_sd, &rec_ld] {
+            let fake = Fake::new(&[]);
+            restart(rec, &fake).unwrap();
+            uninstall(rec, &fake);
+            status(rec, &fake);
+            let lines = fake.lines();
+            assert!(!lines.is_empty());
+            for l in &lines {
+                assert!(
+                    l.starts_with("systemctl --user ") || l.starts_with("launchctl "),
+                    "{l}"
+                );
+                for bad in ["kill", "pkill", "taskkill", "Stop-Process"] {
+                    assert!(
+                        !l.replace("launchctl kickstart -k", "").contains(bad),
+                        "{l}"
+                    );
+                }
+            }
+            assert!(
+                fake.ended.borrow().is_empty(),
+                "no process was ended by id either"
+            );
+            assert!(lines.iter().any(|l| l.contains("agent-demo")));
+        }
+    }
+
+    /// Against the real Task Scheduler, icacls and PowerShell of this Windows machine: `cargo test -- --ignored windows_real`.
+    /// Makes a task for the current user (named for this test), lets it run, restarts it, deletes it, and compares the ids of the
+    /// PowerShell and node processes before and after. Nothing is ended by name: only the ids the wrapper recorded are ended.
     #[cfg(windows)]
     #[test]
     #[ignore = "changes the Task Scheduler of this machine (and removes it again)"]
     fn windows_real_service_round_trip() {
         use super::super::exec::System;
+        use std::collections::BTreeSet;
+        use std::time::{Duration, Instant};
+
+        fn ids() -> BTreeSet<u32> {
+            let out = System
+                .run(
+                    "powershell",
+                    &[
+                        "-NoProfile".into(),
+                        "-Command".into(),
+                        "Get-Process powershell,node -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID } | ForEach-Object { $_.Id }".into(),
+                    ],
+                )
+                .unwrap();
+            out.stdout
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
+        }
+        /// The record of the wrapper, once it names a node.
+        fn wait_for_child(pid_file: &str) -> winproc::PidFile {
+            let end = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(f) = fs::read_to_string(pid_file)
+                    .ok()
+                    .and_then(|t| winproc::parse_pid_file(&t))
+                    && f.child.is_some()
+                {
+                    return f;
+                }
+                assert!(Instant::now() < end, "the wrapper did not start node");
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+        /// Removes the task again whatever happens.
+        struct Cleanup(ServiceRec);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = uninstall(&self.0, &System);
+            }
+        }
+
         let t = TempDir::new("winreal");
         let mut dirs = Dirs::under(t.path());
         dirs.os = Os::Windows;
@@ -1138,6 +1219,7 @@ mod tests {
         let agent = "agent-teststation";
         fs::write(dirs.key_file(agent), "wak_notarealkey0000").unwrap();
         let node = System.which("node").expect("node");
+        let before = ids();
         let done = install(
             &Request {
                 agent,
@@ -1148,20 +1230,73 @@ mod tests {
             },
             &acl,
         );
+        let _cleanup = Cleanup(done.rec.clone());
         assert_eq!(done.problem, None);
         assert_eq!(done.rec.files.len(), 2);
-        let st = status(&done.rec, &System);
-        assert!(st.installed);
-        assert_eq!(st.active, Some(true), "the task is known to the scheduler");
-        let r = restart(&done.rec, &System);
-        assert!(r.is_ok(), "{r:?}");
+        assert!(status(&done.rec, &System).installed);
+        let pid_file = winproc::pid_file_of(&done.rec.files[0]);
+        let first = wait_for_child(&pid_file);
+        let child1 = first.child.clone().unwrap();
+        println!("first run: wrapper {:?} node {:?}", first.wrapper, child1);
+        let during = ids();
+        assert!(during.contains(&first.wrapper.pid) && during.contains(&child1.pid));
+        // the record is true: the start times are the real ones
+        let info = System.process_info(child1.pid).unwrap().unwrap();
+        assert_eq!((info.start, info.image.as_str()), (child1.start, "node"));
+        // the node writes into the wake log
+        std::thread::sleep(Duration::from_secs(2));
+        let log = fs::read_to_string(dirs.wake_log(agent)).unwrap_or_default();
+        println!("wake log: {log}");
+        assert!(log.contains("fleet:"), "node's output reaches the wake log");
+
+        // restart: the recorded processes are gone, a new pair runs
+        let notes = restart(&done.rec, &System).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        std::thread::sleep(Duration::from_millis(500));
+        let after_stop = ids();
+        assert!(
+            !after_stop.contains(&first.wrapper.pid),
+            "old wrapper ended"
+        );
+        assert!(!after_stop.contains(&child1.pid), "old node ended");
+        let second = wait_for_child(&pid_file);
+        assert_ne!(second.wrapper.pid, first.wrapper.pid);
+        assert_ne!(second.child.as_ref().unwrap().pid, child1.pid);
+
+        // uninstall: exactly the recorded processes end, the task and the files are gone
         let r = uninstall(&done.rec, &System);
         assert!(r.problems.is_empty(), "{:?}", r.problems);
+        assert!(r.notes.is_empty(), "{:?}", r.notes);
+        assert_eq!(
+            r.removed
+                .iter()
+                .filter(|x| x.starts_with("process "))
+                .count(),
+            2
+        );
+        std::thread::sleep(Duration::from_millis(500));
         assert_eq!(
             status(&done.rec, &System).active,
             Some(false),
             "the task is gone"
         );
         assert!(done.rec.files.iter().all(|f| !Path::new(f).exists()));
+        assert!(!Path::new(&pid_file).exists());
+        let after = ids();
+        println!("before {before:?}\nafter  {after:?}");
+        // every process this test made is gone; anything else new is somebody else's (other programs start PowerShell and node too)
+        let second_child = second.child.as_ref().unwrap().pid;
+        for pid in [
+            first.wrapper.pid,
+            child1.pid,
+            second.wrapper.pid,
+            second_child,
+        ] {
+            assert!(!after.contains(&pid), "process {pid} is still there");
+        }
+        println!(
+            "new since before (not ours): {:?}",
+            after.difference(&before).collect::<Vec<_>>()
+        );
     }
 }

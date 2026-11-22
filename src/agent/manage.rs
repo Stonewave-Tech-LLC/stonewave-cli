@@ -387,7 +387,12 @@ pub fn rotate(
     let mut all_well = true;
     if let Some(rec) = &st.service {
         match station::restart(rec, ctx.exec) {
-            Ok(()) => ui.ok("Wake service", "restarted with the new key"),
+            Ok(notes) => {
+                for n in &notes {
+                    ui.note(n);
+                }
+                ui.ok("Wake service", "restarted with the new key");
+            }
             Err(e) => {
                 all_well = false;
                 ui.warn(&format!("The wake service could not be restarted: {e}. Restart it by hand; it still has the old key."));
@@ -520,6 +525,9 @@ pub fn disconnect(ctx: &Ctx<'_>, ui: &mut dyn Ui, o: &DisconnectOpts<'_>) -> Res
     }
     if let Some(rec) = &st.service {
         let r = station::uninstall(rec, ctx.exec);
+        for n in &r.notes {
+            ui.note(n);
+        }
         for p in &r.problems {
             problems += 1;
             ui.fail(p);
