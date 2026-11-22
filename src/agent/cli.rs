@@ -31,7 +31,7 @@ Options:
   -h, --help            this help
 
 Files (user only: folders 0700, files 0600, on Windows only your account):
-  ~/.config/wave/<agent>.key      the key (Windows: %APPDATA%\\wave)
+  ~/.config/wave/<agent>.key      the key (Windows: %LOCALAPPDATA%\\wave, never the roaming profile)
   ~/.config/wave/<agent>.json     what this tool made, for `disconnect`; no key inside
   ~/.local/state/wave/<agent>.wake.log   the wake service's log (Windows: %LOCALAPPDATA%\\wave)
 ";

@@ -23,7 +23,7 @@ impl Home {
 
     fn config(&self) -> PathBuf {
         if cfg!(windows) {
-            self.0.join("roaming").join("wave")
+            self.0.join("local").join("wave")
         } else {
             self.0.join(".config").join("wave")
         }

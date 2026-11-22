@@ -33,7 +33,7 @@ This tool will give software agents scoped access to servers, so we take reports
   internet. It keeps the audit log. If a step cannot finish, it says so and exits with an error.
 - `agent connect` signs in with a device code (`purpose: "agent"`), then asks Wave once for the agent's key
   (`POST /v1/agent-connect/mint`, with the sign-in token as Bearer). The key comes back in that answer only. It is written to
-  `<config>/wave/<agent>.key` (folder 0700, file 0600, atomically through a temporary file created exclusively and without
+  `<config>/wave/<agent>.key` (on Windows `%LOCALAPPDATA%\wave`, never the roaming `%APPDATA%`, so nothing secret roams to other machines; folder 0700, file 0600, atomically through a temporary file created exclusively and without
   following links; on Windows only your account has access, set with `icacls`) and nowhere else: it is not printed, not put into a
   command line, an engine's configuration, the state file, a service file or a log, and every text that is shown is filtered for
   anything shaped like a key (`wak_...`). Claude Code and Grok are given the header `Authorization: Bearer ${WAVE_AGENT_KEY}` and Codex

@@ -129,7 +129,7 @@ sudo, and root is refused (a key made by root would belong to nobody).
 team, name, engine), and Wave hands the agent's key **to this machine only**: it never passes the account, a chat or any other
 service. Then, step by step and each one checking first:
 
-1. the key goes into `~/.config/wave/<agent>.key` (Windows `%APPDATA%\wave\`), the folder 0700, the file 0600 (Windows: only
+1. the key goes into `~/.config/wave/<agent>.key` (Windows `%LOCALAPPDATA%\wave\`, never the roaming profile: nothing secret may roam), the folder 0700, the file 0600 (Windows: only
    your account, via `icacls`), written atomically, never through a link,
 2. Wave is added to the agent **without the key in its configuration**: Claude Code and Grok get the header
    `Authorization: Bearer ${WAVE_AGENT_KEY}` (the variable name is written out, not its value), Codex gets
@@ -158,7 +158,7 @@ configuration, and every text shown passes a filter that cuts out anything shape
 already dead), then removes exactly what this tool made.
 
 **Files.** `~/.config/wave/<agent>.key`, `~/.config/wave/<agent>.json` (what was created, for `disconnect`; no key inside),
-`~/.config/wave/fleet-watch.mjs` and `~/.local/state/wave/<agent>.wake.log` (Windows `%LOCALAPPDATA%\wave\`), plus the engine's own
+`~/.config/wave/fleet-watch.mjs` and `~/.local/state/wave/<agent>.wake.log` (on Windows all of them are in `%LOCALAPPDATA%\wave\`), plus the engine's own
 entry and the service files. `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are honoured; `CODEX_HOME` for Codex.
 
 **Wake service (optional, `--yes` accepts, `--no-station` skips).** A small program (`fleet-watch.mjs`, part of this tool, needs

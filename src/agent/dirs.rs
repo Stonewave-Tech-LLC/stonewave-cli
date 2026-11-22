@@ -1,8 +1,9 @@
 //! Where the agent commands keep their files. Resolved from the environment in one place, with the environment passed in,
 //! so tests point everything into a temporary folder without touching the process environment.
 //!
-//! - key and state: `~/.config/wave` (`$XDG_CONFIG_HOME/wave`; Windows `%APPDATA%\wave`)
-//! - wake log: `~/.local/state/wave` (`$XDG_STATE_HOME/wave`; Windows `%LOCALAPPDATA%\wave`)
+//! - key, state, wake script: `~/.config/wave` (`$XDG_CONFIG_HOME/wave`)
+//! - wake log: `~/.local/state/wave` (`$XDG_STATE_HOME/wave`)
+//! - Windows: everything in `%LOCALAPPDATA%\wave`. Never the roaming `%APPDATA%`: nothing secret may roam to other machines.
 
 use std::path::{Path, PathBuf};
 
@@ -63,11 +64,11 @@ impl Dirs {
         .ok_or("cannot find your home folder (HOME is not set)")?;
         let codex_home = absolute(get("CODEX_HOME")).unwrap_or_else(|| home.join(".codex"));
         let (config, state, systemd_user) = if os == Os::Windows {
-            let roaming = absolute(get("APPDATA"))
-                .ok_or("cannot find your application data folder (APPDATA is not set)")?;
-            let local = absolute(get("LOCALAPPDATA")).unwrap_or_else(|| roaming.clone());
+            let local = absolute(get("LOCALAPPDATA")).ok_or(
+                "cannot find your local application data folder (LOCALAPPDATA is not set)",
+            )?;
             (
-                roaming.join("wave"),
+                local.join("wave"),
                 local.join("wave"),
                 home.join(".config").join("systemd").join("user"),
             )
@@ -203,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_uses_appdata() {
+    fn windows_keeps_everything_in_local_appdata_never_in_the_roaming_profile() {
         let d = Dirs::resolve(
             Os::Windows,
             &env(&[
@@ -217,9 +218,20 @@ mod tests {
         // on a Unix test machine these are not absolute paths; the shape is what is checked
         if cfg!(windows) {
             let d = d.unwrap();
-            assert!(d.config.ends_with("Roaming\\wave"));
+            assert!(d.config.ends_with("Local\\wave"), "{:?}", d.config);
             assert!(d.state.ends_with("Local\\wave"));
+            assert!(!d.config.to_string_lossy().contains("Roaming"));
+            assert!(!d.state.to_string_lossy().contains("Roaming"));
             assert_eq!(d.win_user, "PC\\ada");
+            // the roaming folder is not even looked at: without LOCALAPPDATA there is no place for the key
+            let none = Dirs::resolve(
+                Os::Windows,
+                &env(&[
+                    ("USERPROFILE", "C:\\Users\\ada"),
+                    ("APPDATA", "C:\\Users\\ada\\AppData\\Roaming"),
+                ]),
+            );
+            assert!(none.unwrap_err().contains("LOCALAPPDATA"));
         }
     }
 }
