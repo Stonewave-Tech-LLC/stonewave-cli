@@ -10,7 +10,7 @@ This tool will give software agents scoped access to servers, so we take reports
 ## What is in scope
 
 - `install.sh` and how it checks what it installs
-- the `stonewave` binary: `doctor` today; setup, the daemon and the agent shell once they exist
+- the `stonewave` binary: `doctor`, `connect`, `setup`, the daemon, the agent shell and the `agent` commands (key handling, files, service files)
 - the release process (`scripts/release.sh`)
 
 ## Known limits
@@ -31,5 +31,27 @@ This tool will give software agents scoped access to servers, so we take reports
   (the `doctor` checks and a few numbers) once a minute.
 - `revoke` (as root) stops the daemon and the agent SSH, empties the trust list and locks the agent user, also without
   internet. It keeps the audit log. If a step cannot finish, it says so and exits with an error.
+- `agent connect` signs in with a device code (`purpose: "agent"`), then asks Wave once for the agent's key
+  (`POST /v1/agent-connect/mint`, with the sign-in token as Bearer). The key comes back in that answer only. It is written to
+  `<config>/wave/<agent>.key` (on Windows `%LOCALAPPDATA%\wave`, never the roaming `%APPDATA%`, so nothing secret roams to other machines; folder 0700, file 0600, atomically through a temporary file created exclusively and without
+  following links; on Windows only your account has access, set with `icacls`) and nowhere else: it is not printed, not put into a
+  command line, an engine's configuration, the state file, a service file or a log, and every text that is shown is filtered for
+  anything shaped like a key (`wak_...`). Claude Code and Grok are given the header `Authorization: Bearer ${WAVE_AGENT_KEY}` and Codex
+  `bearer_token_env_var = "WAVE_AGENT_KEY"`, so the engine reads the key from its environment; `agent run` sets that variable for one
+  child process. The key is sent to Wave only as a Bearer header, handed to `curl` on stdin. A Wave address that is not https is only
+  accepted for this machine, and the MCP address Wave reports must be on the same host as the API address it was asked on.
+  The agent commands refuse to run as root and never use sudo.
+- `agent status` asks Wave (`GET /v1/agent-connect/status`) with the key; `agent rotate` gets a new key and Wave revokes the old one, while the absolute expiry of the binding stays (a stolen key cannot be renewed for ever; after 90 days a person binds again with `agent connect`);
+  `agent disconnect` revokes the key first (`POST /v1/agent-connect/revoke`) and then removes exactly the entries, files and service
+  recorded in `<config>/wave/<agent>.json`. It changes the Claude Code and Grok configuration only through their own `mcp add` and
+  `mcp remove` commands, and `~/.codex/config.toml` only inside the marked block.
+- The optional wake service runs `node` with the bundled `fleet-watch.mjs` as your user (systemd `--user`, a LaunchAgent, or a
+  scheduled task at logon). It reads the key from the key file, asks Wave's MCP address for what was addressed to the agent, and writes
+  one line per new thing to a private log. On Windows the task runs a small PowerShell wrapper written by this tool; the wrapper keeps node running and records, in a file
+  next to it that holds no secret, its own process id and start time and node's. Stopping the service (`disconnect`, `rotate`, a
+  repeated `connect`) ends exactly those two processes by id, node first, and only after checking that an id still belongs to the same
+  process (same start time and the expected program name, `powershell` or `node`); an id that fails the check is left alone and
+  reported as stale. No process is ever ended by its name or its command line, and on Linux and macOS only `systemctl --user` and
+  `launchctl` are used on this tool's own unit or label.
 - `status` and `doctor` read local files and run report-only commands; `doctor` also opens one TCP connection to
   `account.stonewavetech.com:443` without sending data.
