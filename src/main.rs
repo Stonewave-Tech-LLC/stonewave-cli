@@ -5,6 +5,7 @@
 //! Stonewave account (and changes nothing on the machine yet); `connect --demo`,
 //! `setup` and `revoke` change the server (with sudo; `--dry-run` only looks). `status` and `connect --demo` are demos of the look that talk to nobody. See `README.md`.
 
+mod agent;
 mod b64;
 mod banner;
 mod connect;
@@ -80,6 +81,7 @@ Commands:
   revoke         Revoke all agent access on this server, also without internet (needs sudo)
   status         The line to Wave, the agent SSH and the last health report (--demo: made-up screens)
   banner         Play the banner
+  agent          Connect a coding agent on this machine to Wave: `stonewave agent --help` (connect, status, rotate, disconnect, run)
 
 Options:
   --json         doctor, status: print one JSON object instead of the screen (for agents and scripts)
@@ -237,7 +239,12 @@ fn env_url(name: &str) -> Option<String> {
 }
 
 fn main() -> ExitCode {
-    let args = match parse(std::env::args().skip(1)) {
+    // `stonewave agent ...` has its own words and options
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().map(String::as_str) == Some("agent") {
+        return agent::main(&raw[1..]);
+    }
+    let args = match parse(raw) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("stonewave: {e}\nTry `stonewave --help`.");
