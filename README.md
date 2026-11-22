@@ -8,6 +8,7 @@ rights an admin gave, every action logged with the person it was done for.
 > server with Wave and sets it up (needs sudo; `connect --sign-in-only` only signs in). `setup`, `revoke` and the daemon
 > are real. The Wave side is not switched on for customers yet: the relay is for Stonewave's own servers first.
 > `connect --demo` and `status --demo` only show how the finished CLI will look.
+> `stonewave agent ...` connects a coding agent on this machine to Wave; see [agent](#agent-connect-a-coding-agent-to-wave).
 
 ![connect](media/connect.gif)
 
@@ -110,6 +111,76 @@ HTTP goes through the system `curl` (the install command needs it anyway), so TL
 system's. Secrets are handed to curl on stdin, never as arguments. A plain `http://` address is only accepted for this
 machine (`127.0.0.1`, `localhost`, `::1`), for tests.
 
+## agent: connect a coding agent to Wave
+
+```bash
+stonewave agent connect --engine grok     # claude-code | codex | grok | other
+stonewave agent status [--json]
+stonewave agent rotate
+stonewave agent disconnect [--yes] [--keep-remote]
+stonewave agent run [--agent <name>] -- claude     # start the agent with its key in the environment
+```
+
+This turns a coding agent on **any** machine (your Mac, a Linux server, a Windows PC) into an external agent of a Wave company.
+It is separate from `connect` above, which connects a *server*. Everything lives in your home folder and runs as you: no
+sudo, and root is refused (a key made by root would belong to nobody).
+
+`connect` shows a code and four words, like the server sign-in. You confirm on the account's "connect an agent" page (company,
+team, name, engine), and Wave hands the agent's key **to this machine only**: it never passes the account, a chat or any other
+service. Then, step by step and each one checking first:
+
+1. the key goes into `~/.config/wave/<agent>.key` (Windows `%APPDATA%\wave\`), the folder 0700, the file 0600 (Windows: only
+   your account, via `icacls`), written atomically, never through a link,
+2. Wave is added to the agent **without the key in its configuration**: Claude Code and Grok get the header
+   `Authorization: Bearer ${WAVE_AGENT_KEY}` (the variable name is written out, not its value), Codex gets
+   `bearer_token_env_var = "WAVE_AGENT_KEY"`; `stonewave agent run -- <command>` sets that variable for that one process,
+3. optionally the **wake service** (below).
+
+| Engine | What `connect` does |
+|---|---|
+| `claude-code` | `claude mcp add --transport http --scope user wave <wave>/mcp --header "Authorization: Bearer ${WAVE_AGENT_KEY}"`; an old `wave` entry is removed first (and you are told) |
+| `grok` | `grok mcp add --transport http -H "Authorization: Bearer ${WAVE_AGENT_KEY}" wave <wave>/mcp` |
+| `codex` | a marked block in `~/.codex/config.toml` (`# stonewave: begin wave` ... `# stonewave: end wave`); a `[mcp_servers.wave]` that is not ours is never touched (the step stops with exit code 1); the first change makes `config.toml.stonewave-bak` |
+| `other` | prints the address and the header line |
+
+Without `--engine` it takes the one program it finds on the PATH (`claude`, `codex`, `grok`) and asks when there are several.
+A missing program stops the run before anything is written. What the person confirms on the page wins over `--engine`.
+
+**Addresses.** `--account <url>` / `STONEWAVE_ACCOUNT_URL` for the account; `--wave <url>` / `STONEWAVE_WAVE_URL` for Wave's API,
+else the account tells it. Both need https (http only for this machine). If no Wave address is known, `connect` stops before the key
+is asked for. While Wave is still setting up a new agent, `connect` waits (every 5 seconds, up to 10 minutes) and honours a
+`Retry-After`.
+
+**The key.** It is never printed, not even with an error, never in a command line, a log, a state file or an engine's
+configuration, and every text shown passes a filter that cuts out anything shaped like a key. It expires after 90 days:
+`status` shows the date and warns 14 days before; `rotate` gets a new key with the old one and restarts the wake service.
+`disconnect` revokes the key in Wave **first** (without a connection it refuses, unless `--keep-remote`; a 401 means it was
+already dead), then removes exactly what this tool made.
+
+**Files.** `~/.config/wave/<agent>.key`, `~/.config/wave/<agent>.json` (what was created, for `disconnect`; no key inside),
+`~/.config/wave/fleet-watch.mjs` and `~/.local/state/wave/<agent>.wake.log` (Windows `%LOCALAPPDATA%\wave\`), plus the engine's own
+entry and the service files. `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are honoured; `CODEX_HOME` for Codex.
+
+**Wake service (optional, `--yes` accepts, `--no-station` skips).** A small program (`fleet-watch.mjs`, part of this tool, needs
+Node.js 18 or newer) asks Wave what was addressed to the agent and writes one line per new thing to the wake log (0600, cut to
+the last 1000 lines when the service is installed again). A running session follows that file (`tail -n 0 -F <file>`; PowerShell:
+`Get-Content -Wait -Tail 0 -LiteralPath <file>`) and wakes up on each line. It only wakes sessions that are already running. It runs as you:
+
+| System | How |
+|---|---|
+| Linux | `~/.config/systemd/user/stonewave-wave-<agent>.service` (`systemctl --user enable --now`); to keep it running while you are logged out, run `loginctl enable-linger <user>` yourself, it is only suggested |
+| macOS | `~/Library/LaunchAgents/tech.stonewave.wave.<agent>.plist` (`launchctl bootstrap gui/<uid>`) |
+| Windows | a scheduled task `StonewaveWave-<agent>` at logon, made from a task definition (no admin needed), running a small `.cmd` wrapper without a window |
+
+If Node.js is missing, `connect` still finishes and says the wake service is missing and why.
+
+**What was and was not tested.** The protocol, the files, the rights, the Codex block, the argument lists for `claude`/`grok`/`codex`
+and the text of the three service files are covered by tests, including the real `curl` against a local stand-in for the account
+and Wave. The Windows task, `icacls` and the key rights were also run on a real Windows machine. **launchd and systemd units were
+only checked as text and as the commands that would be run; they have not been started on a Mac or a Linux machine. The Codex block
+follows its documentation but has not been run against Codex, and `claude mcp add` has not been run by this tool on a machine
+with Claude Code.** Grok 1.0.62 was seen to fill the `${WAVE_AGENT_KEY}` header in from its environment (against a local test server, not against Wave itself).
+
 ## setup and revoke
 
 ```bash
@@ -181,6 +252,8 @@ by `scripts/cast2gif.py` with Pillow.
 | `src/term.rs` | terminal abilities, buffered output, raw mode, keys, recording |
 | `src/style.rs`, `src/ui.rs`, `src/banner.rs` | colours, building blocks, banner and wave animation |
 | `src/connect.rs` | the real device code sign-in: account address, curl transport, protocol, wait loop |
+| `src/agent/` | `stonewave agent ...`: Wave API calls, the key and its files, engine entries, Codex block, wake service, commands |
+| `assets/fleet-watch.mjs` | the wake script that the wake service runs (embedded into the binary) |
 | `src/flow.rs` | the screens (real `connect` and the demos) |
 | `install/install.sh.in` | install script template |
 | `scripts/` | release, install test, media renderer |
