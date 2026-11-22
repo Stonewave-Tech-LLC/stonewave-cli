@@ -186,12 +186,90 @@ export async function cycle(o, st) {
   return printed;
 }
 
+/** `<mcp address>` -> `<mcp address>/stream`: the doorbell of Wave (GET, the same key as the tools). */
+export function streamUrlOf(url) {
+  const u = new URL(url);
+  u.pathname = u.pathname.replace(/\/+$/, '') + '/stream'; u.search = ''; u.hash = '';
+  return u.toString();
+}
+
+/** What the loop waits on: a wake from the stream, or the timeout. A wake that came while the loop was busy is not lost. */
+function makeWaker() {
+  let release = null, pending = false;
+  const w = {
+    up: false,
+    wake() { pending = true; release?.(); },
+    async wait(ms) {
+      if (!pending) {
+        let timer;
+        await new Promise((resolve) => { release = resolve; timer = setTimeout(resolve, ms); });
+        clearTimeout(timer); release = null;
+      }
+      pending = false;
+    },
+  };
+  return w;
+}
+
+const WAKE_EVENTS = new Set(['inbox.entry', 'inbox.task', 'inbox.stuck', 'reset']);
+
+/**
+ * Holds one SSE connection to Wave's doorbell (GET <mcp address>/stream). The frames hold ids only, never text, so nothing is read from them: any of them just means
+ * "look at the inbox now", and the normal cycle does that (state file, notice and outside-text markers as always). While the stream is down the loop polls as before.
+ *  - 404 or 405: this Wave has no doorbell: stay on polling, look again every ten minutes;
+ *  - a closed or broken stream, a refused key, a silent line (no byte for 70 s: Wave sends a comment every 25 s): try again with a growing wait (1 s up to 5 minutes);
+ *  - never follows a redirect (the key travels in a header).
+ * Nothing about the stream's state is printed: each line wakes a session.
+ */
+async function runStream(o, w) {
+  const url = streamUrlOf(o.url);
+  const pause = o.streamSleep ?? ((ms) => new Promise((r) => { const t = setTimeout(r, ms); t.unref?.(); }));
+  let backoff = o.streamBackoffMs ?? 1000;
+  while (!o.stopped?.()) {
+    const ac = new AbortController();
+    let idle;
+    const arm = () => { clearTimeout(idle); idle = setTimeout(() => ac.abort(), o.streamIdleMs ?? 70_000); idle.unref?.(); };
+    let long = false;
+    try {
+      const res = await o.fetch(url, { headers: { authorization: `Bearer ${o.key}`, accept: 'text/event-stream' }, redirect: 'error', signal: ac.signal });
+      if (res.status === 404 || res.status === 405) { await res.body?.cancel?.(); await pause(o.streamMissingMs ?? 600_000); continue; }
+      if (res.status !== 200 || !res.body) { await res.body?.cancel?.(); throw new Error('refused'); }
+      w.up = true; w.wake(); arm();                                  // one look at the inbox now: whatever came while the stream was away
+      const started = Date.now();
+      const reader = res.body.getReader(), dec = new TextDecoder();
+      let buf = '', bye = false;
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        arm(); buf += dec.decode(value, { stream: true });
+        if (buf.length > 65_536) buf = buf.slice(-65_536);          // a hostile line without an end must not grow without limit
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const block = buf.slice(0, i); buf = buf.slice(i + 2);
+          const m = /^event: ([a-z0-9_.-]{1,64})$/m.exec(block);
+          if (!m) continue;
+          if (m[1] === 'bye') bye = true; else if (WAKE_EVENTS.has(m[1])) w.wake();
+        }
+        if (bye) break;
+      }
+      long = Date.now() - started > 30_000;
+    } catch { /* the loop below decides */ }
+    finally { clearTimeout(idle); ac.abort(); }
+    if (w.up) { w.up = false; w.wake(); }                           // the loop goes back to polling at once and looks once
+    if (o.stopped?.()) return;
+    if (long) backoff = o.streamBackoffMs ?? 1000;
+    await pause(backoff); backoff = Math.min(backoff * 2, 300_000);
+  }
+}
+
 /** Runs until stopped (or once). Errors are said once per outage, because each line wakes the session. */
 export async function watch(o) {
   o = { rpc: 0, rooms: new Map(), fetch: globalThis.fetch, out: (l) => console.log(l), sleep: (ms) => new Promise((r) => setTimeout(r, ms)), intervalMs: 20_000, ...o };
   const st = loadState(o.statePath);
   if (st.warn) o.out(`${PREFIX} ${st.warn}`);
   let down = null, fails = 0;
+  const w = o.stream && !o.once ? makeWaker() : null;      // the doorbell (opt-in: main turns it on); without it the loop polls as it always did
+  if (w) void runStream(o, w);
   for (;;) {
     let wait = null;
     try {
@@ -207,17 +285,23 @@ export async function watch(o) {
     }
     if (o.once) return 0;
     if (o.stopped?.()) return 0;
-    await o.sleep(Math.max(Math.min(o.intervalMs * 2 ** Math.min(fails, 4), 300_000), wait ?? 0));
+    if (w) {
+      // the stream up: a safety look every few minutes (the doorbell can miss, the inbox cannot); errors and a stream that is down: the polling rhythm as before
+      const poll = Math.min(o.intervalMs * 2 ** Math.min(fails, 4), 300_000);
+      await w.wait(Math.max(w.up && fails === 0 ? (o.safetyMs ?? 300_000) : poll, wait ?? 0));
+      if (!o.stopped?.()) await new Promise((r) => setTimeout(r, o.debounceMs ?? 30));      // several frames at once are one look
+    } else await o.sleep(Math.max(Math.min(o.intervalMs * 2 ** Math.min(fails, 4), 300_000), wait ?? 0));
     if (o.stopped?.()) return 0;
   }
 }
 
 function parseArgs(argv, env) {
-  const a = { once: false, fromStart: false, intervalMs: 20_000, session: env.FLEET_SESSION || 'fleet-watch', statePath: env.FLEET_STATE || null };
+  const a = { once: false, fromStart: false, intervalMs: 20_000, session: env.FLEET_SESSION || 'fleet-watch', statePath: env.FLEET_STATE || null, stream: !['off', 'no', '0'].includes((env.FLEET_STREAM ?? '').toLowerCase()) };
   for (let i = 0; i < argv.length; i++) {
     const x = argv[i];
     if (x === '--once') a.once = true;
     else if (x === '--from-start') a.fromStart = true;
+    else if (x === '--no-stream') a.stream = false;
     else if (x === '--interval') { const n = Number(argv[++i]); if (!(n >= 1 && n <= 3600)) throw new Error('--interval is seconds between 1 and 3600'); a.intervalMs = n * 1000; }
     else if (x === '--session') a.session = argv[++i] ?? '';
     else if (x === '--state') a.statePath = argv[++i] ?? '';
@@ -230,7 +314,8 @@ function parseArgs(argv, env) {
 const HELP = `fleet-watch: prints one line ("fleet: ...") for each new thing addressed to your agent in Wave.
   WAVE_MCP_URL=https://<wave-api host>/mcp  WAVE_AGENT_KEY=wak_...  node fleet-watch.mjs [options]
   --once             ask once and exit (0 = ok, 1 = could not read, 2 = setup error)
-  --interval <s>     seconds between asks (default 20)
+  --interval <s>     seconds between asks while the live line is down (default 20)
+  --no-stream        do not hold the live line to Wave (also FLEET_STREAM=off); ask every --interval seconds as before
   --session <name>   name of your session in Wave's log (default fleet-watch; or FLEET_SESSION)
   --state <file>     where it remembers what it told (default ~/.fleet-watch/<id>.json; or FLEET_STATE)
   --from-start       on the first start also print the older items (default: skip them)
@@ -263,7 +348,7 @@ async function main() {
   if (s.error) return setupError(s.error);
   let stop = false;
   for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { stop = true; process.exit(0); });
-  return watch({ url: s.url, key: s.key, session: a.session, once: a.once, fromStart: a.fromStart, intervalMs: a.intervalMs, statePath: a.statePath || defaultStatePath(s.url, s.key), stopped: () => stop });
+  return watch({ url: s.url, key: s.key, session: a.session, once: a.once, stream: a.stream, fromStart: a.fromStart, intervalMs: a.intervalMs, statePath: a.statePath || defaultStatePath(s.url, s.key), stopped: () => stop });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main().then((c) => { process.exitCode = c; });
