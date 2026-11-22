@@ -684,6 +684,80 @@ mod tests {
         assert!(SCRIPT.starts_with("#!/usr/bin/env node"));
     }
 
+    /// The key is a Bearer header: a redirect must never carry it to another address. Node's fetch is told `redirect: 'error'`;
+    /// here a stand-in for Wave answers 302 to a second address, and that second address must never be contacted.
+    #[test]
+    fn the_script_never_follows_a_redirect_with_the_key() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+        assert!(SCRIPT.contains("redirect: 'error'"));
+        let Some(node) = super::super::exec::System.which("node") else {
+            eprintln!("node not installed: skipped");
+            return;
+        };
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        first.set_nonblocking(true).unwrap();
+        let (first_port, target_port) = (
+            first.local_addr().unwrap().port(),
+            target.local_addr().unwrap().port(),
+        );
+        let server = std::thread::spawn(move || {
+            let end = std::time::Instant::now() + Duration::from_secs(20);
+            let mut asked = 0;
+            while std::time::Instant::now() < end {
+                match first.accept() {
+                    Ok((mut s, _)) => {
+                        s.set_nonblocking(false).unwrap();
+                        let mut buf = [0u8; 4096];
+                        let _ = s.read(&mut buf);
+                        let _ = write!(
+                            s,
+                            "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{target_port}/leak\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        );
+                        asked += 1;
+                        if asked == 2 {
+                            break;
+                        }
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+            asked
+        });
+        let t = TempDir::new("redirect");
+        let script = t.path().join("fleet-watch.mjs");
+        fs::write(&script, SCRIPT).unwrap();
+        let out = std::process::Command::new(node)
+            .arg(&script)
+            .args(["--once", "--state"])
+            .arg(t.path().join("state.json"))
+            .env("WAVE_MCP_URL", format!("http://127.0.0.1:{first_port}/mcp"))
+            .env("WAVE_AGENT_KEY", "wak_redirecttestkey0000")
+            .output()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let said = String::from_utf8_lossy(&out.stdout).into_owned();
+        // the redirect was refused like any other error: one line, no key in it
+        assert!(
+            said.contains("fleet: cannot read the inbox: Wave answered with a redirect"),
+            "{said} / {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!said.contains("redirecttestkey"));
+        assert_eq!(out.status.code(), Some(1));
+        // and the address it pointed to was never contacted
+        assert!(
+            target.accept().is_err(),
+            "the redirect target was contacted with the key"
+        );
+        // let the stand-in stop waiting
+        let _ = std::net::TcpStream::connect(("127.0.0.1", first_port));
+        let _ = server.join();
+    }
+
     #[test]
     fn the_script_passes_node_check() {
         let Some(node) = super::super::exec::System.which("node") else {

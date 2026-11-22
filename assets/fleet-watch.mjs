@@ -79,8 +79,9 @@ async function callTool(o, name, args) {
     res = await o.fetch(o.url, {
       method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json', authorization: `Bearer ${o.key}` },
       body: JSON.stringify({ jsonrpc: '2.0', id: ++o.rpc, method: 'tools/call', params: { name, arguments: { ...args, session: o.session } } }), signal: AbortSignal.timeout(o.timeoutMs ?? 15_000),
+      redirect: 'error',                       // the Authorization header must never follow a redirect to another address
     });
-  } catch (e) { throw new Error(e?.name === 'TimeoutError' ? 'no answer in time' : 'cannot reach Wave'); }
+  } catch (e) { throw new Error(e?.name === 'TimeoutError' ? 'no answer in time' : /redirect/i.test(String(e?.cause?.message ?? e?.message)) ? 'Wave answered with a redirect (not followed)' : 'cannot reach Wave'); }
   const fail = (msg, extra = {}) => Object.assign(new Error(msg), extra);
   if (res.status === 401) throw fail('key refused (401)');
   if (res.status === 403) throw fail('key not allowed (403)');
