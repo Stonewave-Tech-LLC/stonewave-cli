@@ -165,7 +165,7 @@ entry and the service files. `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are honoured
 **Wake service (optional, `--yes` accepts, `--no-station` skips).** A small program (`fleet-watch.mjs`, part of this tool, needs
 Node.js 18 or newer) asks Wave what was addressed to the agent and writes one line per new thing to the wake log (0600, cut to
 the last 1000 lines when the service is installed again). A running session follows that file (`tail -n 0 -F <file>`; PowerShell:
-`Get-Content -Wait -Tail 0 -LiteralPath <file>`) and wakes up on each line. It only wakes sessions that are already running. It runs as you:
+`Get-Content -Wait -Tail 0 -LiteralPath <file>`) and wakes up on each line. It only wakes sessions that are already running. It holds one **live line** to Wave's doorbell (`GET <wave>/mcp/stream`, ids only, never text): when Wave rings it reads the inbox at once, so a line comes in about a second. While the line is down, or on a Wave without a doorbell, it asks every 20 seconds as before (`--no-stream` in the script, or `FLEET_STREAM=off`, never opens the line). It runs as you:
 
 | System | How |
 |---|---|

@@ -758,6 +758,174 @@ mod tests {
         let _ = server.join();
     }
 
+    /// The live line: the script holds one connection to Wave's doorbell, and a frame makes it read the inbox at once, although its polling interval is a minute.
+    /// A stand-in for Wave answers the doorbell (`GET /mcp/stream`) with one frame after 0.8 s, and the inbox call with an item only after that.
+    #[test]
+    fn the_script_wakes_on_the_doorbell_and_not_by_polling() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let Some(node) = super::super::exec::System.which("node") else {
+            eprintln!("node not installed: skipped");
+            return;
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (rung, stop, doorbells) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let (rung_s, stop_s, bells_s) = (rung.clone(), stop.clone(), doorbells.clone());
+        let server = std::thread::spawn(move || {
+            let mut workers = Vec::new();
+            while !stop_s.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((s, _)) => {
+                        s.set_nonblocking(false).unwrap();
+                        let (rung, stop, bells) = (rung_s.clone(), stop_s.clone(), bells_s.clone());
+                        workers.push(std::thread::spawn(move || {
+                            serve_doorbell_stand_in(s, &rung, &stop, &bells)
+                        }));
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            for w in workers {
+                let _ = w.join();
+            }
+        });
+        fn serve_doorbell_stand_in(
+            s: TcpStream,
+            rung: &AtomicBool,
+            stop: &AtomicBool,
+            bells: &AtomicUsize,
+        ) {
+            let mut rd = BufReader::new(s.try_clone().unwrap());
+            let mut first = String::new();
+            if rd.read_line(&mut first).is_err() {
+                return;
+            }
+            let mut len = 0usize;
+            loop {
+                let mut h = String::new();
+                if rd.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                    break;
+                }
+                if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; len];
+            let _ = rd.read_exact(&mut body);
+            let mut s = s;
+            if first.starts_with("GET /mcp/stream") {
+                bells.fetch_add(1, Ordering::SeqCst);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n: open\n\n"
+                );
+                std::thread::sleep(Duration::from_millis(800));
+                rung.store(true, Ordering::SeqCst);
+                let _ = write!(
+                    s,
+                    "event: inbox.entry\ndata: {{\"type\":\"inbox.entry\"}}\n\n"
+                );
+                while !stop.load(Ordering::SeqCst) {
+                    if write!(s, ": keep-alive\n\n").is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                return;
+            }
+            let said = String::from_utf8_lossy(&body);
+            let data = if said.contains("\"name\":\"inbox\"") {
+                let items = if rung.load(Ordering::SeqCst) {
+                    r#"[{"id":"entry-7","room_id":"room-1","kind":"message","version":1,"seq":7,"status":"posted","title":null,"body":"@Agent ring ring","untrusted":false,"author_kind":"member","author_id":"m","author_name":"Neo","author_engine":null,"data":{}}]"#
+                } else {
+                    "[]"
+                };
+                let next = if rung.load(Ordering::SeqCst) { 7 } else { 0 };
+                format!(
+                    r#"{{"notice":"n","items":{items},"tasks":[],"stuck":[],"next_seq":{next}}}"#
+                )
+            } else {
+                r#"{"items":[{"id":"room-1","name":"fleet"}]}"#.to_owned()
+            };
+            let result = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"result":{{"isError":false,"content":[{{"type":"text","text":{}}}]}}}}"#,
+                serde_json::to_string(&data).unwrap()
+            );
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{result}",
+                result.len()
+            );
+        }
+        let t = TempDir::new("doorbell");
+        let script = t.path().join("fleet-watch.mjs");
+        fs::write(&script, SCRIPT).unwrap();
+        let mut child = std::process::Command::new(node)
+            .arg(&script)
+            .args(["--interval", "60", "--state"])
+            .arg(t.path().join("state.json"))
+            .env("WAVE_MCP_URL", format!("http://127.0.0.1:{port}/mcp"))
+            .env("WAVE_AGENT_KEY", "wak_doorbelltestkey0000")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let out = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            for l in BufReader::new(out).lines().map_while(Result::ok) {
+                let _ = tx.send(l);
+            }
+        });
+        let started = Instant::now();
+        let mut lines = Vec::new();
+        while started.elapsed() < Duration::from_secs(8) {
+            if let Ok(l) = rx.recv_timeout(Duration::from_millis(100)) {
+                let done = l.contains("entry-7");
+                lines.push(l);
+                if done {
+                    break;
+                }
+            }
+        }
+        let took = started.elapsed();
+        let _ = child.kill();
+        let _ = child.wait();
+        stop.store(true, Ordering::SeqCst);
+        let _ = server.join();
+        let said = lines.join("\n");
+        assert!(said.contains("entry-7"), "no line for the ring: {said}");
+        assert!(
+            took < Duration::from_secs(6),
+            "took {took:?} with a polling interval of a minute"
+        );
+        assert!(
+            doorbells.load(Ordering::SeqCst) >= 1,
+            "the script never opened the live line"
+        );
+        assert!(!said.contains("doorbelltestkey"), "the key was printed");
+        assert!(
+            lines.iter().all(|l| l.starts_with("fleet:")),
+            "every line starts with fleet: {said}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.to_lowercase().contains("stream")
+                    || l.to_lowercase().contains("doorbell")),
+            "nothing is said about the line itself: {said}"
+        );
+    }
+
     #[test]
     fn the_script_passes_node_check() {
         let Some(node) = super::super::exec::System.which("node") else {
