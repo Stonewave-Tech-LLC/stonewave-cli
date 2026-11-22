@@ -12,7 +12,7 @@ Commands:
   connect      Sign in with a code, get the agent's key from Wave, keep it in a private file, add Wave to the
                agent (without the key in its configuration) and, if you want, set up the wake service
   status       What is set up here and what Wave says (--json: one JSON object, no secrets)
-  rotate       Get a new key (the old one stops working) and write it to the key file
+  rotate       Replace the key with a new one (the old one stops working); the expiry date stays the same
   disconnect   Revoke the key in Wave, then remove the key file, the `wave` entry and the wake service this tool made
   run          Start a command with the key in its environment: stonewave agent run [--agent <name>] -- claude
 

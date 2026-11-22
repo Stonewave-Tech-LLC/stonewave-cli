@@ -152,8 +152,9 @@ is asked for. While Wave is still setting up a new agent, `connect` waits (every
 `Retry-After`.
 
 **The key.** It is never printed, not even with an error, never in a command line, a log, a state file or an engine's
-configuration, and every text shown passes a filter that cuts out anything shaped like a key. It expires after 90 days:
-`status` shows the date and warns 14 days before; `rotate` gets a new key with the old one and restarts the wake service.
+configuration, and every text shown passes a filter that cuts out anything shaped like a key. The binding expires after 90 days, and nothing
+extends it: `status` shows the date and warns 14 days before, and then you run `stonewave agent connect` again. `rotate` replaces a key
+you fear is exposed (a new key with the old one, **the same expiry**; the old one stops working) and restarts the wake service.
 `disconnect` revokes the key in Wave **first** (without a connection it refuses, unless `--keep-remote`; a 401 means it was
 already dead), then removes exactly what this tool made.
 

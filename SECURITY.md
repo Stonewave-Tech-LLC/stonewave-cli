@@ -41,7 +41,7 @@ This tool will give software agents scoped access to servers, so we take reports
   child process. The key is sent to Wave only as a Bearer header, handed to `curl` on stdin. A Wave address that is not https is only
   accepted for this machine, and the MCP address Wave reports must be on the same host as the API address it was asked on.
   The agent commands refuse to run as root and never use sudo.
-- `agent status` asks Wave (`GET /v1/agent-connect/status`) with the key; `agent rotate` gets a new key and Wave revokes the old one;
+- `agent status` asks Wave (`GET /v1/agent-connect/status`) with the key; `agent rotate` gets a new key and Wave revokes the old one, while the absolute expiry of the binding stays (a stolen key cannot be renewed for ever; after 90 days a person binds again with `agent connect`);
   `agent disconnect` revokes the key first (`POST /v1/agent-connect/revoke`) and then removes exactly the entries, files and service
   recorded in `<config>/wave/<agent>.json`. It changes the Claude Code and Grok configuration only through their own `mcp add` and
   `mcp remove` commands, and `~/.codex/config.toml` only inside the marked block.

@@ -529,7 +529,9 @@ pub fn connect(ctx: &Ctx<'_>, ui: &mut dyn Ui, o: &ConnectOpts) -> Result<Outcom
     ));
     ui.kv(
         "Key",
-        &format!("expires {expires}; `stonewave agent rotate` renews it"),
+        &format!(
+            "expires {expires}; then `stonewave agent connect` again (`rotate` replaces a key, it does not extend it)"
+        ),
     );
     match engine.program() {
         Some(p) => ui.kv("Start", &format!("stonewave agent run -- {p}")),

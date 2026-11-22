@@ -17,6 +17,7 @@ use super::key::testdir::TempDir;
 use super::manage::{self, DisconnectOpts};
 use super::state::State;
 use super::testkit::TestUi;
+use super::ui::Kind;
 use super::{Ctx, Timing};
 use crate::connect::{Account, Curl, Http};
 use crate::flow::Outcome;
@@ -166,7 +167,7 @@ impl Stub {
                                     &mut s,
                                     200,
                                     "",
-                                    &json!({"key": KEY2, "expires_at": "2099-05-01T00:00:00Z"})
+                                    &json!({"key": KEY2, "expires_at": "2099-02-20T10:00:00Z"})
                                         .to_string(),
                                 );
                             }
@@ -324,6 +325,15 @@ fn connect_status_rotate_disconnect_with_the_real_curl_against_a_stub() {
     let out = manage::rotate(&ctx, &mut ui, None, None).unwrap();
     assert!(matches!(out, Outcome::Done), "{}", ui.text());
     assert_eq!(std::fs::read_to_string(&key_file).unwrap(), KEY2);
+    // the expiry is the one of the binding, and rotate says so
+    assert!(ui.has(Kind::Ok, "same expiry 2099-02-20"), "{}", ui.text());
+    assert!(ui.has(Kind::Note, "does not extend"));
+    assert_eq!(
+        State::load(&dirs.state_file("agent-demo"))
+            .unwrap()
+            .key_expires_at,
+        "2099-02-20T10:00:00Z"
+    );
     let rot = stub
         .log()
         .into_iter()

@@ -195,7 +195,7 @@ pub fn report(ctx: &Ctx<'_>, st: &State, wave_override: Option<&str>) -> Report 
         Some(d) => {
             if d <= WARN_DAYS {
                 warnings.push(format!(
-                    "the key runs out in {d} days; `stonewave agent rotate` renews it"
+                    "the key runs out in {d} days; run `stonewave agent connect` again before then (`rotate` does not extend it)"
                 ));
             }
             format!("{} · in {d} days", timefmt::date_of(&expires))
@@ -380,6 +380,7 @@ pub fn rotate(
             return Ok(Outcome::Failed);
         }
     }
+    let same_expiry = st.key_expires_at == expires;
     st.key_expires_at = expires.clone();
     if let Err(e) = st.save(&ctx.dirs.state_file(&name)) {
         ui.warn(&format!("Could not update the state file: {e}"));
@@ -387,10 +388,14 @@ pub fn rotate(
     ui.ok(
         "Key rotated",
         &format!(
-            "new key in {} · ends {}",
-            key_path.display(),
-            timefmt::date_of(&expires)
+            "new key, {} expiry {} · in {}",
+            if same_expiry { "same" } else { "new" },
+            timefmt::date_of(&expires),
+            key_path.display()
         ),
+    );
+    ui.note(
+        "Rotating replaces a key you fear is exposed; it does not extend the binding. After the expiry date run `stonewave agent connect` again.",
     );
     let mut all_well = true;
     if let Some(rec) = &st.service {

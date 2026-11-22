@@ -871,7 +871,7 @@ fn status_without_network_still_reports_the_local_part_and_warns_before_expiry()
 
 #[test]
 fn rotate_replaces_the_key_file_restarts_the_service_and_keeps_state_current() {
-    let rotated = json!({"key": KEY2, "expires_at": "2099-05-01T00:00:00Z"}).to_string();
+    let rotated = json!({"key": KEY2, "expires_at": "2099-02-20T10:00:00Z"}).to_string();
     let rig = Rig::new(Os::Linux, vec![], vec![reply(200, &rotated)]);
     connected(&rig, true);
     let exec = Fake::new(&[]);
@@ -890,8 +890,9 @@ fn rotate_replaces_the_key_file_restarts_the_service_and_keeps_state_current() {
         State::load(&rig.dirs.state_file("agent-demo"))
             .unwrap()
             .key_expires_at,
-        "2099-05-01T00:00:00Z"
+        "2099-02-20T10:00:00Z"
     );
+    assert!(ui.has(Kind::Ok, "same expiry 2099-02-20"), "{}", ui.text());
     assert!(
         no_icacls(&exec)
             .contains(&"systemctl --user restart stonewave-wave-agent-demo.service".to_owned()),
