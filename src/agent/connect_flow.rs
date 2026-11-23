@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use super::Ctx;
+use super::dirs::Os;
 use super::engine::{self, Engine, Registered};
 use super::key::{Acl, check_writable, ensure_private_dir, write_private_file};
 use super::state::{EntryRec, State};
@@ -28,6 +29,47 @@ pub struct ConnectOpts {
     pub account: Account,
     /// `--wave` or `STONEWAVE_WAVE_URL`, not yet parsed.
     pub wave: Option<String>,
+    /// `--no-browser`: only show the link and the code.
+    pub no_browser: bool,
+    /// The sign-in and waiting lines in German.
+    pub german: bool,
+    /// Reads an environment variable (tests replace it).
+    pub env: fn(&str) -> Option<String>,
+}
+
+pub fn real_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// `en`, or `de` when the screens are German.
+fn t(german: bool, en: &str, de: &str) -> String {
+    if german { de } else { en }.to_owned()
+}
+
+fn mmss(d: Duration) -> String {
+    format!("{}:{:02}", d.as_secs() / 60, d.as_secs() % 60)
+}
+
+/// Opens the link in the person's browser, if there is one to open: not on a server over ssh with no display. The link is made from the
+/// account's own address here, never run through a shell.
+fn open_browser(ctx: &Ctx<'_>, o: &ConnectOpts, url: &str) -> bool {
+    if o.no_browser || !url.starts_with("https://") && !url.starts_with("http://127.0.0.1") {
+        return false;
+    }
+    let (program, args): (&str, Vec<String>) = match ctx.dirs.os {
+        Os::Mac => ("open", vec![url.to_owned()]),
+        Os::Windows => (
+            "rundll32",
+            vec!["url.dll,FileProtocolHandler".to_owned(), url.to_owned()],
+        ),
+        Os::Linux => {
+            if (o.env)("DISPLAY").is_none() && (o.env)("WAYLAND_DISPLAY").is_none() {
+                return false;
+            }
+            ("xdg-open", vec![url.to_owned()])
+        }
+    };
+    ctx.exec.start_detached(program, &args).is_ok()
 }
 
 fn stop(ui: &mut dyn Ui, what: &str, detail: &str, unchanged: &str) -> Result<Outcome> {
@@ -137,11 +179,39 @@ pub fn connect(ctx: &Ctx<'_>, ui: &mut dyn Ui, o: &ConnectOpts) -> Result<Outcom
             }
         };
     let mark = ui.mark();
-    ui.heading("Sign in to connect this agent");
-    ui.kv("Open", &o.account.link_text());
+    let de = o.german;
+    let (link, prefilled) = started.link(&o.account);
+    ui.heading(&t(
+        de,
+        "Sign in to connect this agent",
+        "Im Browser anmelden, um den Agenten zu verbinden",
+    ));
+    ui.kv(&t(de, "Open", "Seite"), link.trim_start_matches("https://"));
     ui.kv("Code", &started.user_code);
-    ui.kv("Words", &started.words.join(" · "));
-    ui.note("The page shows the same four words. Confirm only if they match and you started this yourself.");
+    ui.kv(&t(de, "Words", "Wörter"), &started.words.join(" · "));
+    let opened = open_browser(ctx, o, &link);
+    ui.note(&match (opened, prefilled) {
+        (true, true) => t(
+            de,
+            "Your browser is open, the code is already filled in.",
+            "Dein Browser ist offen, der Code ist schon eingetragen.",
+        ),
+        (true, false) => t(
+            de,
+            "Your browser is open. Type the code on the page.",
+            "Dein Browser ist offen. Gib dort den Code ein.",
+        ),
+        (false, _) => t(
+            de,
+            "Open the link on any device with a browser and type the code.",
+            "Öffne den Link auf einem beliebigen Gerät mit Browser und gib den Code ein.",
+        ),
+    });
+    ui.note(&t(
+        de,
+        "The page shows the same four words. Confirm only if they match and you started this yourself.",
+        "Die Seite zeigt dieselben vier Wörter. Bestätige nur, wenn sie gleich sind und du das selbst gestartet hast.",
+    ));
     ui.blank();
     ui.flush()?;
     let waited = {
@@ -304,16 +374,48 @@ pub fn connect(ctx: &Ctx<'_>, ui: &mut dyn Ui, o: &ConnectOpts) -> Result<Outcom
         engine: engine.name(),
     };
     let mut slept = Duration::ZERO;
+    let mut not_ready_for = Duration::ZERO;
+    let mut told_admin = false;
+    let mut last_not_ready;
     let mut net_failures = 0;
     let minted = loop {
         let e = match wave::mint(&*wave_http, &wave_addr, &approved.token, &req) {
             Ok(m) => break m,
             Err(e) => e,
         };
+        last_not_ready = false;
         let (pause, msg) = match &e {
             WaveError::Api { code, .. } if code == "agent_not_ready" => {
                 net_failures = 0;
-                (ctx.timing.mint_retry, "Wave is setting up the agent ...")
+                last_not_ready = true;
+                not_ready_for += ctx.timing.mint_retry;
+                if not_ready_for >= ctx.timing.not_ready_notice {
+                    if !told_admin {
+                        told_admin = true;
+                        ui.note(&t(
+                            de,
+                            "This takes longer than usual: Wave is waiting for an admin to apply the plan. You can wait here, or press Ctrl-C and sign in again later (your confirmation stays valid).",
+                            "Das dauert länger als üblich: Wave wartet auf einen Admin, der den Plan anwendet. Du kannst hier warten oder Strg-C drücken und dich später noch einmal anmelden (deine Bestätigung bleibt gültig).",
+                        ));
+                    }
+                    (
+                        ctx.timing.mint_retry,
+                        t(
+                            de,
+                            "Wave is waiting for an admin to apply the plan",
+                            "Wave wartet auf einen Admin, der den Plan anwendet",
+                        ),
+                    )
+                } else {
+                    (
+                        ctx.timing.mint_retry,
+                        t(
+                            de,
+                            "Wave is setting up the agent",
+                            "Wave richtet den Agenten ein",
+                        ),
+                    )
+                }
             }
             WaveError::Api {
                 status: 429,
@@ -323,14 +425,22 @@ pub fn connect(ctx: &Ctx<'_>, ui: &mut dyn Ui, o: &ConnectOpts) -> Result<Outcom
                 net_failures = 0;
                 (
                     Duration::from_secs(retry_after.unwrap_or(30).clamp(1, 120)),
-                    "Wave asks to wait a moment ...",
+                    t(
+                        de,
+                        "Wave asks to wait a moment",
+                        "Wave bittet um einen Moment Geduld",
+                    ),
                 )
             }
             WaveError::Network(_) if net_failures + 1 < MAX_FAILURES => {
                 net_failures += 1;
                 (
                     ctx.timing.mint_retry,
-                    "No answer from Wave, trying again ...",
+                    t(
+                        de,
+                        "No answer from Wave, trying again",
+                        "Keine Antwort von Wave, ich versuche es noch einmal",
+                    ),
                 )
             }
             _ => {
@@ -343,6 +453,26 @@ pub fn connect(ctx: &Ctx<'_>, ui: &mut dyn Ui, o: &ConnectOpts) -> Result<Outcom
             }
         };
         if slept + pause > ctx.timing.mint_max_wait {
+            if last_not_ready && told_admin {
+                return stop(
+                    ui,
+                    &t(
+                        de,
+                        "Wave did not finish setting up the agent",
+                        "Wave hat den Agenten nicht fertig eingerichtet",
+                    ),
+                    &t(
+                        de,
+                        "Wave is waiting for an admin to apply the plan. Tell an admin of the company.",
+                        "Wave wartet auf einen Admin, der den Plan anwendet. Sag einem Admin der Firma Bescheid.",
+                    ),
+                    &t(
+                        de,
+                        "Your confirmation stays valid on the account side. When the plan is applied, run `stonewave agent connect` again (a new code, the same choice). Nothing was changed on this machine.",
+                        "Deine Bestätigung bleibt gültig. Wenn der Plan angewendet ist, starte `stonewave agent connect` noch einmal (neuer Code, dieselbe Wahl). Auf diesem Computer wurde nichts geändert.",
+                    ),
+                );
+            }
             return stop(
                 ui,
                 "Wave did not finish within the time we wait",
@@ -350,7 +480,15 @@ pub fn connect(ctx: &Ctx<'_>, ui: &mut dyn Ui, o: &ConnectOpts) -> Result<Outcom
                 "Your confirmation stays valid on the account side. Run `stonewave agent connect` again (a new code, the same choice) to continue. Nothing was changed on this machine.",
             );
         }
-        ui.pause(pause, msg)?;
+        ui.pause(
+            pause,
+            &format!(
+                "{msg} · {} {} {}",
+                mmss(slept),
+                t(de, "of at most", "von höchstens"),
+                mmss(ctx.timing.mint_max_wait)
+            ),
+        )?;
         slept += pause;
     };
 
