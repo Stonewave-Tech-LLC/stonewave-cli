@@ -51,6 +51,8 @@ pub struct Timing {
     pub mint_retry: Duration,
     /// In total (the sign-in token itself is good for 15 minutes).
     pub mint_max_wait: Duration,
+    /// After this long of "not ready" the screen says plainly that Wave waits for an admin to apply the plan.
+    pub not_ready_notice: Duration,
 }
 
 impl Default for Timing {
@@ -58,6 +60,7 @@ impl Default for Timing {
         Timing {
             mint_retry: Duration::from_secs(5),
             mint_max_wait: Duration::from_secs(10 * 60),
+            not_ready_notice: Duration::from_secs(90),
         }
     }
 }
@@ -169,6 +172,14 @@ pub fn main(raw: &[String]) -> ExitCode {
         _ => None,
     };
 
+    // the sign-in screens speak German when asked to (the menu does), or when the locale is German
+    let german = args.lang.unwrap_or_else(|| {
+        ["LC_ALL", "LC_MESSAGES", "LANG"]
+            .iter()
+            .find_map(|v| env_url(v))
+            .is_some_and(|l| l.to_ascii_lowercase().starts_with("de"))
+    });
+    crate::ui::set_german(german);
     let mut term = match term::Term::open(&term::Options {
         no_anim: args.no_anim,
         ..term::Options::default()
@@ -193,6 +204,9 @@ pub fn main(raw: &[String]) -> ExitCode {
                     yes: args.yes,
                     account: account.expect("connect has an account address"),
                     wave,
+                    no_browser: args.no_browser,
+                    german,
+                    env: connect_flow::real_env,
                 },
             ),
             cli::Sub::Status => {

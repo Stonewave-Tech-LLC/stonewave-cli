@@ -97,8 +97,20 @@ fn handle(mut stream: TcpStream, seen: Seen) {
 
 fn fake_claude(dir: &Path) {
     let p = dir.join("claude");
-    std::fs::write(&p, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '2.1.321 (Claude Code)'; exit 0; fi\nexit 1\n").unwrap();
+    // answers --version, takes `mcp add` and `mcp remove` (what connecting a Claude Code does), refuses everything else
+    std::fs::write(&p, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '2.1.321 (Claude Code)'; exit 0; fi\nif [ \"$1\" = \"mcp\" ]; then exit 0; fi\nexit 1\n").unwrap();
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // a stand-in for the system's opener: writes the link it was given into a file next to it
+    let o = dir.join("xdg-open");
+    std::fs::write(
+        &o,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$1\" > '{}/opened.txt'\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&o, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 // ------------------------------------------------------------------ a terminal
@@ -245,11 +257,8 @@ fn menu(home: &Dir, bin: &Dir, wave: Option<&str>) -> Command {
     c.env_clear()
         .env(
             "PATH",
-            format!(
-                "{}:{}",
-                bin.0.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
+            // only the system's own folders after ours: no coding agent of whoever runs the tests is found by accident
+            format!("{}:/usr/local/bin:/usr/bin:/bin", bin.0.display()),
         )
         .env("HOME", &home.0)
         .env("TERM", "xterm-256color")
@@ -354,6 +363,8 @@ fn the_whole_wizard_for_an_agent_whose_key_lives_in_the_environment() {
     t.send(ENTER);
     t.expect("Wie kommt der Agent zu Wave?");
     t.send(DOWN);
+    t.send(ENTER); // Mehr …
+    t.expect("Auf einem Server mit Secret-Store");
     t.send(ENTER);
     t.expect("Welches Programm soll der Agent sein?");
     t.expect("gefunden (2.1.321");
@@ -491,6 +502,8 @@ fn the_wave_address_is_offered_when_nothing_is_known_and_the_first_agent_can_go_
     t.send(ENTER);
     t.expect("Wie kommt der Agent zu Wave?");
     t.send(DOWN);
+    t.send(ENTER); // Mehr …
+    t.expect("Auf einem Server mit Secret-Store");
     t.send(ENTER);
     t.expect("Welches Programm soll der Agent sein?");
     t.send(ENTER);
@@ -500,4 +513,149 @@ fn the_wave_address_is_offered_when_nothing_is_known_and_the_first_agent_can_go_
     t.expect("https://wave-dev.preview.stonewavetech.com");
     t.send(CTRL_C);
     assert_eq!(t.finish(), Some(0));
+}
+
+// ------------------------------------------------------------------ the simple way, with a small account and a small Wave on one address
+
+type Bodies = Arc<Mutex<Vec<(String, String)>>>;
+
+fn serve_account() -> (String, Bodies) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let bodies: Bodies = Arc::new(Mutex::new(Vec::new()));
+    let (u2, b2) = (url.clone(), bodies.clone());
+    let polls = Arc::new(Mutex::new(0u32));
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let (u, b, p) = (u2.clone(), b2.clone(), polls.clone());
+            thread::spawn(move || handle_account(stream, &u, b, p));
+        }
+    });
+    (url, bodies)
+}
+
+fn handle_account(mut stream: TcpStream, url: &str, bodies: Bodies, polls: Arc<Mutex<u32>>) {
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let (mut len, mut line, mut first) = (0usize, String::new(), String::new());
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+            break;
+        }
+        if first.is_empty() {
+            first = line.clone();
+        }
+        if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
+            len = v.trim().parse().unwrap_or(0);
+        }
+    }
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body).ok();
+    let body = String::from_utf8_lossy(&body).into_owned();
+    let path = first.split_whitespace().nth(1).unwrap_or("").to_owned();
+    bodies.lock().unwrap().push((path.clone(), body.clone()));
+    let (status, out) = match path.as_str() {
+        "/v1/device/code" => (
+            200,
+            format!(
+                r#"{{"device_code":"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG","user_code":"WAVE-7K4Q-X2MP","verification_uri":"{url}/link","expires_in":600,"interval":1,"words":["amber","river","cedar","fox"]}}"#
+            ),
+        ),
+        "/v1/device/token" => {
+            let mut n = polls.lock().unwrap();
+            *n += 1;
+            if *n < 2 {
+                (400, r#"{"error":"authorization_pending"}"#.to_owned())
+            } else {
+                (
+                    200,
+                    format!(
+                        r#"{{"access_token":"aaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbb.cccccccccccccc","token_type":"Bearer","expires_in":900,"scope":"agent:connect","company":"acme","company_name":"Acme GmbH","team":"ops","team_name":"Ops","agent":"ops-bot","agent_name":"Ops Bot","engine":"claude-code","wave_url":"{url}"}}"#
+                    ),
+                )
+            }
+        }
+        "/v1/agent-connect/mint" => (
+            201,
+            format!(
+                r#"{{"key":"{KEY}","agent":{{"id":"11111111-2222-4333-8444-555555555555","key":"ops-bot","name":"Ops Bot"}},"team":{{"key":"ops","name":"Ops"}},"company":"acme","expires_at":"2099-02-20T10:00:00Z"}}"#
+            ),
+        ),
+        _ => {
+            // Wave's MCP: the rooms
+            let b: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let data = match b["params"]["name"].as_str().unwrap_or("") {
+                "rooms" => {
+                    serde_json::json!({ "items": [{ "id": "room-1", "name": "Team room" }, { "id": "room-2", "name": "Sales" }] })
+                }
+                "inbox" => {
+                    serde_json::json!({ "items": [], "next_seq": 1, "tasks": [], "stuck": [] })
+                }
+                _ => serde_json::json!({ "ok": true }),
+            };
+            (
+                200,
+                serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": { "content": [{ "type": "text", "text": data.to_string() }] } }).to_string(),
+            )
+        }
+    };
+    let resp = format!(
+        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}",
+        out.len()
+    );
+    let _ = stream.write_all(resp.as_bytes());
+}
+
+#[test]
+fn the_simple_way_opens_the_browser_and_connects_an_agent_without_asking_for_a_name() {
+    if is_root() {
+        return;
+    }
+    let (home, bin) = rig();
+    let (url, bodies) = serve_account();
+    let mut c = menu(&home, &bin, None);
+    c.env("DISPLAY", ":0").env("STONEWAVE_ACCOUNT_URL", &url);
+    let mut t = Pty::spawn(c, 40, 110);
+    t.expect("Agent verbinden");
+    t.send(ENTER);
+    t.expect("Wie kommt der Agent zu Wave?");
+    t.expect("Neuen Agenten anmelden");
+    t.send(ENTER);
+    t.expect("Agent mit Wave verbinden");
+    t.expect("Claude Code (2.1.321");
+    t.send(ENTER);
+    // the real sign-in runs in the terminal: German, the code and the four words stay as the safeguard, the browser is opened
+    t.expect("Im Browser anmelden");
+    t.expect("WAVE-7K4Q-X2MP");
+    t.expect("amber · river · cedar · fox");
+    t.expect("Dein Browser ist offen. Gib dort den Code ein.");
+    t.expect("Key saved");
+    t.expect("Enter drücken, um zum Menü zurückzukehren");
+    t.send(ENTER);
+    // the name is the one Wave made, read back; "Später" is the default
+    t.expect("Verbunden: ops-bot");
+    t.send(ENTER);
+    t.expect("ops-bot ist verbunden");
+    t.send(ENTER);
+    t.expect("Agenten auf diesem Computer");
+    t.expect("ops-bot");
+    t.send("q");
+    assert_eq!(t.finish(), Some(0));
+
+    assert_eq!(
+        std::fs::read_to_string(bin.0.join("opened.txt")).unwrap(),
+        format!("{url}/link"),
+        "the browser was sent to the account's own page"
+    );
+    let b = bodies.lock().unwrap();
+    let start = b.iter().find(|(p, _)| p == "/v1/device/code").unwrap();
+    assert!(start.1.contains(r#""engine":"claude-code""#), "{}", start.1);
+    assert!(
+        !start.1.contains("agent_name"),
+        "no name was suggested or asked: {}",
+        start.1
+    );
+    let cfg = home.0.join(".config/wave");
+    assert!(cfg.join("ops-bot.key").exists() && cfg.join("ops-bot.json").exists());
+    assert!(!t.everything().contains(KEY), "the key is never shown");
 }

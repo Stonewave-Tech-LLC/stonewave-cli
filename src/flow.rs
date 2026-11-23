@@ -586,7 +586,19 @@ impl Pace for TermPace<'_> {
                 wave_spinner(m, t, 5),
                 m.fg(
                     pal::GREY,
-                    &format!("Waiting for you to confirm · code valid for {}", mmss(left))
+                    &if crate::ui::german() {
+                        format!(
+                            "Warte auf deine Bestätigung im Browser · {} vergangen · der Code gilt noch {}",
+                            mmss(self.started.elapsed()),
+                            mmss(left)
+                        )
+                    } else {
+                        format!(
+                            "Waiting for you to confirm · {} so far · code valid for {}",
+                            mmss(self.started.elapsed()),
+                            mmss(left)
+                        )
+                    }
                 )
             );
             self.term.repaint(self.mark, &[line]);

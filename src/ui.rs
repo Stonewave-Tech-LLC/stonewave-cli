@@ -1,9 +1,21 @@
 //! Small building blocks shared by the screens: margin, key-value rows,
 //! the wave spinner, step rows and bars.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::style::{ColorMode, pal, width};
+
+/// The sign-in and waiting lines of `stonewave agent connect` in German (`--lang de`, or a German locale, or the menu).
+static GERMAN: AtomicBool = AtomicBool::new(false);
+
+pub fn set_german(on: bool) {
+    GERMAN.store(on, Ordering::Relaxed);
+}
+
+pub fn german() -> bool {
+    GERMAN.load(Ordering::Relaxed)
+}
 
 /// Left margin of every line.
 pub const MARGIN: &str = "  ";

@@ -320,6 +320,27 @@ pub struct Started {
     pub expires_in: u64,
     pub interval: u64,
     pub words: [String; 4],
+    /// RFC 8628 `verification_uri_complete`: a link with the code in it, if the account sends one. Only used through [`Started::link`].
+    pub verification_uri_complete: Option<String>,
+}
+
+impl Started {
+    /// The page to open in the browser: the link with the code in it when the account sent one **for its own `/link` page**
+    /// (anything else is ignored), else the plain `/link` page, where the code is typed.
+    pub fn link(&self, acct: &Account) -> (String, bool) {
+        let plain = acct.url("/link");
+        let Some(u) = &self.verification_uri_complete else {
+            return (plain, false);
+        };
+        let own = u
+            .strip_prefix(&plain)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('?') || rest.starts_with('/'));
+        if own && u.len() <= 300 && !u.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            (u.clone(), true)
+        } else {
+            (plain, false)
+        }
+    }
 }
 
 /// The token never shows up in `Debug` or `Display`.
@@ -564,6 +585,11 @@ pub fn start_with(
         expires_in: num("expires_in")?.clamp(30, 3600),
         interval: num("interval")?.clamp(MIN_INTERVAL, MAX_INTERVAL),
         words: w,
+        verification_uri_complete: v
+            .get("verification_uri_complete")
+            .and_then(Value::as_str)
+            .filter(|u| u.starts_with("https://") && u.len() <= 300)
+            .map(str::to_owned),
     })
 }
 
@@ -1049,6 +1075,7 @@ mod tests {
             expires_in: 600,
             interval: 5,
             words: ["a", "b", "c", "d"].map(String::from),
+            verification_uri_complete: None,
         }
     }
 

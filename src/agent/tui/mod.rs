@@ -606,6 +606,7 @@ pub fn snapshot(
                     .unwrap_or_default(),
                 key,
                 connected: st.is_some(),
+                connected_at: st.as_ref().map(|s| s.created.clone()).unwrap_or_default(),
                 running: station_run::station_running(&paths.lock),
                 paused: paths.paused.exists(),
                 service: service::state(dirs, exec, &name),

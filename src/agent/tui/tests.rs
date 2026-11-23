@@ -51,6 +51,7 @@ fn row(name: &str) -> AgentRow {
         engine: "claude-code".into(),
         key: KeyState::File,
         connected: true,
+        connected_at: "2026-11-23T10:00:00Z".into(),
         running: false,
         paused: false,
         service: ServiceState::None,
@@ -65,6 +66,8 @@ struct Fake {
     log: Vec<String>,
     /// What the connect command leaves behind: an agent with this name.
     sign_in_makes: Option<String>,
+    /// The agent is made although the command ends with an error (a late step failed).
+    late_failure: bool,
     interactive_code: i32,
     capture_code: i32,
     capture_lines: Vec<String>,
@@ -86,10 +89,20 @@ impl World for Fake {
 
     fn interactive(&mut self, args: &[String]) -> i32 {
         self.log.push(format!("interactive {}", args.join(" ")));
-        if args.get(1).map(String::as_str) == Some("connect") && self.interactive_code == 0 {
+        if args.get(1).map(String::as_str) == Some("connect")
+            && (self.interactive_code == 0 || self.late_failure)
+        {
             if let Some(n) = &self.sign_in_makes {
                 let s = self.snap.get_or_insert_with(snap);
-                s.agents.push(row(n));
+                let at = format!("2026-11-24T10:{:02}:00Z", self.log.len() % 60);
+                match s.agents.iter_mut().find(|a| a.name == *n) {
+                    Some(a) => a.connected_at = at,
+                    None => {
+                        let mut a = row(n);
+                        a.connected_at = at;
+                        s.agents.push(a);
+                    }
+                }
             }
         }
         self.interactive_code
@@ -376,6 +389,20 @@ fn as_root_the_menu_connects_nothing() {
 
 // ------------------------------------------------------------------ agent actions
 
+/// Opens the page of the only agent and chooses one of its actions.
+fn open_action(r: &mut Rig, a: &AgentRow, action: AgentAction) {
+    let acts = agent_actions(a, r.app.snap.os);
+    let at = acts
+        .iter()
+        .position(|x| *x == action)
+        .expect("the action is offered");
+    r.press(Key::Enter);
+    for _ in 0..at {
+        r.press(Key::Down);
+    }
+    r.press(Key::Enter);
+}
+
 fn with_profile(mut a: AgentRow) -> AgentRow {
     let mut p = profile::sample(&a.name);
     p.key_env = None;
@@ -451,8 +478,7 @@ fn pausing_asks_first_and_enter_on_the_default_is_a_no() {
     let mut s = snap();
     s.agents = vec![with_profile(row("claude"))];
     let mut r = Rig::with(s);
-    // Pausieren is the 4th action: Status, CheckWave, RunHere, Pause
-    r.keys(&[Key::Enter, Key::Down, Key::Down, Key::Down, Key::Enter]);
+    open_action(&mut r, &with_profile(row("claude")), AgentAction::Pause);
     assert!(
         matches!(r.app.top(), Screen::Confirm(_)),
         "{:?}",
@@ -500,15 +526,11 @@ fn a_service_is_shown_whole_before_it_is_written() {
     let mut s = snap();
     s.agents = vec![with_profile(row("claude"))];
     let mut r = Rig::with(s);
-    // Status, CheckWave, RunHere, Pause, InstallService
-    r.keys(&[
-        Key::Enter,
-        Key::Down,
-        Key::Down,
-        Key::Down,
-        Key::Down,
-        Key::Enter,
-    ]);
+    open_action(
+        &mut r,
+        &with_profile(row("claude")),
+        AgentAction::InstallService,
+    );
     let screen = r.screen();
     assert!(
         screen.contains("ExecStart=")
@@ -535,9 +557,9 @@ fn an_env_key_agent_without_a_secret_store_command_gets_no_service() {
     p.launcher.clear();
     a.profile = Some(p);
     let mut s = snap();
-    s.agents = vec![a];
+    s.agents = vec![a.clone()];
     let mut r = Rig::with(s);
-    r.keys(&[Key::Enter, Key::Down, Key::Down, Key::Down, Key::Enter]); // InstallService
+    open_action(&mut r, &a, AgentAction::InstallService);
     assert!(
         matches!(r.app.top(), Screen::Agent { .. }),
         "no question was asked"
@@ -585,151 +607,405 @@ fn disconnecting_signs_off_first_and_only_then_forgets_the_rest() {
     assert!(r.screen().contains("nicht gelungen"));
 }
 
-// ------------------------------------------------------------------ the wizard
+// ------------------------------------------------------------------ the wizard: the simple way
+
+const E: Key = Key::Enter;
+
+/// Opens the wizard from a main screen without agents and takes the simple way up to the sign-in screen.
+fn to_connect(r: &mut Rig) {
+    r.keys(&[E, E]); // "Agent verbinden", "Neuen Agenten anmelden"
+    assert_eq!(r.wizard().step, Step::Connect);
+}
+
+/// The simple way up to the question about the station: the sign-in makes the agent `ops-bot`.
+fn signed_in(r: &mut Rig) {
+    r.world.sign_in_makes = Some("ops-bot".into());
+    to_connect(r);
+    r.press(E);
+    assert_eq!(r.wizard().step, Step::StationAsk);
+}
 
 #[test]
-fn a_new_agent_goes_from_sign_in_to_a_running_service() {
+fn a_first_connect_is_a_few_screens_and_asks_for_no_name() {
     let mut r = Rig::new();
-    r.world.sign_in_makes = Some("claude".into());
-    r.keys(&[Key::Enter]); // "Agent verbinden"
+    r.world.sign_in_makes = Some("ops-bot".into());
+    r.keys(&[E]); // "Agent verbinden"
     assert_eq!(r.wizard().step, Step::Mode);
-    r.press(Key::Enter); // sign in with the browser
-    assert_eq!(r.wizard().step, Step::Engine);
-    assert!(r.screen().contains("Claude Code") && r.screen().contains("gefunden (2.1.321"));
-    // Codex is not installed: refused with the hint, nothing moves
-    r.keys(&[Key::Down, Key::Enter]);
-    assert_eq!(r.wizard().step, Step::Engine);
+    let screen = r.screen();
+    // the simple way is first and the chosen one; the server way is not even named here
     assert!(
-        r.screen().contains("npm install -g @openai/codex"),
+        screen.contains("Neuen Agenten anmelden") && screen.contains("Mehr …"),
+        "{screen}"
+    );
+    assert!(!screen.contains("Secret-Store"), "{screen}");
+    r.press(E);
+    assert_eq!(r.wizard().step, Step::Connect);
+    let screen = r.screen();
+    assert!(
+        screen.contains("Claude Code (2.1.321")
+            && screen.contains("Dein Browser öffnet die Anmeldeseite"),
+        "{screen}"
+    );
+    assert!(
+        !screen.contains("Wie heißt der Agent"),
+        "no name is asked: {screen}"
+    );
+    assert!(r.calls().is_empty(), "nothing starts before Enter");
+    r.press(E);
+    // no --name: the agent is the one the person picks in Wave; the screens speak German
+    assert_eq!(
+        r.calls(),
+        vec!["interactive agent connect --engine claude-code --no-station --lang de"]
+    );
+    assert_eq!((r.term.suspended, r.term.resumed), (1, 1));
+    // what Wave called the agent is read back
+    assert_eq!(r.wizard().step, Step::StationAsk);
+    assert!(r.screen().contains("Verbunden: ops-bot"), "{}", r.screen());
+    // the default is "Später": Enter ends it
+    r.press(E);
+    assert_eq!(r.wizard().step, Step::Done);
+    assert!(
+        r.screen().contains("ops-bot ist verbunden"),
         "{}",
         r.screen()
     );
-    r.keys(&[Key::Up, Key::Enter]);
-    assert_eq!(r.wizard().step, Step::Name);
-    assert_eq!(r.wizard().name.value(), "claude", "a free name is proposed");
-    r.press(Key::Enter);
-    assert_eq!(r.wizard().step, Step::SignIn);
-    assert!(
-        r.screen()
-            .contains("stonewave agent connect --engine claude-code --name claude --no-station")
-    );
-    assert_eq!(
-        r.world
-            .log
-            .iter()
-            .filter(|l| l.starts_with("interactive"))
-            .count(),
-        0,
-        "nothing starts before Enter"
-    );
-    r.press(Key::Enter);
-    assert_eq!(
-        r.calls(),
-        vec!["interactive agent connect --engine claude-code --name claude --no-station"]
-    );
-    assert_eq!((r.term.suspended, r.term.resumed), (1, 1));
-    assert_eq!(r.wizard().step, Step::StationAsk);
-    r.press(Key::Enter); // yes
-    // the address of Wave: the one the sign-in made, to be confirmed before any room is asked
-    assert_eq!(r.wizard().step, Step::WaveUrl);
-    assert_eq!(r.wizard().wave_url.value(), "https://wave.test");
     assert!(
         r.calls().iter().all(|c| !c.starts_with("rooms")),
-        "{:?}",
-        r.calls()
+        "no room was asked"
     );
-    r.press(Key::Enter);
-    // the rooms are fetched with the key file (no variable)
-    assert_eq!(r.wizard().step, Step::Rooms);
-    assert!(
-        r.calls()
-            .contains(&"rooms claude - https://wave.test".to_owned()),
-        "{:?}",
-        r.calls()
-    );
-    assert!(r.screen().contains("Team room") && r.screen().contains("Random"));
-    // nothing chosen: refused
-    r.press(Key::Enter);
-    assert_eq!(r.wizard().step, Step::Rooms);
-    assert!(r.screen().contains("mindestens einen Raum"));
-    r.keys(&[Key::Char(' '), Key::Down, Key::Char(' '), Key::Enter]);
-    assert_eq!(r.wizard().step, Step::Workdir);
-    assert_eq!(r.wizard().workdir.value(), "/home/neo/wave-agents/claude");
-    r.press(Key::Enter);
-    assert_eq!(r.wizard().step, Step::Limits);
-    assert!(r.screen().contains("20 Minuten") && r.screen().contains("keine Befehls-Werkzeuge"));
-    // the preview: the dry run first, the profile is saved only after it was clean
-    r.world.capture_lines = vec!["station: dry run".into(), "command: claude -p ...".into()];
-    r.press(Key::Enter);
-    assert_eq!(r.wizard().step, Step::Preview);
-    let calls = r.calls();
-    assert_eq!(calls[3], "save claude");
-    assert!(
-        calls[2].starts_with("capture agent station run --agent claude --wave https://wave.test --workdir /home/neo/wave-agents/claude --rooms room-1,room-2 --claude /usr/bin/claude --dry-run"),
-        "{calls:?}"
-    );
-    assert!(r.screen().contains("command: claude -p"));
-    // the test run hands the terminal over once more
-    r.keys(&[Key::Enter]);
-    assert_eq!(r.wizard().step, Step::Test);
-    r.press(Key::Enter);
-    let calls = r.calls();
-    assert!(
-        calls[4].starts_with("interactive agent station run --agent claude")
-            && calls[4].ends_with("--once"),
-        "{calls:?}"
-    );
-    assert_eq!(r.wizard().step, Step::Service);
-    let screen = r.screen();
-    assert!(
-        screen.contains("stonewave-station-claude.service")
-            && screen.contains("Environment=\"PATH=")
-            && screen.contains("ExecStart=")
-            && screen.contains("/opt/sw/stonewave"),
-        "the whole file is shown: {screen}"
-    );
-    // Enter on the default, "Nein": nothing is installed
-    r.press(Key::Enter);
-    assert!(!r.world.log.iter().any(|l| l.starts_with("install")));
-    assert_eq!(r.wizard().step, Step::Done);
-    assert!(r.screen().contains("claude ist eingerichtet") && r.screen().contains("Kein Dienst"));
-    r.press(Key::Enter);
+    r.press(E);
     assert!(matches!(r.app.top(), Screen::Main { .. }));
+    assert!(r.screen().contains("ops-bot"));
 }
 
-/// The wizard for a new agent up to the question about the service.
-fn new_agent_to_service(r: &mut Rig) {
+#[test]
+fn the_agent_that_was_made_is_found_also_when_it_was_connected_before() {
+    // signed in again: the same name, a newer time
+    let mut s = snap();
+    s.agents = vec![row("claude")];
+    let mut r = Rig::with(s);
     r.world.sign_in_makes = Some("claude".into());
+    r.keys(&[Key::Down, E, E, E]); // Agent verbinden, Neuen Agenten, Anmelden
+    assert_eq!(r.wizard().step, Step::StationAsk);
+    // nothing new came out of the sign-in: said, and the person can try again
+    let mut r = Rig::new();
+    to_connect(&mut r);
+    r.press(E);
+    assert_eq!(r.wizard().step, Step::Connect);
+    assert!(
+        r.screen().contains("Es wurde kein Agent angelegt"),
+        "{}",
+        r.screen()
+    );
+}
+
+#[test]
+fn a_sign_in_that_does_not_finish_can_be_tried_again() {
+    let mut r = Rig::new();
+    r.world.interactive_code = 1;
+    r.world.sign_in_makes = Some("ops-bot".into());
+    to_connect(&mut r);
+    r.press(E);
+    assert_eq!(r.wizard().step, Step::Connect);
+    assert!(r.screen().contains("nicht abgeschlossen"), "{}", r.screen());
+    r.world.interactive_code = 0;
+    r.press(E);
+    assert_eq!(r.wizard().step, Step::StationAsk);
+}
+
+#[test]
+fn an_agent_that_was_made_is_not_lost_when_a_late_step_of_the_sign_in_failed() {
+    let mut r = Rig::new();
+    r.world.interactive_code = 1;
+    r.world.late_failure = true;
+    r.world.sign_in_makes = Some("ops-bot".into());
+    to_connect(&mut r);
+    r.press(E);
+    assert_eq!(
+        r.wizard().step,
+        Step::StationAsk,
+        "the agent is there, so the wizard goes on"
+    );
+    r.press(E);
+    assert_eq!(r.wizard().step, Step::Done);
+    assert!(
+        r.screen()
+            .contains("Ein Schritt beim Verbinden ist nicht gelungen"),
+        "{}",
+        r.screen()
+    );
+}
+
+#[test]
+fn with_several_programs_the_first_found_is_chosen_and_another_can_be_picked() {
+    let mut s = snap();
+    s.engines[1].found = true; // Codex too
+    let mut r = Rig::with(s);
+    r.world.sign_in_makes = Some("ops-bot".into());
+    to_connect(&mut r);
+    assert!(
+        r.screen().contains("Claude Code") && r.screen().contains("Codex"),
+        "{}",
+        r.screen()
+    );
+    r.keys(&[Key::Down, E]);
+    assert_eq!(
+        r.calls(),
+        vec!["interactive agent connect --engine codex --no-station --lang de"]
+    );
+    // the engine of the agent Wave made is Claude Code here (the fake says so), so the station question follows
+    assert_eq!(r.wizard().step, Step::StationAsk);
+}
+
+#[test]
+fn without_a_program_the_screen_says_what_to_install() {
+    let mut s = snap();
+    s.engines[0].found = false;
+    let mut r = Rig::with(s);
+    to_connect(&mut r);
+    assert!(
+        r.screen()
+            .contains("npm install -g @anthropic-ai/claude-code"),
+        "{}",
+        r.screen()
+    );
+    r.press(E);
+    assert_eq!(r.wizard().step, Step::Connect);
+    assert!(r.calls().is_empty());
+}
+
+#[test]
+fn the_station_with_the_usual_settings_takes_one_screen_and_one_enter() {
+    let mut r = Rig::new();
+    signed_in(&mut r);
+    r.keys(&[Key::Down, E]); // "Ja, jetzt mit den üblichen Einstellungen"
+    assert_eq!(r.wizard().step, Step::Defaults);
+    // the rooms came from Wave with the key file of the agent that was made, and all of them are chosen
+    assert!(
+        r.calls()
+            .contains(&"rooms ops-bot - https://wave.test".to_owned()),
+        "{:?}",
+        r.calls()
+    );
+    let screen = r.screen();
+    for needle in [
+        "alle 3: Team room, Company room, Random",
+        "/home/neo/wave-agents/ops-bot",
+        "https://wave.test",
+        "20 Min · 40 Züge · 2 USD",
+        "ohne Befehls-Werkzeuge",
+        "r ändert",
+        "o ändert",
+        "w ändert",
+    ] {
+        assert!(screen.contains(needle), "{needle}: {screen}");
+    }
+    r.world.capture_lines = vec!["station: dry run".into()];
+    r.press(E);
+    // the preview ran, was clean, was saved, and the next question is the service (default Nein)
+    let calls = r.calls();
+    assert!(
+        calls[2].starts_with("capture agent station run --agent ops-bot --wave https://wave.test --workdir /home/neo/wave-agents/ops-bot --rooms room-1,room-2,room-3 --claude /usr/bin/claude --dry-run"),
+        "{calls:?}"
+    );
+    assert_eq!(calls[3], "save ops-bot");
+    assert_eq!(r.wizard().step, Step::Service);
+    assert_eq!(r.wizard().cursor, 0);
+    assert!(
+        r.screen().contains("stonewave-station-ops-bot.service"),
+        "{}",
+        r.screen()
+    );
+    // Enter on the default: no service
+    r.press(E);
+    assert!(!r.world.log.iter().any(|l| l.starts_with("install")));
+    assert_eq!(r.wizard().step, Step::Done);
+    assert!(
+        r.screen().contains("ops-bot ist eingerichtet") && r.screen().contains("Kein Dienst"),
+        "{}",
+        r.screen()
+    );
+    // the simple way never runs the inbox test by itself
+    assert!(!r.calls().iter().any(|c| c.contains("--once")));
+}
+
+#[test]
+fn every_part_of_the_defaults_can_be_changed_and_the_screen_comes_back() {
+    let mut r = Rig::new();
+    signed_in(&mut r);
+    r.keys(&[Key::Down, E]);
+    // rooms: one off
+    r.press(Key::Char('r'));
+    assert_eq!(r.wizard().step, Step::Rooms);
+    r.keys(&[Key::Down, Key::Char(' '), E]);
+    assert_eq!(r.wizard().step, Step::Defaults);
+    assert!(
+        r.screen().contains("2 von 3: Team room, Random"),
+        "{}",
+        r.screen()
+    );
+    // folder
+    r.press(Key::Char('o'));
+    assert_eq!(r.wizard().step, Step::Workdir);
+    r.press(Key::CtrlU);
+    r.text("/srv/agents/ops");
+    r.press(E);
+    assert_eq!(r.wizard().step, Step::Defaults);
+    assert!(r.screen().contains("/srv/agents/ops"));
+    // the address: the rooms are asked again from there
+    let before = r.calls().iter().filter(|c| c.starts_with("rooms")).count();
+    r.press(Key::Char('w'));
+    assert_eq!(r.wizard().step, Step::WaveUrl);
+    r.press(Key::CtrlU);
+    r.text("https://wave.other.test");
+    r.press(E);
+    assert_eq!(r.wizard().step, Step::Defaults);
+    let asked: Vec<String> = r
+        .calls()
+        .into_iter()
+        .filter(|c| c.starts_with("rooms"))
+        .collect();
+    assert_eq!(asked.len(), before + 1);
+    assert_eq!(
+        asked.last().unwrap(),
+        "rooms ops-bot - https://wave.other.test"
+    );
+    // a typed address that is not usable is refused where it is typed
+    r.press(Key::Char('w'));
+    r.press(Key::CtrlU);
+    r.text("http://example.com");
+    r.press(E);
+    assert_eq!(r.wizard().step, Step::WaveUrl);
+    assert!(
+        r.screen().contains("Diese Adresse geht nicht"),
+        "{}",
+        r.screen()
+    );
+    r.keys(&[Key::CtrlU]);
+    r.text("https://wave.other.test");
+    r.press(E);
+    // everything goes into the profile
+    r.press(E);
+    let saved = r.world.profiles.last().unwrap();
+    assert_eq!(saved.workdir, "/srv/agents/ops");
+    assert_eq!(saved.wave_url, "https://wave.other.test");
+    assert_eq!(
+        saved.rooms.len(),
+        3,
+        "the rooms were asked again for the new address: all chosen again"
+    );
+}
+
+#[test]
+fn no_room_chosen_is_said_and_esc_goes_back_to_the_question() {
+    let mut r = Rig::new();
+    signed_in(&mut r);
+    r.keys(&[Key::Down, E, Key::Char('r')]);
     r.keys(&[
-        Key::Enter, // Agent verbinden
-        Key::Enter, // sign in with the browser
-        Key::Enter, // Claude Code
-        Key::Enter, // name
-        Key::Enter, // sign in
-        Key::Enter, // station: yes
-        Key::Enter, // the address of Wave
         Key::Char(' '),
-        Key::Enter, // rooms
-        Key::Enter, // folder
-        Key::Enter, // limits
-        Key::Enter, // preview
-        Key::Enter, // test
-    ]);
+        Key::Down,
+        Key::Char(' '),
+        Key::Down,
+        Key::Char(' '),
+    ]); // all three off
+    r.press(E);
+    assert_eq!(r.wizard().step, Step::Rooms);
+    assert!(
+        r.screen().contains("mindestens einen Raum"),
+        "{}",
+        r.screen()
+    );
+    r.press(Key::Char(' '));
+    r.press(E);
+    assert_eq!(r.wizard().step, Step::Defaults);
+    r.press(Key::Esc);
+    assert_eq!(r.wizard().step, Step::StationAsk);
+    // from the question there is no way back into the sign-in: the wizard closes
+    r.press(Key::Esc);
+    assert!(matches!(r.app.top(), Screen::Main { .. }));
+    assert!(
+        r.screen().contains("ops-bot"),
+        "the agent that was made is on the screen"
+    );
+}
+
+#[test]
+fn a_failed_room_list_is_said_and_can_be_tried_again() {
+    let mut r = Rig::new();
+    r.world.rooms = Some(Err("Wave nimmt den Schlüssel nicht an.".into()));
+    signed_in(&mut r);
+    r.keys(&[Key::Down, E]);
+    assert_eq!(r.wizard().step, Step::Defaults);
+    assert!(
+        r.screen().contains("Wave nimmt den Schlüssel nicht an."),
+        "{}",
+        r.screen()
+    );
+    assert!(
+        r.screen().contains("werden von Wave geholt"),
+        "{}",
+        r.screen()
+    );
+    r.world.rooms = Some(Ok(vec![]));
+    r.press(E);
+    assert!(
+        r.screen().contains("noch keinen Raum lesen"),
+        "{}",
+        r.screen()
+    );
+    r.world.rooms = None;
+    r.press(E);
+    assert!(r.screen().contains("alle 3"), "{}", r.screen());
+}
+
+#[test]
+fn nothing_is_remembered_before_the_dry_run_is_clean() {
+    let mut r = Rig::new();
+    signed_in(&mut r);
+    r.world.capture_code = 1;
+    r.world.capture_lines =
+        vec!["refused: the working folder cannot be your whole home folder".into()];
+    r.keys(&[Key::Down, E, E]);
+    assert_eq!(r.wizard().step, Step::Preview);
+    assert!(
+        r.screen().contains("Nichts wurde gemerkt"),
+        "{}",
+        r.screen()
+    );
+    assert!(r.world.profiles.is_empty(), "no profile was saved");
+    r.press(E);
+    assert_eq!(r.wizard().step, Step::Preview, "Enter does not go on");
+    // Esc: back to the defaults, to change the folder
+    r.press(Key::Esc);
+    assert_eq!(r.wizard().step, Step::Defaults);
+    // a second try that works saves it and goes on to the service question
+    r.world.capture_code = 0;
+    r.world.capture_lines = vec!["fine".into()];
+    r.press(E);
+    assert_eq!(r.world.profiles.len(), 1);
     assert_eq!(r.wizard().step, Step::Service);
 }
 
 #[test]
 fn the_service_is_installed_only_after_an_explicit_yes() {
     let mut r = Rig::new();
-    new_agent_to_service(&mut r);
-    // the cursor starts on "Nein"
-    assert_eq!(r.wizard().cursor, 0);
-    r.keys(&[Key::Down, Key::Enter]);
+    signed_in(&mut r);
+    r.keys(&[Key::Down, E, E]);
+    assert_eq!(r.wizard().step, Step::Service);
+    let screen = r.screen();
+    assert!(
+        screen.contains("Environment=\"PATH=")
+            && screen.contains("ExecStart=")
+            && screen.contains("/opt/sw/stonewave"),
+        "the whole file is shown: {screen}"
+    );
+    assert_eq!(r.wizard().cursor, 0, "the cursor starts on Nein");
+    r.keys(&[Key::Down, E]);
     assert_eq!(
         r.world
             .log
             .iter()
-            .filter(|l| *l == "install claude")
+            .filter(|l| *l == "install ops-bot")
             .count(),
         1
     );
@@ -740,105 +1016,40 @@ fn the_service_is_installed_only_after_an_explicit_yes() {
 #[test]
 fn a_failed_install_stays_on_the_question_with_the_reason() {
     let mut r = Rig::new();
-    new_agent_to_service(&mut r);
+    signed_in(&mut r);
+    r.keys(&[Key::Down, E, E]);
     r.world.install = Some(Err("`systemctl --user daemon-reload` failed: no bus".into()));
-    r.keys(&[Key::Down, Key::Enter]);
+    r.keys(&[Key::Down, E]);
     assert_eq!(r.wizard().step, Step::Service);
     assert!(r.screen().contains("no bus"), "{}", r.screen());
 }
 
 #[test]
-fn nothing_is_remembered_before_the_dry_run_is_clean() {
-    let mut r = Rig::new();
-    r.world.capture_code = 1;
-    r.world.capture_lines =
-        vec!["refused: the working folder cannot be your whole home folder".into()];
-    r.keys(&[
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter, // station: yes
-        Key::Enter, // the address of Wave
-        Key::Char(' '),
-        Key::Enter, // rooms
-        Key::Enter, // folder
-        Key::Enter, // limits: the dry run runs and says no
-    ]);
-    assert_eq!(r.wizard().step, Step::Preview);
+fn where_there_is_no_service_installer_the_simple_way_ends_with_a_hint() {
+    let mut s = snap();
+    s.os = Os::Windows;
+    s.home = if cfg!(windows) {
+        "C:\\Users\\neo"
+    } else {
+        "/home/neo"
+    }
+    .into();
+    let mut r = Rig::with(s);
+    signed_in(&mut r);
+    r.keys(&[Key::Down, E]);
+    assert_eq!(r.wizard().step, Step::Defaults);
+    assert_eq!(
+        r.wizard().workdir.value(),
+        format!("{}\\wave-agents\\ops-bot", r.app.snap.home)
+    );
+    r.press(E);
+    assert_eq!(r.wizard().step, Step::Done);
     assert!(
-        r.screen().contains("Nichts wurde gemerkt"),
+        r.screen().contains("noch nicht einrichten"),
         "{}",
         r.screen()
     );
-    assert!(r.world.profiles.is_empty(), "no profile was saved");
-    // Enter does not go on, and a profile is not there for a service to be built on
-    r.press(Key::Enter);
-    assert_eq!(r.wizard().step, Step::Preview);
-    // a second try that works saves it
-    r.world.capture_code = 0;
-    r.world.capture_lines = vec!["fine".into()];
-    r.press(Key::Char('r'));
-    assert_eq!(r.world.profiles.len(), 1);
-    r.press(Key::Enter);
-    assert_eq!(r.wizard().step, Step::Test);
-}
-
-#[test]
-fn the_wave_address_has_a_default_when_nothing_is_known() {
-    let mut s = snap();
-    s.wave_hint = None;
-    // an existing agent: Name -> address
-    let mut r = Rig::with(s.clone());
-    r.keys(&[Key::Enter, Key::Down, Key::Enter, Key::Enter, Key::Enter]);
-    assert_eq!(r.wizard().step, Step::WaveUrl);
-    assert_eq!(r.wizard().wave_url.value(), DEFAULT_WAVE);
-    r.press(Key::Enter);
-    assert_eq!(
-        r.wizard().step,
-        Step::KeySource,
-        "the default is accepted as it stands"
-    );
-    // a typed address is not replaced by a proposal when the person comes back
-    r.press(Key::Esc);
-    r.press(Key::CtrlU);
-    r.text("https://wave.mine.test");
-    r.keys(&[Key::Enter, Key::Esc]);
-    assert_eq!(r.wizard().wave_url.value(), "https://wave.mine.test");
-    // a new agent without a hint: the sign-in makes the address, it is shown for confirmation
-    let mut r = Rig::with(s);
-    r.world.sign_in_makes = Some("claude".into());
-    r.keys(&[
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-    ]);
-    assert_eq!(r.wizard().step, Step::WaveUrl);
-    assert_eq!(
-        r.wizard().wave_url.value(),
-        "https://wave.test",
-        "taken from what the sign-in made"
-    );
-    // and an agent whose state has no address and nothing else is known falls back to the default
-    let mut s = snap();
-    s.wave_hint = None;
-    s.agents = vec![{
-        let mut a = row("claude");
-        a.wave_url = None;
-        a
-    }];
-    let mut r = Rig::with(s);
-    r.keys(&[Key::Enter, Key::Down, Key::Down, Key::Enter]); // the agent, "Station einrichten"
-    assert_eq!(r.wizard().wave_url.value(), DEFAULT_WAVE);
-    assert!(
-        r.calls().iter().any(|c| c.ends_with(DEFAULT_WAVE)),
-        "{:?}",
-        r.calls()
-    );
+    assert!(!r.calls().iter().any(|c| c.starts_with("install")));
 }
 
 #[test]
@@ -847,16 +1058,9 @@ fn a_mac_gets_a_launch_agent_and_the_question_says_so() {
     s.os = Os::Mac;
     let mut a = with_profile(row("claude"));
     a.profile.as_mut().unwrap().workdir = "/Users/neo/wave-agents/claude".into();
-    s.agents = vec![a];
+    s.agents = vec![a.clone()];
     let mut r = Rig::with(s);
-    r.keys(&[
-        Key::Enter,
-        Key::Down,
-        Key::Down,
-        Key::Down,
-        Key::Down,
-        Key::Enter,
-    ]);
+    open_action(&mut r, &a, AgentAction::InstallService);
     let screen = r.screen();
     assert!(
         screen.contains("LaunchAgents/tech.stonewave.station.claude.plist")
@@ -880,25 +1084,9 @@ fn a_mac_gets_a_launch_agent_and_the_question_says_so() {
 
 #[test]
 fn every_command_the_wizard_starts_is_one_that_exists_and_carries_no_key() {
-    // the whole wizard again, collecting every command it ran
     let mut r = Rig::new();
-    r.world.sign_in_makes = Some("claude".into());
-    r.keys(&[
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Char(' '),
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-    ]);
+    signed_in(&mut r);
+    r.keys(&[Key::Down, E, E, Key::Down, E, E]);
     let calls = r.calls();
     assert!(calls.len() >= 4, "{calls:?}");
     for c in &calls {
@@ -918,67 +1106,126 @@ fn every_command_the_wizard_starts_is_one_that_exists_and_carries_no_key() {
 }
 
 #[test]
-fn a_failed_sign_in_stays_on_the_step_and_a_second_try_works() {
-    let mut r = Rig::new();
-    r.world.interactive_code = 1;
-    r.keys(&[Key::Enter, Key::Enter, Key::Enter, Key::Enter, Key::Enter]);
-    assert_eq!(r.wizard().step, Step::SignIn);
-    assert!(r.screen().contains("nicht abgeschlossen"), "{}", r.screen());
-    r.world.interactive_code = 0;
-    r.press(Key::Enter);
-    assert_eq!(r.wizard().step, Step::StationAsk);
-}
-
-#[test]
-fn later_leaves_the_station_for_the_agents_own_page() {
-    let mut r = Rig::new();
-    r.keys(&[Key::Enter, Key::Enter, Key::Enter, Key::Enter, Key::Enter]);
-    assert_eq!(r.wizard().step, Step::StationAsk);
-    r.keys(&[Key::Down, Key::Enter]);
-    assert_eq!(r.wizard().step, Step::Done);
-    assert!(r.screen().contains("später auf der Seite des Agenten"));
-    assert!(r.calls().iter().all(|c| !c.starts_with("rooms")));
-}
-
-#[test]
-fn names_are_checked_before_anything_happens() {
+fn the_station_of_an_agent_already_connected_starts_at_the_defaults() {
     let mut s = snap();
     s.agents = vec![row("claude")];
     let mut r = Rig::with(s);
-    r.keys(&[Key::Down, Key::Enter, Key::Enter, Key::Enter]); // wizard, Mode, Engine -> Name
+    r.keys(&[E, Key::Down, Key::Down, E]); // the agent, "Station einrichten"
+    assert_eq!(r.wizard().step, Step::Defaults);
+    assert!(
+        r.calls()
+            .contains(&"rooms claude - https://wave.test".to_owned()),
+        "{:?}",
+        r.calls()
+    );
+    assert!(r.screen().contains("alle 3"), "{}", r.screen());
+    r.press(Key::Esc);
+    assert!(
+        matches!(r.app.top(), Screen::Agent { .. }),
+        "Esc where the wizard was opened closes it"
+    );
+}
+
+#[test]
+fn an_agent_whose_station_is_set_up_again_keeps_its_rooms() {
+    let mut s = snap();
+    let mut a = with_profile(row("claude"));
+    a.profile.as_mut().unwrap().rooms = vec!["room-2".into()];
+    s.agents = vec![a.clone()];
+    let mut r = Rig::with(s);
+    open_action(&mut r, &a, AgentAction::SetUpStation);
+    assert_eq!(r.wizard().step, Step::Defaults);
+    assert!(
+        r.screen().contains("1 von 3: Company room"),
+        "{}",
+        r.screen()
+    );
+}
+
+// ------------------------------------------------------------------ the wizard: "Mehr", the server with a secret store
+
+#[test]
+fn the_server_way_sits_behind_mehr_and_says_so() {
+    let mut r = Rig::new();
+    r.keys(&[E, Key::Down, E]); // Agent verbinden, Mehr …
+    assert_eq!(r.wizard().step, Step::Mode);
+    let screen = r.screen();
+    assert!(
+        screen.contains("Auf einem Server mit Secret-Store") && screen.contains("Zurück"),
+        "{screen}"
+    );
+    // Esc goes back to the first list, not out of the wizard
+    r.press(Key::Esc);
+    assert_eq!(r.wizard().step, Step::Mode);
+    assert!(
+        r.screen().contains("Neuen Agenten anmelden"),
+        "{}",
+        r.screen()
+    );
+    // "Zurück" does the same
+    r.keys(&[Key::Down, E, Key::Down, E]);
+    assert!(
+        r.screen().contains("Neuen Agenten anmelden"),
+        "{}",
+        r.screen()
+    );
+    // into the server way: it says on every screen what it is for
+    r.keys(&[Key::Down, E, E]);
+    assert_eq!(r.wizard().step, Step::Engine);
+    let screen = r.screen();
+    assert!(
+        screen.contains("Dieser Weg ist für einen Server")
+            && screen.contains("Auf einem normalen Computer brauchst du ihn nicht"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("Server mit Secret-Store · Schritt 2 von"),
+        "{screen}"
+    );
+}
+
+/// Into the server way: Agent verbinden, Mehr, the server, then the program (Claude Code).
+fn into_server_way(r: &mut Rig) {
+    r.keys(&[E, Key::Down, E, E, E]);
+    assert_eq!(r.wizard().step, Step::Name);
+}
+
+#[test]
+fn names_are_checked_in_the_server_way_before_anything_happens() {
+    let mut s = snap();
+    s.agents = vec![row("claude")];
+    let mut r = Rig::with(s);
+    r.keys(&[Key::Down]); // down to "Agent verbinden"
+    r.keys(&[E, Key::Down, E, E, E]);
     assert_eq!(r.wizard().step, Step::Name);
     assert_eq!(
         r.wizard().name.value(),
         "claude-2",
         "the proposal is a free name"
     );
-    for _ in 0..12 {
-        r.press(Key::Backspace);
-    }
+    r.press(Key::CtrlU);
     r.text("Bad Name!");
-    r.press(Key::Enter);
+    r.press(E);
     assert_eq!(r.wizard().step, Step::Name);
     assert!(r.screen().contains("Kleinbuchstaben"), "{}", r.screen());
     r.press(Key::CtrlU);
     r.text("claude");
-    r.press(Key::Enter);
+    r.press(E);
     assert!(r.screen().contains("gibt es hier schon"));
     r.press(Key::CtrlU);
     r.text("other");
-    r.press(Key::Enter);
-    assert_eq!(r.wizard().step, Step::SignIn);
+    r.press(E);
+    assert_eq!(r.wizard().step, Step::WaveUrl);
 }
 
 #[test]
 fn an_existing_agent_with_a_key_in_a_secret_store_never_types_the_key() {
     let mut r = Rig::new();
-    // Mode: the second entry; engine Claude Code; name
-    r.keys(&[Key::Enter, Key::Down, Key::Enter, Key::Enter]);
-    assert_eq!(r.wizard().step, Step::Name);
+    into_server_way(&mut r);
     assert_eq!(r.wizard().name.value(), "claude");
     r.press(Key::CtrlU);
     r.text("demo");
-    r.press(Key::Enter);
+    r.press(E);
     assert_eq!(r.wizard().step, Step::WaveUrl);
     assert_eq!(
         r.wizard().wave_url.value(),
@@ -988,7 +1235,7 @@ fn an_existing_agent_with_a_key_in_a_secret_store_never_types_the_key() {
     // a plain-http address is refused
     r.press(Key::CtrlU);
     r.text("http://example.com");
-    r.press(Key::Enter);
+    r.press(E);
     assert_eq!(r.wizard().step, Step::WaveUrl);
     assert!(
         r.screen().contains("Diese Adresse geht nicht"),
@@ -997,27 +1244,26 @@ fn an_existing_agent_with_a_key_in_a_secret_store_never_types_the_key() {
     );
     r.press(Key::CtrlU);
     r.text("https://wave.stonewavetech.test");
-    r.press(Key::Enter);
+    r.press(E);
     assert_eq!(r.wizard().step, Step::KeySource);
     // the key itself is refused as a variable name
     r.press(Key::CtrlU);
     r.text("wak_0a1b2c3d-0000-4000-8000-000000000001_secret");
-    r.press(Key::Enter);
+    r.press(E);
     assert_eq!(r.wizard().step, Step::KeySource);
     assert!(r.screen().contains("NAME der Umgebungsvariable"));
-    assert!(!r.screen().contains("wak_0a1b") || r.screen().matches("wak_0a1b").count() <= 1);
     r.press(Key::CtrlU);
     r.text("DEMO_KEY");
     assert!(r.screen().contains("ist in dieser Shell gesetzt"));
     // a launcher with shell characters is refused
     r.press(Key::Tab);
     r.text("secrets-run run; rm -rf /");
-    r.press(Key::Enter);
+    r.press(E);
     assert_eq!(r.wizard().step, Step::KeySource);
     assert!(r.screen().contains("nur Buchstaben"));
     r.press(Key::CtrlU);
     r.text("/usr/local/bin/secrets-run run --env=prod --");
-    r.press(Key::Enter);
+    r.press(E);
     assert_eq!(r.wizard().step, Step::Rooms);
     assert!(
         r.calls()
@@ -1025,15 +1271,9 @@ fn an_existing_agent_with_a_key_in_a_secret_store_never_types_the_key() {
         "{:?}",
         r.calls()
     );
-    // Room 1 and 2, then on to the end
-    r.keys(&[
-        Key::Char(' '),
-        Key::Down,
-        Key::Char(' '),
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-    ]);
+    // the server way starts with no room chosen: two of them, then on to the end
+    assert!(r.screen().contains("[ ] Team room"), "{}", r.screen());
+    r.keys(&[Key::Char(' '), Key::Down, Key::Char(' '), E, E, E]);
     assert_eq!(r.wizard().step, Step::Preview);
     let saved = r.world.profiles.last().unwrap().clone();
     assert_eq!(saved.key_env.as_deref(), Some("DEMO_KEY"));
@@ -1051,136 +1291,74 @@ fn an_existing_agent_with_a_key_in_a_secret_store_never_types_the_key() {
         "{capture}"
     );
     assert!(!capture.contains("wak_"));
-    // the service of this agent goes through the secret store
-    r.keys(&[Key::Enter]);
-    r.press(Key::Char('s')); // skip the test
+    // the server way stops at the preview, then the inbox test, then the service through the secret store
+    r.press(E);
+    assert_eq!(r.wizard().step, Step::Test);
+    r.press(Key::Char('s'));
     assert_eq!(r.wizard().step, Step::Service);
-    assert!(
-        r.screen().contains(
-            "ExecStart=\"/usr/local/bin/secrets-run\" \"run\" \"--env=prod\" \"--\" \"/opt/sw/stonewave\""
-        ),
-        "{}",
-        r.screen()
-    );
+    assert!(r.screen().contains("ExecStart=\"/usr/local/bin/secrets-run\" \"run\" \"--env=prod\" \"--\" \"/opt/sw/stonewave\""), "{}", r.screen());
 }
 
 #[test]
-fn a_failed_room_list_can_be_tried_again_and_an_empty_one_says_why() {
-    let mut r = Rig::new();
-    r.world.rooms = Some(Err("Wave nimmt den Schlüssel nicht an.".into()));
-    r.keys(&[
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-    ]); // ... Rooms
-    assert_eq!(r.wizard().step, Step::Rooms);
-    assert!(
-        r.screen()
-            .contains("Wave nimmt den Schlüssel nicht an. Enter versucht es noch einmal."),
-        "{}",
-        r.screen()
-    );
-    r.world.rooms = Some(Ok(vec![]));
-    r.press(Key::Enter);
-    assert!(r.screen().contains("noch keinen Raum lesen"));
-    r.world.rooms = None;
-    r.press(Key::Enter);
-    assert!(r.screen().contains("Company room"));
-}
-
-#[test]
-fn esc_goes_back_one_step_and_keeps_what_was_chosen() {
-    let mut r = Rig::new();
-    r.keys(&[
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Char(' '),
-        Key::Enter,
-    ]);
-    assert_eq!(r.wizard().step, Step::Workdir);
-    r.press(Key::Esc);
-    assert_eq!(r.wizard().step, Step::Rooms);
-    assert_eq!(r.wizard().chosen_rooms().len(), 1, "the room stays chosen");
-    // no way back into the sign-in once it is done
-    r.keys(&[Key::Esc]);
+fn the_wave_address_has_a_default_when_nothing_is_known() {
+    let mut s = snap();
+    s.wave_hint = None;
+    let mut r = Rig::with(s.clone());
+    into_server_way(&mut r);
+    r.press(E);
     assert_eq!(r.wizard().step, Step::WaveUrl);
-    r.keys(&[Key::Esc]);
+    assert_eq!(r.wizard().wave_url.value(), DEFAULT_WAVE);
+    r.press(E);
     assert_eq!(
         r.wizard().step,
-        Step::StationAsk,
-        "back from the address is the question about the station, not the sign-in"
+        Step::KeySource,
+        "the default is accepted as it stands"
     );
-    r.keys(&[Key::Esc]);
-    assert!(
-        matches!(r.app.top(), Screen::Main { .. }),
-        "and from there the wizard closes: the sign-in is not repeated"
-    );
-}
-
-#[test]
-fn a_service_cannot_be_set_up_elsewhere_than_on_linux_and_the_wizard_says_how_to_go_on() {
-    let mut s = snap();
-    s.os = Os::Windows;
-    s.home = if cfg!(windows) {
-        "C:\\Users\\neo"
-    } else {
-        "/home/neo"
-    }
-    .into();
+    // a typed address is not replaced by a proposal when the person comes back
+    r.press(Key::Esc);
+    r.press(Key::CtrlU);
+    r.text("https://wave.mine.test");
+    r.keys(&[E, Key::Esc]);
+    assert_eq!(r.wizard().wave_url.value(), "https://wave.mine.test");
+    // the simple way: the address comes from what the sign-in made; without one, the default
+    let mut a = row("ops-bot");
+    a.wave_url = None;
+    s.agents = vec![a];
     let mut r = Rig::with(s);
-    r.keys(&[
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-    ]);
-    assert_eq!(r.wizard().step, Step::Rooms);
-    r.keys(&[Key::Char(' '), Key::Enter]);
-    assert_eq!(
-        r.wizard().workdir.value(),
-        format!("{}\\wave-agents\\claude", r.app.snap.home)
-    );
-    r.keys(&[Key::Enter, Key::Enter, Key::Enter, Key::Char('s')]);
-    assert_eq!(r.wizard().step, Step::Service);
+    r.keys(&[E, Key::Down, Key::Down, E]); // the agent's page, "Station einrichten"
+    assert_eq!(r.wizard().wave_url.value(), DEFAULT_WAVE);
     assert!(
-        r.screen().contains("noch nicht einrichten"),
-        "{}",
-        r.screen()
-    );
-    assert!(!r.calls().iter().any(|c| c.starts_with("install")));
-    r.press(Key::Enter);
-    assert_eq!(r.wizard().step, Step::Done);
-}
-
-#[test]
-fn the_station_of_an_agent_already_connected_starts_at_the_rooms() {
-    let mut s = snap();
-    s.agents = vec![row("claude")];
-    let mut r = Rig::with(s);
-    r.keys(&[Key::Enter, Key::Down, Key::Down, Key::Enter]); // the agent, "Station einrichten"
-    assert_eq!(r.wizard().step, Step::Rooms);
-    assert!(
-        r.calls()
-            .contains(&"rooms claude - https://wave.test".to_owned()),
+        r.calls().iter().any(|c| c.ends_with(DEFAULT_WAVE)),
         "{:?}",
         r.calls()
     );
-    r.press(Key::Esc);
+}
+
+// ------------------------------------------------------------------ the agent's page: the test run
+
+#[test]
+fn the_test_run_is_asked_first_and_gets_the_terminal() {
+    let mut s = snap();
+    let a = with_profile(row("claude"));
+    s.agents = vec![a.clone()];
+    let mut r = Rig::with(s);
+    open_action(&mut r, &a, AgentAction::Test);
+    assert!(r.screen().contains("Testlauf"), "{}", r.screen());
+    r.press(E); // the default is no
+    assert!(r.calls().is_empty());
+    r.press(E);
+    r.keys(&[Key::Down, E]);
+    let calls = r.calls();
+    assert_eq!(calls.len(), 1);
     assert!(
-        matches!(r.app.top(), Screen::Agent { .. }),
-        "Esc where the wizard was opened closes it"
+        calls[0].starts_with("interactive agent station run --agent claude")
+            && calls[0].ends_with("--once"),
+        "{calls:?}"
+    );
+    assert!(
+        r.screen().contains("Der Testlauf ist beendet"),
+        "{}",
+        r.screen()
     );
 }
 
@@ -1251,15 +1429,8 @@ fn the_banner_plays_once_at_the_start_and_any_key_ends_it() {
 #[test]
 fn the_busy_line_is_drawn_while_wave_is_asked() {
     let mut r = Rig::new();
-    r.keys(&[
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-        Key::Enter,
-    ]);
+    signed_in(&mut r);
+    r.keys(&[Key::Down, Key::Enter]);
     assert!(
         r.term
             .frames
@@ -1353,14 +1524,11 @@ fn a_long_question_scrolls_above_its_answers_and_the_answers_stay_on_the_screen(
     let mut s = snap();
     s.agents = vec![with_profile(row("claude"))];
     let mut r = Rig::with(s);
-    r.keys(&[
-        Key::Enter,
-        Key::Down,
-        Key::Down,
-        Key::Down,
-        Key::Down,
-        Key::Enter,
-    ]);
+    open_action(
+        &mut r,
+        &with_profile(row("claude")),
+        AgentAction::InstallService,
+    );
     assert!(matches!(r.app.top(), Screen::Confirm(_)));
     // a plain 80x24 terminal: the service file does not fit, the question does
     let lines = view::render(&r.app, 80, 24, ColorMode::None, 0.0);
@@ -1391,7 +1559,8 @@ fn a_long_question_scrolls_above_its_answers_and_the_answers_stay_on_the_screen(
 #[test]
 fn a_refusal_shows_right_under_the_field_even_on_a_small_terminal() {
     let mut r = Rig::new();
-    r.keys(&[Key::Enter, Key::Down, Key::Enter, Key::Enter, Key::Enter]);
+    into_server_way(&mut r);
+    r.press(Key::Enter);
     assert_eq!(r.wizard().step, Step::WaveUrl);
     r.press(Key::CtrlU);
     r.text("http://example.com");
@@ -1408,32 +1577,27 @@ fn a_refusal_shows_right_under_the_field_even_on_a_small_terminal() {
 #[test]
 #[ignore]
 fn print_screens() {
-    let mut s = snap();
-    let mut demo = with_profile(row("demo"));
-    demo.running = true;
-    demo.service = ServiceState::Installed { active: true };
-    s.agents = vec![demo, row("claude")];
-    let mut r = Rig::with(s);
+    let mut r = Rig::new();
+    r.world.sign_in_makes = Some("ops-bot".into());
     let show = |r: &Rig, title: &str| {
         println!("===== {title}");
-        for l in view::render(&r.app, 84, 34, ColorMode::None, 0.0) {
+        for l in view::render(&r.app, 84, 30, ColorMode::None, 0.0) {
             println!("|{l}");
         }
     };
-    show(&r, "main");
+    show(&r, "main, nothing connected");
     r.press(Key::Enter);
-    show(&r, "agent");
-    r.press(Key::Esc);
-    r.keys(&[Key::Down, Key::Down, Key::Enter]);
-    show(&r, "wizard mode");
+    show(&r, "mode");
     r.keys(&[Key::Down, Key::Enter]);
-    show(&r, "engine (existing)");
+    show(&r, "mode, mehr");
+    r.keys(&[Key::Esc, Key::Enter]);
+    show(&r, "connect");
     r.press(Key::Enter);
-    show(&r, "name");
+    show(&r, "station question");
+    r.keys(&[Key::Down, Key::Enter]);
+    show(&r, "defaults");
     r.press(Key::Enter);
-    show(&r, "wave url");
+    show(&r, "service");
     r.press(Key::Enter);
-    show(&r, "key source");
-    r.press(Key::Enter);
-    show(&r, "rooms");
+    show(&r, "done");
 }

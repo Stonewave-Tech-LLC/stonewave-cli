@@ -40,36 +40,48 @@ it and brings you back), pause / resume, stopping or starting the service, setti
 
 ## The wizard "Agent verbinden"
 
-A handful of decisions; each step says what it will do first.
+### The simple way (for every normal computer)
 
-1. **Way**: *sign in with the browser* (a new agent; Wave gives it a key for this computer) or *connect an existing agent* (its key is in a secret
-   store, typical for a server).
-2. **Program**: Claude Code, Codex, Grok Build. Those not installed are greyed out with an install hint. The station (waking by mention) exists for
-   Claude Code only so far; Codex and Grok are connected, their station follows.
-3. **Name**: lower case letters, digits, dashes; a free name is proposed.
-4. *New agent*: **sign in**: the menu steps aside and runs `stonewave agent connect --engine <program> --name <name> --no-station`: the code and the
-   four words, you confirm in the browser, the menu comes back. Then **Station**: *Ja* or *Später*.
-   *Existing agent*: **Wave address**, then **key source**: the name of the environment variable and, for a service, the command of the secret store
-   that starts a program with its secrets in the environment (for example `secrets-run run --env=prod --`; only plain words are accepted).
-5. **Wave address** (both ways, before any room is asked): proposed from what is known, in this order: the address the sign-in made, `STONEWAVE_WAVE_URL`,
-   the address of another agent here, else `https://wave-dev.preview.stonewavetech.com`. Editable; `https` only (plain `http` only for this machine).
-6. **Rooms**: fetched from Wave with the agent's key (a multi-select). A station wakes only in the rooms chosen, and only for people of the company.
-7. **Working folder**: the only place the agent may read and write; default `~/wave-agents/<name>`.
-8. **Limits**: shown, not changed here (20 minutes and 40 turns per wake, 2 USD estimate, 10 per hour, 50 per day, one session per room).
-9. **Preview**: `station run ... --dry-run`, the exact wake command and everything around it. Starts nothing and creates nothing. If it would be
-   refused (a working folder that holds keys or is your whole home folder, no Claude Code to start) it ends with an error, and **nothing is remembered
-   until a preview is clean**: no profile, so no service can be built on a setup that does not start. `r` repeats it.
-10. **Test**: `station run ... --once`: looks into the inbox once and stops. The first start only remembers the inbox position and wakes nobody; if a
-    position exists already, an open mention can wake the agent now. The menu steps aside so you see the output.
-11. **Service**: the whole file is shown (it scrolls above the answers on a small terminal), then *Nein* or *Ja*, and **the cursor starts on Nein**: Enter
-    without a choice installs nothing. The same question appears on the agent's page.
-    - Linux: a systemd user unit `stonewave-station-<name>.service`, no root. `loginctl enable-linger` is mentioned, never done.
-    - macOS: a launchd agent `~/Library/LaunchAgents/tech.stonewave.station.<name>.plist` (loaded with `launchctl bootstrap gui/<uid>`, started at login,
-      started again after an error, unloaded by "Station stoppen"). launchd has no journal, so the station's output (ids and counts, never message text)
-      goes to a private log file next to the other state files. **Not run on a real Mac yet.**
-    - Both hold the same options as the commands above, the launcher words in front, the full path of Claude Code and the PATH of the shell the menu runs
-      in (a service has a short PATH; relative and empty entries are left out). Neither ever holds the key.
-    - Windows has no service installer yet: the menu says so and the station is started from the agent's page.
+The first entry, "Neuen Agenten anmelden", is the default. A first connect is a few screens:
+
+1. **Program**: the one that is installed (Claude Code, Codex, Grok Build); with several, a short list. Nothing else is asked: **no name is typed**. The
+   agent is the one the person picks in Wave, and the menu reads its name back afterwards. Enter starts `stonewave agent connect --engine <program>
+   --no-station --lang de`.
+2. **Sign in**: the menu steps aside and the sign-in runs in the terminal, in German: the **browser is opened** on the account's page (not on a server
+   without a display, not with `--no-browser`; then the link is shown), the **code and the four words stay on the screen** (the person checks that the
+   page shows the same words), and while it waits it says what for and how long: "Warte auf deine Bestätigung im Browser · 0:42 vergangen · der Code gilt
+   noch 9:18", then "Wave richtet den Agenten ein · 0:35 von höchstens 10:00". After 90 seconds of "not ready" it says plainly "Wave wartet auf einen
+   Admin, der den Plan anwendet" and, at the end of the ten minutes, what to do (tell an admin; the confirmation stays valid; run it again afterwards).
+3. **Station?**: "Später" is the default, and ends the wizard: the agent is connected (**Fertig**). "Ja, jetzt mit den üblichen Einstellungen" goes on:
+   - **Defaults** (one screen): Wave's address (the one the sign-in made), the rooms (**all** the agent may read, it is only woken where a person
+     mentions it; `r` changes the choice), the folder (`~/wave-agents/<name>`, `o`), the limits (20 minutes and 40 turns, 2 USD estimate, 10 per hour,
+     50 per day, one session per room, only people of the company, no command tools; shown, not changed here), `w` changes the address. Enter sets it
+     up: the preview (`station run ... --dry-run`, nothing started, nothing created) must be **clean before anything is remembered**; then the profile is
+     saved.
+   - **Service** (Linux, macOS): the whole file is shown, *Nein* is the default, Enter installs nothing. Details below.
+
+The test run (looking into the inbox once, `--once`) and everything else (pause, service, other rooms) are on the agent's page.
+
+### "Mehr …": a server with a secret store
+
+Behind "Mehr …" there is "Auf einem Server mit Secret-Store", for an agent that exists in Wave already and whose key is in a secret store (typical for a
+server). It says on every screen what it is for and how to leave it. It is the long way, with numbered steps: program, name, Wave address, key source
+(the name of the environment variable, and for a service the command of the secret store), rooms (none chosen at first), folder, limits, preview, test
+(`--once`), service.
+
+### Details that apply to both
+
+- **Wave address** (server way, or `w` on the defaults): proposed from the address the sign-in made, then `STONEWAVE_WAVE_URL`, the address of another
+  agent here, else `https://wave-dev.preview.stonewavetech.com`. Editable; `https` only (plain `http` only for this machine).
+- **Service**: the whole file is shown (it scrolls above the answers on a small terminal), then *Nein* or *Ja*, and **the cursor starts on Nein**: Enter
+  without a choice installs nothing. The same question appears on the agent's page.
+  - Linux: a systemd user unit `stonewave-station-<name>.service`, no root. `loginctl enable-linger` is mentioned, never done.
+  - macOS: a launchd agent `~/Library/LaunchAgents/tech.stonewave.station.<name>.plist` (loaded with `launchctl bootstrap gui/<uid>`, started at login,
+    started again after an error, unloaded by "Station stoppen"). launchd has no journal, so the station's output (ids and counts, never message text)
+    goes to a private log file next to the other state files. `gui/<uid>` needs a logged-in graphical session. **Not run on a real Mac yet.**
+  - Both hold the same options as the commands above, the launcher words in front, the full path of Claude Code and the PATH of the shell the menu runs
+    in (a service has a short PATH; relative and empty entries are left out). Neither ever holds the key.
+  - Windows has no service installer yet: the menu says so and the station is started from the agent's page.
 
 ## A server with a secret store (for example the main server over ssh)
 
@@ -86,7 +98,7 @@ existing setup there.
 
 Tested: every screen and step of the wizard by pressing keys against a scripted machine (`src/agent/tui/tests.rs`), and the real binary on a real
 pseudo-terminal (`tests/menu_pty.rs`, Unix): opening, navigating, leaving with `q`, Ctrl-C, SIGTERM and SIGHUP with the terminal given back, `--plain`,
-`dumb`, a small terminal, the default Wave address, and the whole wizard for an agent with a key in the environment (rooms from a small Wave on the loopback address, the preview, a real `--once`
+`dumb`, a small terminal, the default Wave address, and the simple way against a small account and Wave (the browser opener, the German sign-in, the name read back, the key file) and the whole server way for an agent with a key in the environment (rooms from a small Wave on the loopback address, the preview, a real `--once`
 test with a stand-in for Claude Code, no key written anywhere).
 
 **Not tested:** a real Claude Code, a real Wave, the sign-in step with the real account service, writing the service on a real systemd or launchd (the
