@@ -6,7 +6,8 @@
 # Short on purpose, so you can read it before running it. It:
 #   1. downloads the manifest of the newest release over HTTPS (TLS 1.2 or better),
 #   2. downloads stonewave.exe and checks it against the manifest: size and SHA-256, and the Authenticode signature, which must be valid and
-#      made by the certificate of "Stonewave Tech LLC" (the name and the certificate's thumbprint are pinned below),
+#      made for exactly the subject "Stonewave Tech LLC, Sheridan, Wyoming, US" by a certificate that was issued under the Microsoft
+#      authority pinned below (Azure signing certificates last three days, so the authority is pinned, not the certificate),
 #   3. runs the downloaded program once with --version, which must say what the manifest says,
 #   4. puts it into %LOCALAPPDATA%\Stonewave\bin\stonewave.exe (a running older copy is renamed aside, not killed),
 #   5. adds that folder to YOUR user PATH and says so (not with -NoPath).
@@ -32,10 +33,16 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 
 $Base = 'https://stonewavetech.com/cli'
-# Who signs the Windows build: the certificate's common name and its thumbprint(s), pinned when the release is made
-# (scripts/release-bundle.sh). More than one thumbprint is a certificate that was renewed.
-$SignerName = 'Stonewave Tech LLC'
-$SignerThumbprints = '@WIN_THUMBPRINTS@'
+# Who signs the Windows build. Azure Artifact Signing makes a new certificate every few days (each valid for three days; the signature stays
+# valid because it is timestamped), so a certificate's own thumbprint cannot be pinned for good. Pinned instead, all of it required:
+#   - the exact subject of the signer certificate,
+#   - the thumbprint of the authority that issued it ("Microsoft ID Verified Code Signing PCA 2021"; written in when the release is made,
+#     scripts/release-bundle.sh): it must be in the certificate's chain, which Windows builds up to a trusted root and checks for revocation,
+#   - Windows' own verdict on the signature (Valid), and the SHA-256 of the manifest.
+$SignerSubject = 'CN=Stonewave Tech LLC, O=Stonewave Tech LLC, L=Sheridan, S=Wyoming, C=US'
+$SignerCaThumbprints = '@WIN_CA_THUMBPRINTS@'
+# Release 0.2.0 was signed before the authority was pinned: its certificate is pinned by its own thumbprint, for that release only.
+$LegacyLeaf = @{ '0.2.0' = '8A69FFDF224024FD656E942B043D92D5AA381505' }
 
 function Say([string]$Text) { Write-Host "  $Text" }
 function Fail([string]$Text) { throw "stonewave install: $Text" }
@@ -87,19 +94,63 @@ function Get-Remote([string]$Relative, [string]$Dest) {
 
 # ---------------------------------------------------------------- the checks
 
-# Valid signature, from the pinned certificate, or the end.
-function Test-StonewaveSignature([string]$Path, [string]$Name, [string]$Thumbprints) {
-    if ($Thumbprints -match '^@') { Fail 'this installer was not prepared for Windows (no certificate pinned). Nothing was installed.' }
-    $allowed = @($Thumbprints -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { $_.ToUpperInvariant() })
-    if ($allowed.Count -eq 0) { Fail 'no certificate is pinned. Nothing was installed.' }
+# The chain of a signer certificate, as Windows builds it (up to a trusted root), with its status and the thumbprints from the certificate up.
+# The leaf of a short-lived certificate has expired long before anybody installs: the chain is judged as of the time the certificate began,
+# when the signature (timestamped, and checked by Windows as Valid) was made. Revocation is asked online; only when the answer cannot be had
+# (no network, no list) the check is repeated from what is cached, then without, and then it says so. Anything else wrong ends it.
+# -TestOnlyAcceptUntrustedRoot is for the tests (certificates made on the spot have no trusted root); the installer itself never uses it.
+function Get-SignerChain([System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert, [switch]$TestOnlyAcceptUntrustedRoot) {
+    $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+    $chain.ChainPolicy.VerificationTime = $Cert.NotBefore.AddMinutes(1)
+    $chain.ChainPolicy.UrlRetrievalTimeout = [TimeSpan]::FromSeconds(20)
+    $chain.ChainPolicy.RevocationFlag = [System.Security.Cryptography.X509Certificates.X509RevocationFlag]::ExcludeRoot
+    if ($TestOnlyAcceptUntrustedRoot) { $chain.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::AllowUnknownCertificateAuthority }
+    $ok = $false
+    $status = @()
+    $warning = ''
+    foreach ($mode in 'Online', 'Offline', 'NoCheck') {
+        $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]$mode
+        $ok = $chain.Build($Cert)
+        $status = @($chain.ChainStatus | ForEach-Object { $_.Status.ToString() })
+        if ($ok) { if ($mode -ne 'Online') { $warning = "revocation of the signing certificate could not be checked ($mode)" }; break }
+        $benign = @('RevocationStatusUnknown', 'OfflineRevocation')
+        if ($TestOnlyAcceptUntrustedRoot) { $benign += 'UntrustedRoot' }      # reported although accepted
+        $other = @($status | Where-Object { $_ -notin $benign })
+        if ($other.Count -gt 0) { break }
+    }
+    $prints = @($chain.ChainElements | ForEach-Object { $_.Certificate.Thumbprint.ToUpperInvariant() })
+    return @{ Ok = $ok; Status = ($status -join ', '); Thumbprints = $prints; Warning = $warning }
+}
+
+# The pins, on a certificate and its chain: the exact subject, then either the certificate's own thumbprint (only the legacy one of a release)
+# or an issuing authority above it in the chain. Returns what it matched, or ends.
+function Test-SignerPins($Cert, $Chain, [string]$Subject, [string[]]$CaPins, [string[]]$LeafPins) {
+    if ($Cert.Subject -cne $Subject) { Fail "the download is signed by '$($Cert.Subject)', not by '$Subject'. Nothing was installed." }
+    $leaf = $Cert.Thumbprint.ToUpperInvariant()
+    if (@($LeafPins) -contains $leaf) { return "certificate $leaf" }
+    if (-not $Chain.Ok) { Fail "the chain of the signing certificate is not valid ($($Chain.Status)). Nothing was installed." }
+    $above = @($Chain.Thumbprints | Select-Object -Skip 1)
+    foreach ($pin in @($CaPins)) {
+        if ($above -contains $pin) { return "issued under $pin" }
+    }
+    Fail 'the signing certificate was not issued under the authority this installer pins. Nothing was installed.'
+}
+
+# Valid signature, for the pinned subject, issued under the pinned authority (or, for one release, by the pinned certificate), or the end.
+function Test-StonewaveSignature([string]$Path, [string]$Subject, [string]$CaThumbprints, [string[]]$LeafThumbprints = @(), [switch]$TestOnlyAcceptUntrustedRoot) {
+    $ca = @($CaThumbprints -split '[,\s]+' | Where-Object { $_ -match '^[0-9A-Fa-f]{40}$' } | ForEach-Object { $_.ToUpperInvariant() })
+    $leaves = @($LeafThumbprints | Where-Object { $_ } | ForEach-Object { $_.ToUpperInvariant() })
+    if ($ca.Count -eq 0 -and $leaves.Count -eq 0) {
+        Fail 'this installer was not prepared for Windows (no authority pinned). Nothing was installed.'
+    }
     $sig = Get-AuthenticodeSignature -FilePath $Path
     if ($sig.Status -ne 'Valid') { Fail "the signature of the download is not valid ($($sig.Status)). Nothing was installed." }
     $cert = $sig.SignerCertificate
     if ($null -eq $cert) { Fail 'the download has no signer certificate. Nothing was installed.' }
-    # the common name must be exactly ours (a lookalike such as "Stonewave Tech LLC Ltd" or a longer subject does not pass)
-    if ($cert.Subject -notmatch ('(^|,\s*)CN=' + [regex]::Escape($Name) + '(,|$)')) { Fail "the download is signed by '$($cert.Subject)', not by $Name. Nothing was installed." }
-    if ($allowed -notcontains $cert.Thumbprint.ToUpperInvariant()) { Fail "the signing certificate ($($cert.Thumbprint)) is not one this installer pins. Nothing was installed." }
-    Say "signature ok ($Name, certificate $($cert.Thumbprint))"
+    $chain = Get-SignerChain $cert -TestOnlyAcceptUntrustedRoot:$TestOnlyAcceptUntrustedRoot
+    $how = Test-SignerPins $cert $chain $Subject $ca $leaves
+    Say "signature ok ($($cert.Subject.Split(',')[0].Substring(3)), $how)"
+    if ($chain.Warning) { Say "note: $($chain.Warning)" }
 }
 
 # What a program says to --version (an empty text if it cannot be run).
@@ -189,7 +240,9 @@ function Install-Stonewave {
         Say "sha256    $hash"
         if ($hash -ne $m.Sha) { Fail "the checksum does not match the manifest ($($m.Sha)). Nothing was installed." }
         Say 'checksum ok'
-        Test-StonewaveSignature $file $SignerName $SignerThumbprints
+        $legacy = @()
+        if ($LegacyLeaf.ContainsKey($m.Version)) { $legacy = @($LegacyLeaf[$m.Version]) }
+        Test-StonewaveSignature $file $SignerSubject $SignerCaThumbprints $legacy
         # the program has been checked: now it may run once, to say who it is
         $ran = Get-BinaryVersion $file
         if ($ran -ne $want) { Fail "the program says '$ran', not '$want'. Nothing was installed." }
@@ -233,7 +286,8 @@ function Show-PathHelp([string]$Bin) {
     $env:Path = $env:Path.TrimEnd(';') + ';' + $Bin
 }
 
-# Dot-sourcing this file (`. .\install.ps1`) only defines the functions (the tests use it); running or piping it installs.
+# Running or piping this file installs: the whole file is one `& { ... } @args` block. Only the tests dot-source what is INSIDE the block (they cut
+# off the first and the last line, marked stonewave-installer-begin / -end): then this guard sees `.` and the functions are only defined.
 if ($MyInvocation.InvocationName -ne '.') {
     try {
         Install-Stonewave

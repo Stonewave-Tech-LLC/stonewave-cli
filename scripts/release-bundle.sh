@@ -19,7 +19,7 @@
 #   STONEWAVE_BUNDLE_TEST=1      TESTS ONLY: allows STONEWAVE_BUNDLE_COMMIT (a made-up commit) and STONEWAVE_ALLOW_DIRTY=1 (a tree with changes);
 #                                the bundle then carries a TEST-BUNDLE-NOT-FOR-PUBLISHING file. Without it both are refused.
 #   STONEWAVE_MAC_TEAM_ID        the Apple team id (10 characters), needed when a macOS file is given
-#   STONEWAVE_WIN_THUMBPRINTS    thumbprint(s) of the code-signing certificate, comma separated, needed when a Windows file is given
+#   STONEWAVE_WIN_CA_THUMBPRINTS thumbprint(s) of the authority that issues the signing certificates ("Microsoft ID Verified Code Signing PCA 2021"), comma separated, needed when a Windows file is given
 #
 # Before it is published, run the installers' own check against the folder, on each system it is for:
 #   sh OUT_DIR/install.sh --dry-run --from-dir OUT_DIR --bin-dir /tmp/x          (Linux, macOS)
@@ -118,17 +118,17 @@ add x86_64-windows "$x86_64_windows" ".exe"
 
 # the installers, with what they pin written in
 mac_id=@MAC_TEAM_ID@
-win_prints=@WIN_THUMBPRINTS@
+win_ca=@WIN_CA_THUMBPRINTS@
 if [ -n "$x86_64_macos$aarch64_macos" ]; then
     mac_id=${STONEWAVE_MAC_TEAM_ID:-}
     printf '%s\n' "$mac_id" | grep -Eq '^[A-Z0-9]{10}$' || { echo "release-bundle: STONEWAVE_MAC_TEAM_ID (10 characters) is needed with a macOS build" >&2; exit 1; }
 fi
 if [ -n "$x86_64_windows" ]; then
-    win_prints=${STONEWAVE_WIN_THUMBPRINTS:-}
-    printf '%s\n' "$win_prints" | grep -Eq '^[0-9A-Fa-f]{40}(,[0-9A-Fa-f]{40})*$' || { echo "release-bundle: STONEWAVE_WIN_THUMBPRINTS (40 hex characters each, comma separated) is needed with a Windows build" >&2; exit 1; }
+    win_ca=${STONEWAVE_WIN_CA_THUMBPRINTS:-}
+    printf '%s\n' "$win_ca" | grep -Eq '^[0-9A-Fa-f]{40}(,[0-9A-Fa-f]{40})*$' || { echo "release-bundle: STONEWAVE_WIN_CA_THUMBPRINTS (40 hex characters each, comma separated) is needed with a Windows build" >&2; exit 1; }
 fi
 sed -e "s/@MAC_TEAM_ID@/$mac_id/" install/cli/install.sh.in >"$out/install.sh"
-sed -e "s/@WIN_THUMBPRINTS@/$win_prints/" install/cli/install.ps1.in >"$out/install.ps1"
+sed -e "s/@WIN_CA_THUMBPRINTS@/$win_ca/" install/cli/install.ps1.in >"$out/install.ps1"
 chmod 644 "$out/install.sh" "$out/install.ps1"
 
 if [ "$latest" = yes ]; then
