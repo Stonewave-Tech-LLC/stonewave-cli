@@ -15,6 +15,7 @@ use crate::connect::{Account, Curl, Http};
 use crate::flow::{Host, Outcome};
 use crate::term;
 
+pub mod claude;
 pub mod cli;
 pub mod codex;
 pub mod connect_flow;
@@ -23,8 +24,13 @@ pub mod engine;
 pub mod exec;
 pub mod key;
 pub mod manage;
+pub mod menu;
+pub mod sessions;
+pub mod spawn;
 pub mod state;
 pub mod station;
+pub mod station_cli;
+pub mod station_run;
 pub mod timefmt;
 pub mod ui;
 pub mod wave;
@@ -79,7 +85,7 @@ fn real_http(a: &Account) -> Box<dyn Http> {
 }
 
 /// A key made by root belongs to nobody: refuse.
-fn running_as_root() -> bool {
+pub(crate) fn running_as_root() -> bool {
     #[cfg(unix)]
     {
         // SAFETY: geteuid has no arguments and cannot fail.
@@ -92,6 +98,10 @@ fn running_as_root() -> bool {
 }
 
 pub fn main(raw: &[String]) -> ExitCode {
+    // `stonewave agent station ...` has its own words and options (F-136)
+    if raw.first().map(String::as_str) == Some("station") {
+        return station_cli::main(&raw[1..]);
+    }
     let args = match cli::parse(raw) {
         Ok(a) => a,
         Err(e) => {

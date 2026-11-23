@@ -15,7 +15,8 @@ rights an admin gave, every action logged with the person it was done for.
 ## How it will work
 
 1. Wave shows an install command. Its checksum pins `install.sh`, and `install.sh` pins the binary.
-2. `sudo stonewave` on the server shows a sign-in code. The admin enters it in Wave.
+2. `sudo stonewave connect` on the server shows a sign-in code. The admin enters it in Wave. (`stonewave` alone on a terminal opens the
+   [menu of coding agents](#menu-and-station); as root it only points back to this command.)
 3. The admin's device makes its own key. **Each admin device is its own SSH certificate authority.** Only the public
    half goes to the server, and both sides show the same four words to compare.
 4. A deterministic setup creates an agent user without sudo, a localhost-only SSH for that user (certificates only, a
@@ -110,6 +111,22 @@ is; it is non-zero only when the command itself failed. Without sudo it says `"r
 HTTP goes through the system `curl` (the install command needs it anyway), so TLS and the certificate store are the
 system's. Secrets are handed to curl on stdin, never as arguments. A plain `http://` address is only accepted for this
 machine (`127.0.0.1`, `localhost`, `::1`), for tests.
+
+## Menu and station
+
+```bash
+stonewave                      # on a terminal: the menu (also `stonewave agents`)
+stonewave agent station run --agent <name> --dry-run   # what a wake would run; starts nothing
+stonewave agent station run --agent <name>             # wake the agent when a person of the company mentions it
+```
+
+The **menu** lists which coding agents are installed on this computer (Claude Code, Codex, Grok Build; Gemini CLI is found, connecting it comes
+next), which ones are connected to Wave, and starts the next step: connect, check, show a wake, start the station. It works the same on a PC and on
+a server, and writes nothing itself.
+
+The **station** keeps one long session per room for the agent and continues it on every wake, instead of starting a fresh run for each mention. A wake
+has no shell and no web, one MCP server (Wave), its own working folder and limits for time, turns, cost and count. Slice 1 supports Claude Code.
+Everything about it, including what was and was not tested: [docs/station.md](docs/station.md).
 
 ## agent: connect a coding agent to Wave
 
@@ -254,6 +271,7 @@ by `scripts/cast2gif.py` with Pillow.
 | `src/style.rs`, `src/ui.rs`, `src/banner.rs` | colours, building blocks, banner and wave animation |
 | `src/connect.rs` | the real device code sign-in: account address, curl transport, protocol, wait loop |
 | `src/agent/` | `stonewave agent ...`: Wave API calls, the key and its files, engine entries, Codex block, wake service, commands |
+| `src/agent/station_run.rs`, `claude.rs`, `spawn.rs`, `sessions.rs`, `menu.rs` | the station (wakes by continuing a session), the Claude Code command, starting a run with limits, the sessions per room, the menu |
 | `assets/fleet-watch.mjs` | the wake script that the wake service runs (embedded into the binary) |
 | `src/flow.rs` | the screens (real `connect` and the demos) |
 | `install/install.sh.in` | install script template |
