@@ -2,7 +2,12 @@
 # Collects the builds of one release into the folder that is put on stonewavetech.com/cli/, and writes the manifest.
 #
 #   scripts/release-bundle.sh OUT_DIR --x86_64-linux FILE [--aarch64-linux FILE] [--x86_64-macos FILE] [--aarch64-macos FILE] \
-#                                     [--x86_64-windows FILE] [--no-latest]
+#                                     [--x86_64-windows FILE] [--no-latest] [--built-from COMMIT]
+#
+# --built-from COMMIT: the programs were built from COMMIT (8 hex characters, what `stonewave --version` says), and the installers and
+#   documents come from the commit you are on now, which is later. Allowed only when COMMIT is an ancestor of HEAD and nothing but the installers,
+#   scripts, tests and documents changed in between (no source file, no Cargo file): the programs are then what HEAD would build.
+#   The manifest names COMMIT, because that is what the programs say.
 #
 # Output (the whole OUT_DIR is what the web server shows under /cli/):
 #   install.sh, install.ps1            the installers, with the pinned signer values written in
@@ -32,10 +37,16 @@ out=${1:?usage: scripts/release-bundle.sh OUT_DIR --x86_64-linux FILE ...}
 shift
 
 latest=yes
+built_from=
 x86_64_linux= aarch64_linux= x86_64_macos= aarch64_macos= x86_64_windows=
 while [ $# -gt 0 ]; do
     case "$1" in
     --no-latest) latest=no ;;
+    --built-from)
+        [ $# -ge 2 ] || { echo "release-bundle: --built-from needs a commit" >&2; exit 1; }
+        built_from=$2
+        shift
+        ;;
     --x86_64-linux | --aarch64-linux | --x86_64-macos | --aarch64-macos | --x86_64-windows)
         [ $# -ge 2 ] || { echo "release-bundle: $1 needs a file" >&2; exit 1; }
         [ -f "$2" ] || { echo "release-bundle: no such file: $2" >&2; exit 1; }
@@ -67,6 +78,20 @@ if [ -n "${STONEWAVE_BUNDLE_COMMIT:-}${STONEWAVE_ALLOW_DIRTY:-}" ]; then
     test_bundle=yes
 fi
 commit=${STONEWAVE_BUNDLE_COMMIT:-$(git rev-parse --short=8 HEAD)}
+if [ -n "$built_from" ]; then
+    printf '%s\n' "$built_from" | grep -Eq '^[0-9a-f]{8}$' || { echo "release-bundle: --built-from needs 8 hex characters" >&2; exit 1; }
+    git cat-file -e "$built_from^{commit}" 2>/dev/null || { echo "release-bundle: no such commit: $built_from" >&2; exit 1; }
+    git merge-base --is-ancestor "$built_from" HEAD || { echo "release-bundle: $built_from is not an ancestor of HEAD" >&2; exit 1; }
+    # what may differ between the commit the programs were built from and the one the installers come from
+    changed=$(git diff --name-only "$built_from" HEAD -- . ':(exclude)install' ':(exclude)scripts' ':(exclude)tests' ':(exclude)docs' ':(exclude)README.md' ':(exclude).gitattributes')
+    if [ -n "$changed" ]; then
+        echo "release-bundle: the programs would not be the same: these files changed since $built_from:" >&2
+        echo "$changed" | sed 's/^/  /' >&2
+        exit 1
+    fi
+    commit=$(git rev-parse --short=8 "$built_from")
+    echo "release-bundle: programs built from $commit, installers from $(git rev-parse --short=8 HEAD)"
+fi
 printf '%s\n' "$commit" | grep -Eq '^[0-9a-f]{8}$' || { echo "release-bundle: no commit" >&2; exit 1; }
 if [ "${STONEWAVE_ALLOW_DIRTY:-}" != 1 ] && [ -n "$(git status --porcelain --untracked-files=no)" ]; then
     echo "release-bundle: the working tree has changes; a release is built from a clean commit" >&2
