@@ -457,3 +457,47 @@ fn the_main_screen_lists_an_agent_the_wizard_made_and_its_page_offers_what_fits(
     t.send("q");
     assert_eq!(t.finish(), Some(0));
 }
+
+#[test]
+fn a_term_or_hup_signal_gives_the_terminal_back() {
+    if is_root() {
+        return;
+    }
+    for sig in [libc::SIGTERM, libc::SIGHUP] {
+        let (home, bin) = rig();
+        let mut t = Pty::spawn(menu(&home, &bin, None), 40, 100);
+        t.expect("Agent verbinden");
+        // SAFETY: a plain kill of the child this test started.
+        unsafe {
+            libc::kill(t.child.id() as i32, sig);
+        }
+        assert_eq!(t.finish(), Some(0), "signal {sig}");
+        let all = t.everything();
+        assert!(
+            all.contains("\x1b[?1049l") && all.contains("\x1b[?25h"),
+            "signal {sig}: the screen was not given back"
+        );
+    }
+}
+
+#[test]
+fn the_wave_address_is_offered_when_nothing_is_known_and_the_first_agent_can_go_on() {
+    if is_root() {
+        return;
+    }
+    let (home, bin) = rig();
+    let mut t = Pty::spawn(menu(&home, &bin, None), 40, 110);
+    t.expect("Agent verbinden");
+    t.send(ENTER);
+    t.expect("Wie kommt der Agent zu Wave?");
+    t.send(DOWN);
+    t.send(ENTER);
+    t.expect("Welches Programm soll der Agent sein?");
+    t.send(ENTER);
+    t.expect("Wie heißt der Agent?");
+    t.send(ENTER);
+    t.expect("Wo liegt Wave?");
+    t.expect("https://wave-dev.preview.stonewavetech.com");
+    t.send(CTRL_C);
+    assert_eq!(t.finish(), Some(0));
+}

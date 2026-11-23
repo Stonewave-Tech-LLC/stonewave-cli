@@ -49,7 +49,7 @@ pub fn plain_id(s: &str) -> bool {
 }
 
 fn text_ok(s: &str, max: usize) -> bool {
-    !s.is_empty() && s.chars().count() <= max && !s.chars().any(char::is_control)
+    !s.is_empty() && s.chars().count() <= max && !s.chars().any(crate::agent::key::is_invisible)
 }
 
 impl Profile {
@@ -109,15 +109,27 @@ impl Profile {
         if !text_ok(&wave_url, 300) {
             return None;
         }
+        // only an engine a station can wake, spelled the way this tool spells it
+        let engine = s("engine")?;
+        if crate::agent::engine::Engine::parse(&engine)
+            .is_none_or(|e| e == crate::agent::engine::Engine::Other)
+        {
+            return None;
+        }
+        // names are for the screen only, but they are shown: no control, bidirectional or zero-width characters
+        let room_names = list("room_names").unwrap_or_default();
+        if room_names.len() > rooms.len() || !room_names.iter().all(|n| text_ok(n, 80)) {
+            return None;
+        }
         Some(Profile {
             agent,
-            engine: s("engine")?,
+            engine,
             wave_url,
             key_env,
             launcher,
             workdir,
             rooms,
-            room_names: list("room_names").unwrap_or_default(),
+            room_names,
         })
     }
 
@@ -208,6 +220,11 @@ mod tests {
             ("key_env", json!("not a name")),
             ("launcher", json!(["secrets-run", "run; rm -rf /"])),
             ("workdir", json!("relative/path")),
+            ("engine", json!("not-an-engine")),
+            ("engine", json!("other")),
+            ("room_names", json!(["Team room", "Evil \u{202E}name"])),
+            ("room_names", json!(["a\u{200B}b"])),
+            ("room_names", json!(["a", "b", "c"])),
         ] {
             let mut j = good.clone();
             j[k] = v;

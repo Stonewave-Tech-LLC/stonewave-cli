@@ -206,7 +206,10 @@ pub fn list_rooms(http: &dyn Http, mcp: &str, key: &Key) -> Result<Vec<(String, 
                 .unwrap_or(id);
             Some((
                 id.to_owned(),
-                name.chars().filter(|c| !c.is_control()).take(80).collect(),
+                name.chars()
+                    .filter(|c| !super::key::is_invisible(*c))
+                    .take(80)
+                    .collect(),
             ))
         })
         .collect())
@@ -508,6 +511,16 @@ pub fn check_workdir(
     dirs: &Dirs,
     key_file: Option<&Path>,
 ) -> Result<Vec<String>, String> {
+    check_workdir_place(work, dirs, key_file)?;
+    check_workdir_content(work)
+}
+
+/// The checks of the place alone: nothing is created or changed, so `--dry-run` can say "refused" too.
+pub fn check_workdir_place(
+    work: &Path,
+    dirs: &Dirs,
+    key_file: Option<&Path>,
+) -> Result<(), String> {
     if !work.is_absolute() {
         return Err("the working folder must be a full path".into());
     }
@@ -556,6 +569,11 @@ pub fn check_workdir(
             return Err("the key file lies inside the working folder".into());
         }
     }
+    Ok(())
+}
+
+/// Makes the folder (private) and looks inside it: links that lead out are refused, instruction files are warned about.
+fn check_workdir_content(work: &Path) -> Result<Vec<String>, String> {
     fs::create_dir_all(work)
         .map_err(|e| format!("cannot create the working folder: {}", e.kind()))?;
     #[cfg(unix)]
@@ -1266,6 +1284,11 @@ impl<'a> Station<'a> {
                 return rep;
             }
         }
+    }
+
+    /// Whether a wake can be planned at all (Claude Code is found, the settings are valid): what `--dry-run` shows before it says anything else.
+    pub fn can_plan(&self) -> bool {
+        self.plan("x", None, &self.room_dir("ROOM-ID")).is_ok()
     }
 
     /// What `--dry-run` shows: the exact command of a wake and everything around it, without starting anything or asking Wave.

@@ -6,10 +6,14 @@
 
 use crate::agent::dirs::Os;
 use crate::agent::engine::Engine;
+use crate::agent::key::is_invisible;
 use crate::connect::{Account, is_agent_slug};
 
 use super::profile::{Profile, plain_word};
 use super::service::{self, ServiceState};
+
+/// Where Wave is when nothing else is known (the wizard offers it, editable).
+pub const DEFAULT_WAVE: &str = "https://wave-dev.preview.stonewavetech.com";
 
 // ------------------------------------------------------------------ input
 
@@ -47,7 +51,7 @@ impl Input {
     pub fn with(text: &str) -> Input {
         let chars: Vec<char> = text
             .chars()
-            .filter(|c| !c.is_control())
+            .filter(|c| !is_invisible(*c))
             .take(INPUT_MAX)
             .collect();
         Input {
@@ -60,6 +64,7 @@ impl Input {
         self.chars.iter().collect()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.chars.is_empty()
     }
@@ -71,7 +76,7 @@ impl Input {
     /// Returns whether the key was an editing key.
     pub fn edit(&mut self, key: Key) -> bool {
         match key {
-            Key::Char(c) if !c.is_control() => {
+            Key::Char(c) if !is_invisible(c) => {
                 if self.chars.len() < INPUT_MAX {
                     self.chars.insert(self.cursor, c);
                     self.cursor += 1;
@@ -221,9 +226,10 @@ pub enum Await {
     Nothing,
     Connect,
     Rooms,
-    /// The profile is being saved; the preview follows.
-    SaveForPreview(Profile),
+    /// The dry-run preview of the wizard is running.
     Preview,
+    /// The preview was clean; the profile is being saved.
+    SaveAfterPreview,
     Test,
     Install,
     /// A command whose output goes on a screen of its own.
@@ -405,6 +411,10 @@ pub struct Wizard {
     pub message: Option<(Level, String)>,
     pub signed_in: bool,
     pub test_ok: bool,
+    /// The Wave address was typed by the person: it is not replaced by a proposal any more.
+    pub wave_edited: bool,
+    /// The dry run of this setup was clean: only then the choices are remembered and a service may follow.
+    pub preview_ok: bool,
     pub notes: Vec<String>,
 }
 
@@ -429,6 +439,8 @@ impl Wizard {
             message: None,
             signed_in: false,
             test_ok: false,
+            wave_edited: false,
+            preview_ok: false,
             notes: Vec::new(),
         }
     }
@@ -456,8 +468,9 @@ impl Wizard {
             .map(|p| p.wave_url.clone())
             .or_else(|| a.wave_url.clone())
             .or_else(|| snap.wave_hint.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| DEFAULT_WAVE.to_owned());
         w.wave_url = Input::with(&wave);
+        w.wave_edited = true;
         if let Some(p) = &a.profile {
             w.key_env = Input::with(p.key_env.as_deref().unwrap_or("WAVE_AGENT_KEY"));
             w.launcher = Input::with(&p.launcher.join(" "));
@@ -514,7 +527,8 @@ impl Wizard {
             (Step::Engine, _) => Step::Name,
             (Step::Name, Mode::New) => Step::SignIn,
             (Step::Name, Mode::Existing) => Step::WaveUrl,
-            (Step::WaveUrl, _) => Step::KeySource,
+            (Step::WaveUrl, Mode::Existing) => Step::KeySource,
+            (Step::WaveUrl, Mode::New) => Step::Rooms,
             (Step::KeySource, _) => Step::Rooms,
             (Step::SignIn, _) => {
                 if self.engine == Some(Engine::ClaudeCode) {
@@ -523,7 +537,7 @@ impl Wizard {
                     Step::Done
                 }
             }
-            (Step::StationAsk, _) => Step::Rooms,
+            (Step::StationAsk, _) => Step::WaveUrl,
             (Step::Rooms, _) => Step::Workdir,
             (Step::Workdir, _) => Step::Limits,
             (Step::Limits, _) => Step::Preview,
@@ -541,12 +555,13 @@ impl Wizard {
             (Step::Mode, _) => return None,
             (Step::Engine, _) => Step::Mode,
             (Step::Name, _) => Step::Engine,
-            (Step::WaveUrl, _) => Step::Name,
+            (Step::WaveUrl, Mode::Existing) => Step::Name,
+            (Step::WaveUrl, Mode::New) => Step::StationAsk,
             (Step::KeySource, _) => Step::WaveUrl,
             // after signing in there is no way back to signing in
             (Step::SignIn, _) => Step::Name,
             (Step::StationAsk, _) => return None,
-            (Step::Rooms, Mode::New) => Step::StationAsk,
+            (Step::Rooms, Mode::New) => Step::WaveUrl,
             (Step::Rooms, Mode::Existing) => Step::KeySource,
             (Step::Workdir, _) => Step::Rooms,
             (Step::Limits, _) => Step::Workdir,
@@ -641,7 +656,7 @@ pub fn real_env_probe(name: &str) -> bool {
 }
 
 fn plain_text(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
+    s.chars().filter(|c| !is_invisible(*c)).collect()
 }
 
 impl App {
@@ -1003,19 +1018,27 @@ impl App {
     }
 
     /// The title and the lines of the question before a service is set up: the whole file, as it will be written.
-    fn install_confirm(&self, p: &Profile) -> Result<(String, Vec<String>), String> {
+    pub fn install_confirm(&self, p: &Profile) -> Result<(String, Vec<String>), String> {
         if p.key_env.is_some() && p.launcher.is_empty() {
             return Err("Der Dienst braucht den Befehl deines Secret-Stores, der den Schlüssel setzt. Richte die Station neu ein und trage ihn ein.".into());
         }
-        let unit = service::systemd_unit(
+        let os = self.snap.os;
+        let log =
+            std::path::Path::new(&self.snap.state_dir).join(format!("{}.station.log", p.agent));
+        let unit = service::file_text(
+            os,
             p,
             &self.snap.exe,
             self.snap.claude.as_deref(),
             self.snap.path_env.as_deref(),
+            &crate::agent::dirs::text(&log),
         );
         let mut lines = vec![
-            "Das Menü schreibt diese Datei und startet sie (`systemctl --user`, ohne Root):"
-                .to_owned(),
+            format!(
+                "Das Menü schreibt diese Datei ({}) und startet sie (`{}`, ohne Root):",
+                service::file_hint(os, &p.agent),
+                service::manager(os)
+            ),
             String::new(),
         ];
         lines.extend(unit.lines().map(str::to_owned));
@@ -1094,9 +1117,6 @@ impl App {
                         ));
                     } else {
                         w.workdir = Input::with(&default_workdir(&self.snap, &n));
-                        if w.wave_url.is_empty() {
-                            w.wave_url = Input::with(self.snap.wave_hint.as_deref().unwrap_or(""));
-                        }
                         self.advance(&mut w, &mut fx);
                     }
                 } else {
@@ -1117,7 +1137,9 @@ impl App {
                     }
                 } else {
                     w.message = None;
-                    w.wave_url.edit(key);
+                    if w.wave_url.edit(key) {
+                        w.wave_edited = true;
+                    }
                 }
             }
             Step::KeySource => match key {
@@ -1226,11 +1248,7 @@ impl App {
             }
             Step::Limits => {
                 if key == Key::Enter {
-                    let p = w.profile();
                     self.advance(&mut w, &mut fx);
-                    self.awaiting = Await::SaveForPreview(p.clone());
-                    self.busy = Some("Die Einrichtung wird gemerkt …".into());
-                    fx.push(Effect::SaveProfile(p));
                 }
             }
             Step::Preview => match key {
@@ -1238,7 +1256,8 @@ impl App {
                 Key::Down | Key::Char('j') => w.scroll += 1,
                 Key::PageUp => w.scroll = w.scroll.saturating_sub(10),
                 Key::PageDown => w.scroll += 10,
-                Key::Enter if w.message.is_none() => self.advance(&mut w, &mut fx),
+                Key::Enter if w.preview_ok => self.advance(&mut w, &mut fx),
+                Key::Char('r' | 'R') => self.start_preview(&mut w, &mut fx),
                 _ => {}
             },
             Step::Test => match key {
@@ -1277,9 +1296,39 @@ impl App {
         w.field = 0;
         w.scroll = 0;
         w.step = w.next_step();
-        if w.step == Step::Rooms && !w.rooms_loaded {
-            fx.extend(self.fetch_rooms(w));
+        match w.step {
+            Step::WaveUrl if !w.wave_edited => w.wave_url = Input::with(&self.wave_prefill(w)),
+            Step::Rooms if !w.rooms_loaded => fx.extend(self.fetch_rooms(w)),
+            Step::Preview => self.start_preview(w, fx),
+            _ => {}
         }
+    }
+
+    /// The Wave address to propose: the one the sign-in made, else the one in the environment or of another agent here, else the default.
+    fn wave_prefill(&self, w: &Wizard) -> String {
+        self.snap
+            .agent(&w.agent())
+            .and_then(|a| a.wave_url.clone())
+            .or_else(|| self.snap.wave_hint.clone())
+            .unwrap_or_else(|| DEFAULT_WAVE.to_owned())
+    }
+
+    /// The dry run of what was decided. Nothing is remembered before it is clean.
+    fn start_preview(&mut self, w: &mut Wizard, fx: &mut Vec<Effect>) {
+        w.preview_ok = false;
+        w.output.clear();
+        w.message = None;
+        let p = w.profile();
+        self.awaiting = Await::Preview;
+        self.busy = Some("Vorschau wird erstellt …".into());
+        fx.push(Effect::Capture {
+            title: "Vorschau".into(),
+            args: with_agent(station_command(
+                &p,
+                self.snap.claude.as_deref(),
+                &["--dry-run"],
+            )),
+        });
     }
 
     fn fetch_rooms(&mut self, w: &Wizard) -> Vec<Effect> {
@@ -1305,9 +1354,14 @@ impl App {
             }
             return;
         }
-        w.cursor = App::move_cursor(w.cursor, 2, key);
+        match key {
+            Key::PageUp => w.scroll = w.scroll.saturating_sub(5),
+            Key::PageDown => w.scroll += 5,
+            _ => w.cursor = App::move_cursor(w.cursor, 2, key),
+        }
+        // the cursor starts on "Nein": Enter without a choice installs nothing
         if key == Key::Enter {
-            if w.cursor == 0 {
+            if w.cursor == 1 {
                 self.awaiting = Await::Install;
                 self.busy = Some("Der Dienst wird eingerichtet …".into());
                 fx.push(Effect::InstallService(p));
@@ -1333,12 +1387,21 @@ impl App {
             }
             Event::Output { code, lines } => match awaiting {
                 Await::Preview => {
+                    let mut save = None;
                     if let Some(w) = self.wizard() {
                         w.output = lines;
                         w.scroll = 0;
                         if code != 0 {
-                            w.message = Some((Level::Bad, "Die Vorschau meldet ein Problem (siehe oben). Mit Esc zurück und ändern.".into()));
+                            w.message = Some((Level::Bad, "Die Vorschau meldet ein Problem (siehe oben). Nichts wurde gemerkt. Mit Esc zurück und ändern, mit r noch einmal.".into()));
+                        } else {
+                            w.preview_ok = true;
+                            save = Some(w.profile());
                         }
+                    }
+                    if let Some(p) = save {
+                        self.awaiting = Await::SaveAfterPreview;
+                        self.busy = Some("Die Einrichtung wird gemerkt …".into());
+                        return vec![Effect::SaveProfile(p)];
                     }
                 }
                 Await::Show(title) => self.stack.push(Screen::Output {
@@ -1481,25 +1544,15 @@ impl App {
                     }
                     return vec![Effect::Refresh];
                 }
-                Await::SaveForPreview(p) => match r {
-                    Ok(_) => {
-                        self.awaiting = Await::Preview;
-                        self.busy = Some("Vorschau wird erstellt …".into());
-                        return vec![Effect::Capture {
-                            title: "Vorschau".into(),
-                            args: with_agent(station_command(
-                                &p,
-                                self.snap.claude.as_deref(),
-                                &["--dry-run"],
-                            )),
-                        }];
-                    }
-                    Err(e) => {
+                Await::SaveAfterPreview => {
+                    if let Err(e) = r {
                         if let Some(w) = self.wizard() {
+                            w.preview_ok = false;
                             w.message = Some((Level::Bad, e));
                         }
                     }
-                },
+                    return vec![Effect::Refresh];
+                }
                 _ => {
                     if let Err(e) = r {
                         self.say(Level::Bad, &e);

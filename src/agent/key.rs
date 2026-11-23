@@ -53,6 +53,22 @@ fn is_key_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
 }
 
+/// A character that must not get into text that is shown or remembered: control characters, and the ones that change how text reads or
+/// hide in it (bidirectional marks, zero-width and joiner characters, the byte order mark, the soft hyphen).
+pub fn is_invisible(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
+        )
+}
+
 /// Cuts every `wak_...` out of a text and drops control characters. Used on everything printed.
 pub fn scrub(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

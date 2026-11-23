@@ -100,7 +100,7 @@ while nobody is logged in (the station never does that for you). How the secret-
 only needs the variable.
 
 `stonewave agent connect` does not install a service that runs the station: the wake service it offers only writes lines into a log file. The
-menu does (Linux, a systemd user unit, [menu.md](menu.md)): it shows the file first and writes the same options as above.
+menu does (Linux: a systemd user unit; macOS: a launchd agent; [menu.md](menu.md)): it shows the file first and writes the same options as above.
 
 ## Files
 

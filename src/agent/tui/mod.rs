@@ -15,6 +15,7 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::{Hide, Show};
@@ -175,6 +176,43 @@ pub fn run_loop(
 
 // ------------------------------------------------------------------ the real terminal
 
+/// Whether the full screen is taken (so a panic or a signal knows there is something to give back).
+static SCREEN_ON: AtomicBool = AtomicBool::new(false);
+/// SIGTERM or SIGHUP arrived: the loop ends and the terminal is restored by the normal way out.
+static GOT_SIGNAL: AtomicBool = AtomicBool::new(false);
+
+/// Gives the terminal back: normal screen, cursor, cooked mode. Safe to call twice and from a panic hook.
+fn restore_terminal() {
+    if SCREEN_ON.swap(false, Ordering::SeqCst) {
+        let mut out = io::stdout();
+        let _ = crossterm::execute!(out, Show, LeaveAlternateScreen);
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+#[cfg(unix)]
+extern "C" fn on_signal(_: i32) {
+    GOT_SIGNAL.store(true, Ordering::SeqCst);
+}
+
+/// While the full screen is up, SIGTERM and SIGHUP end the menu through its normal way out (a terminal that is closed or a `kill` would
+/// otherwise leave it in raw mode on the alternate screen).
+fn catch_signals(on: bool) {
+    #[cfg(unix)]
+    // SAFETY: the handler only stores into an atomic; `signal` is given a valid handler or the default action.
+    unsafe {
+        let h = if on {
+            on_signal as extern "C" fn(i32) as usize
+        } else {
+            libc::SIG_DFL
+        };
+        libc::signal(libc::SIGTERM, h);
+        libc::signal(libc::SIGHUP, h);
+    }
+    #[cfg(not(unix))]
+    let _ = on;
+}
+
 struct Screen {
     out: io::Stdout,
     last: Vec<String>,
@@ -190,6 +228,8 @@ impl Screen {
             let _ = terminal::disable_raw_mode();
             return Err(e);
         }
+        SCREEN_ON.store(true, Ordering::SeqCst);
+        catch_signals(true);
         Ok(Screen {
             out,
             last: Vec::new(),
@@ -200,8 +240,8 @@ impl Screen {
 
     fn leave(&mut self) {
         if self.active {
-            let _ = crossterm::execute!(self.out, Show, LeaveAlternateScreen);
-            let _ = terminal::disable_raw_mode();
+            restore_terminal();
+            catch_signals(false);
             self.active = false;
         }
     }
@@ -275,10 +315,20 @@ impl Console for Screen {
         if !self.active {
             return Some(Some(Key::CtrlC));
         }
-        match event::poll(wait) {
-            Ok(true) => {}
-            Ok(false) => return None,
-            Err(_) => return Some(Some(Key::CtrlC)),
+        // waited for in short slices, so a signal is noticed within a fifth of a second
+        let deadline = Instant::now() + wait;
+        loop {
+            if GOT_SIGNAL.load(Ordering::SeqCst) {
+                return Some(Some(Key::CtrlC));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            let slice = left.min(Duration::from_millis(200));
+            match event::poll(slice) {
+                Ok(true) => break,
+                Ok(false) if left <= slice => return None,
+                Ok(false) => {}
+                Err(_) => return Some(Some(Key::CtrlC)),
+            }
         }
         match event::read() {
             Ok(TermEvent::Key(k)) => map_key(k).map(Some).or(Some(None)),
@@ -310,6 +360,8 @@ impl Console for Screen {
             && crossterm::execute!(self.out, EnterAlternateScreen, Hide).is_ok()
         {
             self.active = true;
+            SCREEN_ON.store(true, Ordering::SeqCst);
+            catch_signals(true);
             self.size = terminal::size().unwrap_or(self.size);
             self.last.clear();
             let _ = write!(self.out, "\x1b[2J");
@@ -390,7 +442,7 @@ fn tidy_lines(text: &str) -> Vec<String> {
         .lines()
         .map(|l| {
             l.chars()
-                .filter(|c| !c.is_control() || *c == '\t')
+                .filter(|c| !super::key::is_invisible(*c) || *c == '\t')
                 .collect::<String>()
         })
         .collect()
@@ -491,7 +543,7 @@ impl World for Real {
     }
 
     fn service_control(&mut self, agent: &str, what: &str) -> Result<(), String> {
-        service::control(&System, agent, what)
+        service::control(&self.dirs, &System, agent, what)
     }
 
     fn remove_service(&mut self, agent: &str) -> Result<(), String> {
@@ -639,6 +691,12 @@ pub fn main() -> ExitCode {
             return super::menu::main(true);
         }
     };
+    // a panic gives the terminal back BEFORE its message is printed, so the message can be read
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        previous(info);
+    }));
     let animate = mode != ColorMode::None
         && !std::env::var_os("STONEWAVE_NO_ANIM").is_some_and(|v| !v.is_empty());
     run_loop(&mut app, &mut world, &mut screen, mode, animate);

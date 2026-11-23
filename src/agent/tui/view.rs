@@ -3,6 +3,7 @@
 
 use crate::agent::dirs::Os;
 use crate::agent::engine::Engine;
+use crate::agent::key::is_invisible;
 use crate::banner;
 use crate::style::{ColorMode, pal};
 use crate::ui::{MARGIN, wave_spinner};
@@ -470,7 +471,7 @@ fn output_screen(
         o.push(
             p.plain(
                 &l.chars()
-                    .filter(|c| !c.is_control() || *c == '\t')
+                    .filter(|c| !is_invisible(*c) || *c == '\t')
                     .collect::<String>(),
             ),
         );
@@ -478,31 +479,52 @@ fn output_screen(
     (o, "↑↓ blättern · Enter oder Esc zurück")
 }
 
-fn confirm_screen(p: &P, c: &Confirm, rows: usize) -> (Vec<String>, &'static str) {
+/// A text, then a question with two answers (the first is the default). A text that is longer than `rows` scrolls above the answers, which
+/// always stay on the screen. Returns the lines and whether the text scrolls.
+fn ask_block(
+    p: &P,
+    lines: &[String],
+    scroll: usize,
+    cursor: usize,
+    rows: usize,
+    answers: [&str; 2],
+) -> (Vec<String>, bool) {
     let mut text: Vec<String> = Vec::new();
-    for l in &c.lines {
+    for l in lines {
         if l.is_empty() {
             text.push(String::new());
         } else {
             text.extend(p.paragraph(l));
         }
     }
-    // the question and its two answers always stay on the screen; a long text scrolls above them
-    let room = rows.saturating_sub(2 + 3).max(1);
-    let scroll = c.scroll.min(text.len().saturating_sub(room));
-    let mut o = vec![p.heading(&c.title), String::new()];
-    o.extend(text.iter().skip(scroll).take(room).cloned());
+    let room = rows.saturating_sub(3).max(1);
+    let scroll = scroll.min(text.len().saturating_sub(room));
+    let mut o: Vec<String> = text.iter().skip(scroll).take(room).cloned().collect();
     let more = text.len() > scroll + room;
     o.push(if more {
         p.grey("▼ mehr: Bild ↓")
     } else {
         String::new()
     });
-    o.push(p.row(c.cursor == 0, "Nein"));
-    o.push(p.row(c.cursor == 1, "Ja"));
+    o.push(p.row(cursor == 0, answers[0]));
+    o.push(p.row(cursor == 1, answers[1]));
+    (o, text.len() > room)
+}
+
+fn confirm_screen(p: &P, c: &Confirm, rows: usize) -> (Vec<String>, &'static str) {
+    let mut o = vec![p.heading(&c.title), String::new()];
+    let (block, scrolls) = ask_block(
+        p,
+        &c.lines,
+        c.scroll,
+        c.cursor,
+        rows.saturating_sub(2),
+        ["Nein", "Ja"],
+    );
+    o.extend(block);
     (
         o,
-        if text.len() > room {
+        if scrolls {
             "Bild ↑↓ blättert · ↑↓ wählen · Enter bestätigt · j ja · n oder Esc nein"
         } else {
             "↑↓ wählen · Enter bestätigt · j ja · n oder Esc nein"
@@ -518,7 +540,7 @@ fn steps_of(w: &Wizard) -> Vec<Step> {
         Mode::New => {
             v.push(Step::SignIn);
             if w.engine.is_none_or(|e| e == Engine::ClaudeCode) {
-                v.push(Step::StationAsk);
+                v.extend([Step::StationAsk, Step::WaveUrl]);
             }
         }
         Mode::Existing => v.extend([Step::WaveUrl, Step::KeySource]),
@@ -730,7 +752,11 @@ fn wizard_screen(app: &App, p: &P, w: &Wizard, rows: usize) -> (Vec<String>, &'s
             if let Some((l, m)) = &w.message {
                 o.push(p.level(*l, m));
             }
-            keys = "↑↓ blättern · Enter weiter · Esc zurück";
+            keys = if w.preview_ok {
+                "↑↓ blättern · Enter weiter · r wiederholt · Esc zurück"
+            } else {
+                "↑↓ blättern · r wiederholt · Esc zurück"
+            };
         }
         Step::Test => {
             o.extend(p.paragraph("Die Station schaut einmal in den Posteingang von Wave und hört wieder auf. Beim allerersten Start merkt sie sich nur den Stand und weckt niemanden. Gibt es schon einen Stand, kann ein offener Aufruf jetzt den Agenten wecken."));
@@ -756,35 +782,37 @@ fn wizard_screen(app: &App, p: &P, w: &Wizard, rows: usize) -> (Vec<String>, &'s
             } else if !app.service_possible(&prof) {
                 o.extend(p.paragraph("Für einen Dienst fehlt der Start-Befehl deines Secret-Stores (Schritt \"Woher kommt der Schlüssel?\"): ohne ihn hätte der Dienst keinen Schlüssel. Du kannst zurückgehen und ihn eintragen oder die Station von Hand starten."));
                 keys = "Enter weiter · Esc zurück";
-            } else {
-                o.extend(p.paragraph("Ein Benutzer-Dienst (ohne Root) startet die Station jetzt und bei jedem Anmelden und startet sie neu, wenn sie abstürzt. Die Datei, die das Menü schreibt:"));
-                o.push(String::new());
-                o.push(p.kv(
-                    "Datei",
-                    &format!("~/.config/systemd/user/{}", service::unit_name(&prof.agent)),
-                ));
-                o.push(
-                    p.kv(
-                        "Befehl",
-                        &service::exec_words(&prof, &app.snap.exe, app.snap.claude.as_deref())
-                            .join(" "),
-                    ),
+            } else if let Ok((_, lines)) = app.install_confirm(&prof) {
+                // the same question as on the agent's page: the whole file, "Nein" is where the cursor starts
+                let mut intro = vec![
+                    "Ein Benutzer-Dienst (ohne Root) startet die Station jetzt und bei jedem Anmelden und startet sie neu, wenn sie abstürzt.".to_owned(),
+                    String::new(),
+                ];
+                intro.extend(lines);
+                let (block, scrolls) = ask_block(
+                    p,
+                    &intro,
+                    w.scroll,
+                    w.cursor,
+                    rows.saturating_sub(o.len()),
+                    [
+                        "Nein, ich starte die Station selbst",
+                        "Ja, einrichten und starten",
+                    ],
                 );
-                o.push(String::new());
-                o.push(p.row(w.cursor == 0, "Ja, einrichten und starten"));
-                o.push(p.row(w.cursor == 1, "Nein, ich starte die Station selbst"));
-                keys = "↑↓ wählen · Enter bestätigt · Esc zurück";
+                o.extend(block);
+                keys = if scrolls {
+                    "Bild ↑↓ blättert · ↑↓ wählen · Enter bestätigt · Esc zurück"
+                } else {
+                    "↑↓ wählen · Enter bestätigt · Esc zurück"
+                };
             }
             if let Some((l, m)) = &w.message {
-                o.push(String::new());
                 o.push(p.level(*l, m));
             }
         }
         Step::Done => {
             o.push(p.level(Level::Ok, &format!("{} ist eingerichtet.", w.agent())));
-            if w.step == Step::Done && !w.rooms.is_empty() && w.chosen_rooms().is_empty() {
-                // skipped the station
-            }
             for n in &w.notes {
                 o.extend(p.note(n));
             }
