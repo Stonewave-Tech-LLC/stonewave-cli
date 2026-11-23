@@ -1,3 +1,4 @@
-# Shell scripts must keep LF line endings, also in Windows checkouts.
+# Shell scripts and the installer templates must keep LF line endings, also in Windows checkouts.
 *.sh text eol=lf
 *.sh.in text eol=lf
+*.ps1.in text eol=lf

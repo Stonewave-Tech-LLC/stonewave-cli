@@ -1,9 +1,9 @@
 [package]
 name = "stonewave-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Stonewave server CLI: connect a server to Wave so its dev agent gets safe, scoped hands (early build)"
+description = "Stonewave CLI: connect coding agents and servers to Wave, with safe, scoped hands (early build)"
 license = "Apache-2.0"
 repository = "https://github.com/Stonewave-Tech-LLC/stonewave-cli"
 publish = false

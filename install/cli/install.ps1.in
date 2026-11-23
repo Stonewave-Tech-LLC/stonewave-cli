@@ -1,0 +1,246 @@
+# Stonewave CLI installer for one user (Windows PowerShell 5.1 or newer). No administrator rights.
+#
+#   irm https://stonewavetech.com/cli/install.ps1 | iex
+#   & ([scriptblock]::Create((irm https://stonewavetech.com/cli/install.ps1))) -Version 0.2.0 -NoPath
+#
+# Short on purpose, so you can read it before running it. It:
+#   1. downloads the manifest of the newest release over HTTPS (TLS 1.2 or better),
+#   2. downloads stonewave.exe and checks it against the manifest: size and SHA-256, and the Authenticode signature, which must be valid and
+#      made by the certificate of "Stonewave Tech LLC" (the name and the certificate's thumbprint are pinned below),
+#   3. runs the downloaded program once with --version, which must say what the manifest says,
+#   4. puts it into %LOCALAPPDATA%\Stonewave\bin\stonewave.exe (a running older copy is renamed aside, not killed),
+#   5. adds that folder to YOUR user PATH and says so (not with -NoPath).
+#
+# Parameters:
+#   -Version X.Y.Z   install exactly this release (also an older one). Without it: the newest, and never an older one than you have.
+#   -NoPath          do not touch PATH
+#   -DryRun          download and check everything, install nothing
+#   -BinDir DIR      install here instead of %LOCALAPPDATA%\Stonewave\bin
+#   -FromDir DIR     take manifest and program from this folder instead of the internet (same checks): for tests and offline installs
+# The whole installer is one script block (`& { ... } @args`): its functions, its variables, StrictMode and $ErrorActionPreference end with it,
+# so `irm | iex` leaves nothing of them in your session. The options reach it through @args (they are read by the block's own param list).
+& { # stonewave-installer-begin
+param(
+    [string]$Version = '',
+    [switch]$NoPath,
+    [switch]$DryRun,
+    [string]$BinDir = '',
+    [string]$FromDir = ''
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 2
+
+$Base = 'https://stonewavetech.com/cli'
+# Who signs the Windows build: the certificate's common name and its thumbprint(s), pinned when the release is made
+# (scripts/release-bundle.sh). More than one thumbprint is a certificate that was renewed.
+$SignerName = 'Stonewave Tech LLC'
+$SignerThumbprints = '@WIN_THUMBPRINTS@'
+
+function Say([string]$Text) { Write-Host "  $Text" }
+function Fail([string]$Text) { throw "stonewave install: $Text" }
+
+# ---------------------------------------------------------------- the manifest
+
+# What came from outside must look exactly like what we expect before it is used in a path or a command.
+function Read-Manifest([string]$Path, [string]$Target) {
+    $lines = @(Get-Content -LiteralPath $Path)
+    if ($lines.Count -lt 3 -or $lines[0].Trim() -ne 'stonewave-manifest 1') { Fail 'the manifest is not in a format this installer knows' }
+    $m = @{ Version = ''; Commit = ''; File = ''; Sha = ''; Size = '' }
+    foreach ($line in $lines) {
+        $w = @($line -split '\s+' | Where-Object { $_ -ne '' })
+        if ($w.Count -ge 2 -and $w[0] -eq 'version') { $m.Version = $w[1] }
+        elseif ($w.Count -ge 2 -and $w[0] -eq 'commit') { $m.Commit = $w[1] }
+        elseif ($w.Count -ge 5 -and $w[0] -eq 'file' -and $w[1] -eq $Target) { $m.Sha = $w[2]; $m.Size = $w[3]; $m.File = $w[4] }
+    }
+    if ($m.Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { Fail 'the manifest has no usable version' }
+    if ($m.Commit -notmatch '^[0-9a-f]{7,40}$') { Fail 'the manifest has no usable commit' }
+    if ($m.File -eq '') { Fail "release $($m.Version) has no build for $Target" }
+    if ($m.Sha -notmatch '^[0-9a-f]{64}$') { Fail "the manifest has no usable checksum for $Target" }
+    if ($m.Size -notmatch '^[0-9]{1,12}$') { Fail "the manifest has no usable size for $Target" }
+    if ($m.File -ne "stonewave-$($m.Version)-$Target.exe") { Fail "the manifest names $($m.File) for $Target, which does not fit" }
+    return $m
+}
+
+function Get-Remote([string]$Relative, [string]$Dest) {
+    if ($FromDir -ne '') {
+        $src = Join-Path $FromDir ($Relative -replace '/', '\')
+        if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { Fail "not found in ${FromDir}: $Relative" }
+        Copy-Item -LiteralPath $src -Destination $Dest
+        return
+    }
+    # PowerShell 5.1 can start with TLS 1.0 on some systems: TLS 1.2 is ADDED to what is allowed (nothing is taken away, and TLS 1.3 is not
+    # forced on a .NET that does not do it well), and the setting is put back afterwards
+    $oldProtocol = [Net.ServicePointManager]::SecurityProtocol
+    [Net.ServicePointManager]::SecurityProtocol = $oldProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $old = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try {
+        Invoke-WebRequest -UseBasicParsing -Uri "$Base/$Relative" -OutFile $Dest -TimeoutSec 300
+    } catch {
+        Fail "download failed: $Base/$Relative ($($_.Exception.Message))"
+    } finally {
+        $ProgressPreference = $old
+        [Net.ServicePointManager]::SecurityProtocol = $oldProtocol
+    }
+}
+
+# ---------------------------------------------------------------- the checks
+
+# Valid signature, from the pinned certificate, or the end.
+function Test-StonewaveSignature([string]$Path, [string]$Name, [string]$Thumbprints) {
+    if ($Thumbprints -match '^@') { Fail 'this installer was not prepared for Windows (no certificate pinned). Nothing was installed.' }
+    $allowed = @($Thumbprints -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { $_.ToUpperInvariant() })
+    if ($allowed.Count -eq 0) { Fail 'no certificate is pinned. Nothing was installed.' }
+    $sig = Get-AuthenticodeSignature -FilePath $Path
+    if ($sig.Status -ne 'Valid') { Fail "the signature of the download is not valid ($($sig.Status)). Nothing was installed." }
+    $cert = $sig.SignerCertificate
+    if ($null -eq $cert) { Fail 'the download has no signer certificate. Nothing was installed.' }
+    # the common name must be exactly ours (a lookalike such as "Stonewave Tech LLC Ltd" or a longer subject does not pass)
+    if ($cert.Subject -notmatch ('(^|,\s*)CN=' + [regex]::Escape($Name) + '(,|$)')) { Fail "the download is signed by '$($cert.Subject)', not by $Name. Nothing was installed." }
+    if ($allowed -notcontains $cert.Thumbprint.ToUpperInvariant()) { Fail "the signing certificate ($($cert.Thumbprint)) is not one this installer pins. Nothing was installed." }
+    Say "signature ok ($Name, certificate $($cert.Thumbprint))"
+}
+
+# What a program says to --version (an empty text if it cannot be run).
+function Get-BinaryVersion([string]$Path) {
+    try {
+        $out = & $Path --version 2>$null
+        return ((@($out) | Select-Object -First 1) -as [string]).Trim()
+    } catch {
+        return ''
+    }
+}
+
+function Test-Older([string]$A, [string]$B) { return ([version]$A) -lt ([version]$B) }
+
+# ---------------------------------------------------------------- PATH (the user's own, not the machine's)
+
+# Adds a folder to the USER path in the registry. The old value is read without expanding %VARIABLES% and written back as an expandable
+# string, so what was in it stays as it was. Returns $true when it changed something.
+function Add-ToUserPath([string]$Dir, [string]$SubKey = 'Environment') {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($SubKey, $true)
+    if ($null -eq $key) { Fail "cannot open HKCU\$SubKey" }
+    try {
+        $old = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $want = $Dir.TrimEnd('\')
+        foreach ($e in ($old -split ';')) {
+            # an entry may be written with %LOCALAPPDATA% and the like: it is compared as it reads once expanded
+            $here = [Environment]::ExpandEnvironmentVariables($e.Trim()).TrimEnd('\')
+            if ($here -ieq [Environment]::ExpandEnvironmentVariables($want)) { return $false }
+        }
+        $new = if ($old.Trim() -eq '') { $Dir } else { $old.TrimEnd(';') + ';' + $Dir }
+        $key.SetValue('Path', $new, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+    } finally {
+        $key.Close()
+    }
+    if ($SubKey -eq 'Environment') {
+        # setting and removing a variable makes Windows tell running programs that the environment changed
+        [Environment]::SetEnvironmentVariable('STONEWAVE_PATH_CHANGED', '1', 'User')
+        [Environment]::SetEnvironmentVariable('STONEWAVE_PATH_CHANGED', $null, 'User')
+    }
+    return $true
+}
+
+# ---------------------------------------------------------------- the whole thing
+
+function Install-Stonewave {
+    if ($Version -ne '' -and $Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { Fail '-Version must look like 0.2.0' }
+    if (-not [Environment]::Is64BitOperatingSystem) { Fail 'this needs a 64-bit Windows' }
+    $target = 'x86_64-windows'
+    $bin = $BinDir
+    if ($bin -eq '') { $bin = Join-Path $env:LOCALAPPDATA 'Stonewave\bin' }
+    if (-not [IO.Path]::IsPathRooted($bin)) { Fail '-BinDir must be a full path' }
+    Say "Stonewave CLI installer: $target, into $bin"
+    New-Item -ItemType Directory -Force -Path $bin | Out-Null
+    $tmp = Join-Path $bin ('.stonewave-install.' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    try {
+        if ($Version -ne '') { Get-Remote "$Version/manifest.txt" (Join-Path $tmp 'manifest.txt') }
+        else { Get-Remote 'latest/manifest.txt' (Join-Path $tmp 'manifest.txt') }
+        $m = Read-Manifest (Join-Path $tmp 'manifest.txt') $target
+        if ($Version -ne '' -and $m.Version -ne $Version) { Fail "asked for $Version, the manifest is for $($m.Version)" }
+        Say "release   $($m.Version) ($($m.Commit))"
+
+        $exe = Join-Path $bin 'stonewave.exe'
+        $want = "stonewave $($m.Version) ($($m.Commit))"
+        $installedLine = ''
+        if (Test-Path -LiteralPath $exe -PathType Leaf) {
+            $installedLine = Get-BinaryVersion $exe
+            if ($installedLine -match '^stonewave ([0-9]+\.[0-9]+\.[0-9]+)') {
+                Say "installed  $installedLine"
+                if ($Version -eq '') {
+                    if (Test-Older $m.Version $Matches[1]) { Fail "you have $($Matches[1]), which is newer than the latest release $($m.Version). To go back, say so: -Version $($m.Version)" }
+                    if ($installedLine -eq $want) {
+                        Say 'already up to date'
+                        Show-PathHelp $bin
+                        return
+                    }
+                }
+            }
+        }
+
+        $file = Join-Path $tmp $m.File
+        Say "downloading $($m.File)"
+        Get-Remote "$($m.Version)/$($m.File)" $file
+        $size = (Get-Item -LiteralPath $file).Length
+        if ([string]$size -ne $m.Size) { Fail "the size is $size, the manifest says $($m.Size). Nothing was installed." }
+        $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+        Say "sha256    $hash"
+        if ($hash -ne $m.Sha) { Fail "the checksum does not match the manifest ($($m.Sha)). Nothing was installed." }
+        Say 'checksum ok'
+        Test-StonewaveSignature $file $SignerName $SignerThumbprints
+        # the program has been checked: now it may run once, to say who it is
+        $ran = Get-BinaryVersion $file
+        if ($ran -ne $want) { Fail "the program says '$ran', not '$want'. Nothing was installed." }
+        Say "runs      $ran"
+
+        if ($DryRun) { Say "dry run: would install $exe"; return }
+        # a running older copy cannot be overwritten, but it can be renamed: it keeps running, the new one takes its place
+        $aside = $null
+        if (Test-Path -LiteralPath $exe) {
+            $aside = "$exe.old-$PID"
+            Move-Item -LiteralPath $exe -Destination $aside -Force
+        }
+        try {
+            Move-Item -LiteralPath $file -Destination $exe -Force
+        } catch {
+            if ($aside) { Move-Item -LiteralPath $aside -Destination $exe -Force }
+            Fail "cannot put $exe in place: $($_.Exception.Message)"
+        }
+        if ($aside) { Remove-Item -LiteralPath $aside -Force -ErrorAction SilentlyContinue }
+        Get-ChildItem -LiteralPath $bin -Filter 'stonewave.exe.old-*' -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+        Say "installed $exe"
+        Show-PathHelp $bin
+        Say 'next: stonewave          (the menu)     stonewave doctor     (a read-only check)'
+    } finally {
+        Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Show-PathHelp([string]$Bin) {
+    $here = @(($env:Path -split ';') | ForEach-Object { $_.Trim().TrimEnd('\') })
+    if ($here -icontains $Bin.TrimEnd('\')) { return }
+    if ($NoPath -or $DryRun) {
+        Say "$Bin is not on your PATH; run $Bin\stonewave.exe or add the folder yourself"
+        return
+    }
+    if (Add-ToUserPath $Bin) {
+        Say "added $Bin to your user PATH (not the machine's). Open a new terminal to use 'stonewave' by name."
+    } else {
+        Say "$Bin is already in your user PATH. Open a new terminal to use 'stonewave' by name."
+    }
+    $env:Path = $env:Path.TrimEnd(';') + ';' + $Bin
+}
+
+# Dot-sourcing this file (`. .\install.ps1`) only defines the functions (the tests use it); running or piping it installs.
+if ($MyInvocation.InvocationName -ne '.') {
+    try {
+        Install-Stonewave
+    } catch {
+        Write-Host ('  ' + $_.Exception.Message) -ForegroundColor Red
+        # `irm | iex` runs in the caller's session: never `exit` there, it would close their window
+        $global:LASTEXITCODE = 1
+    }
+}
+} @args # stonewave-installer-end

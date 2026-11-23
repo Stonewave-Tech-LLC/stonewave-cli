@@ -1,0 +1,330 @@
+#!/bin/sh
+# Stonewave CLI installer for one user. No root, no sudo.
+#
+#   curl --proto '=https' --tlsv1.2 -fsSL https://stonewavetech.com/cli/install.sh | sh
+#   curl --proto '=https' --tlsv1.2 -fsSL https://stonewavetech.com/cli/install.sh | sh -s -- --version 0.2.0 --add-to-path
+#
+# Short on purpose, so you can read it before running it. It:
+#   1. works out your system (Linux or macOS, x86_64 or arm64),
+#   2. downloads the manifest of the newest release over HTTPS (TLS 1.2 or better),
+#   3. downloads the program and checks it against the manifest: size and SHA-256 on every system, and on macOS also the Apple code
+#      signature, which must be a Developer ID signature of our team (pinned below),
+#   4. runs the downloaded program once with --version, which must say what the manifest says,
+#   5. puts it into ~/.local/bin/stonewave (replacing an older one in one step),
+#   6. tells you if that folder is not on your PATH. It changes a shell startup file only if you ask (--add-to-path) or say yes.
+#
+# On Linux the only check is the SHA-256 from the manifest, which comes from the same HTTPS site as the program: it protects against a
+# damaged or swapped download, not against someone who controls stonewavetech.com. (Windows and macOS builds are code-signed.)
+#
+# Options:
+#   --version X.Y.Z   install exactly this release (also an older one). Without it: the newest, and never an older one than you have.
+#   --add-to-path     add the folder to your PATH in your shell startup file, saying which one
+#   --no-path         do not touch or ask about PATH
+#   --dry-run         download and check everything, install nothing
+#   --bin-dir DIR     install here instead of ~/.local/bin
+#   --from-dir DIR    take manifest and program from this folder instead of the internet (same checks): for tests and offline installs
+#   -h, --help        this text
+set -eu
+
+BASE="https://stonewavetech.com/cli"
+# The Apple team that signs the macOS build (pinned when the release is made, see scripts/release-bundle.sh).
+MAC_TEAM_ID="@MAC_TEAM_ID@"
+
+say() { printf '  %s\n' "$*"; }
+warn() { printf '  ! %s\n' "$*" >&2; }
+fail() {
+    printf '  stonewave install: %s\n' "$*" >&2
+    exit 1
+}
+
+# ---------------------------------------------------------------- small helpers
+
+# A value that came from outside must look exactly like what we expect before it is used in a path, a command or a file.
+is_semver() { printf '%s\n' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; }
+is_sha256() { printf '%s\n' "$1" | grep -Eq '^[0-9a-f]{64}$'; }
+is_number() { printf '%s\n' "$1" | grep -Eq '^[0-9]{1,12}$'; }
+# a build of unpublished code (-dirty) is not a release
+is_commit() { printf '%s\n' "$1" | grep -Eq '^[0-9a-f]{7,40}$'; }
+is_file_name() { printf '%s\n' "$1" | grep -Eq '^stonewave-[0-9]+\.[0-9]+\.[0-9]+-[a-z0-9_]+-[a-z]+(\.exe)?$'; }
+
+# 1 if $1 is older than $2, else 0 (both x.y.z)
+ver_older() {
+    IFS=. read -r a1 a2 a3 <<EOF
+$1
+EOF
+    IFS=. read -r b1 b2 b3 <<EOF
+$2
+EOF
+    if [ "$a1" -ne "$b1" ]; then [ "$a1" -lt "$b1" ] && echo 1 || echo 0; return; fi
+    if [ "$a2" -ne "$b2" ]; then [ "$a2" -lt "$b2" ] && echo 1 || echo 0; return; fi
+    [ "$a3" -lt "$b3" ] && echo 1 || echo 0
+}
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 -r "$1" | cut -d' ' -f1
+    else
+        fail "needs sha256sum, shasum or openssl to check the download"
+    fi
+}
+
+# fetch URL_PATH DEST: over HTTPS (TLS 1.2 or better), or from --from-dir
+fetch() {
+    if [ -n "$from_dir" ]; then
+        [ -f "$from_dir/$1" ] || fail "not found in $from_dir: $1"
+        cp "$from_dir/$1" "$2"
+    elif command -v curl >/dev/null 2>&1; then
+        curl -fsSL --proto '=https' --tlsv1.2 --retry 2 --connect-timeout 20 --max-time 300 -o "$2" "$BASE/$1" || fail "download failed: $BASE/$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --https-only --secure-protocol=TLSv1_2 --tries=3 --timeout=60 -O "$2" "$BASE/$1" || fail "download failed: $BASE/$1 (a BusyBox wget cannot do HTTPS with these settings: install curl, or a full wget)"
+    else
+        fail "needs curl or wget"
+    fi
+}
+
+# ---------------------------------------------------------------- the manifest
+
+# read_manifest FILE TARGET: sets m_version m_commit m_file m_sha m_size, all checked
+read_manifest() {
+    [ "$(head -n 1 "$1")" = "stonewave-manifest 1" ] || fail "the manifest is not in a format this installer knows"
+    m_version= m_commit= m_file= m_sha= m_size=
+    while read -r kw a b c d; do
+        case $kw in
+        version) m_version=$a ;;
+        commit) m_commit=$a ;;
+        file) if [ "$a" = "$2" ]; then m_sha=$b m_size=$c m_file=$d; fi ;;
+        esac
+    done <"$1"
+    is_semver "$m_version" || fail "the manifest has no usable version"
+    is_commit "$m_commit" || fail "the manifest has no usable commit"
+    [ -n "$m_file" ] || fail "release $m_version has no build for $2"
+    is_sha256 "$m_sha" || fail "the manifest has no usable checksum for $2"
+    is_number "$m_size" || fail "the manifest has no usable size for $2"
+    is_file_name "$m_file" || fail "the manifest names a file this installer does not accept"
+    case $m_file in
+    "stonewave-$m_version-$2" | "stonewave-$m_version-$2.exe") ;;
+    *) fail "the manifest names $m_file for $2, which does not fit" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- macOS: the code signature
+
+# check_macos_signature FILE: a valid Developer ID signature of our team, or the end
+check_macos_signature() {
+    case "$MAC_TEAM_ID" in
+    @*) fail "this installer was not prepared for macOS (no team id pinned). Nothing was installed." ;;
+    esac
+    printf '%s\n' "$MAC_TEAM_ID" | grep -Eq '^[A-Z0-9]{10}$' || fail "the team id pinned in this installer is not valid. Nothing was installed."
+    command -v codesign >/dev/null 2>&1 || fail "codesign is missing, the signature cannot be checked"
+    # Without -R, codesign checks the file against the requirement written INTO the file, which its maker chooses: a certificate of the maker's
+    # own would pass. This requirement is ours: the chain ends at Apple's root (anchor apple generic), runs through Apple's Developer ID
+    # Certification Authority (the intermediate, OID 1.2.840.113635.100.6.2.6), the leaf is a "Developer ID Application" certificate (OID
+    # 1.2.840.113635.100.6.1.13), and its organizational unit is our team. The "=" in front makes it a text requirement.
+    mac_req="anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$MAC_TEAM_ID\""
+    codesign --verify --strict "-R=$mac_req" "$1" >/dev/null 2>&1 || fail "the code signature of the download is not a valid Developer ID signature of our team. Nothing was installed."
+    cs_info=$(codesign -dv --verbose=4 "$1" 2>&1) || fail "cannot read the code signature. Nothing was installed."
+    printf '%s\n' "$cs_info" | grep -q '^Authority=Developer ID Application' || fail "the download is not signed with a Developer ID certificate. Nothing was installed."
+    cs_team=$(printf '%s\n' "$cs_info" | sed -n 's/^TeamIdentifier=//p' | head -n 1)
+    [ -n "$cs_team" ] && [ "$cs_team" = "$MAC_TEAM_ID" ] || fail "the download is signed by another team ($cs_team). Nothing was installed."
+    say "signature ok (Developer ID, team $cs_team)"
+    # Gatekeeper's verdict on a bare command-line tool is informational: it often says "not an app" for a program that is notarized
+    if command -v spctl >/dev/null 2>&1; then
+        verdict=$(spctl --assess --type execute -vv "$1" 2>&1 | head -n 2 | tr '\n' ' ' || true)
+        say "gatekeeper: ${verdict:-no answer}"
+    fi
+}
+
+# ---------------------------------------------------------------- PATH
+
+shell_rc() {
+    case "$(basename "${SHELL:-sh}")" in
+    zsh) printf '%s\n' "${ZDOTDIR:-$HOME}/.zshrc" ;;
+    bash) if [ "$os" = macos ]; then printf '%s\n' "$HOME/.bash_profile"; else printf '%s\n' "$HOME/.bashrc"; fi ;;
+    *) printf '%s\n' "$HOME/.profile" ;;
+    esac
+}
+
+# a yes from the person at the keyboard, also when the script itself is piped in (the question goes to the terminal, not to stdin)
+ask_yes() {
+    # only when a person can see the question: output goes to a terminal (a script that captures the output is never asked)
+    [ -t 1 ] || [ -t 2 ] || return 1
+    ( : </dev/tty ) 2>/dev/null || return 1
+    printf '  %s [y/N] ' "$1" >/dev/tty
+    read -r answer </dev/tty || return 1
+    case $answer in y | Y | yes | YES | j | J | ja) return 0 ;; *) return 1 ;; esac
+}
+
+add_to_path() {
+    rc=$(shell_rc)
+    if [ "$bin" = "$HOME/.local/bin" ]; then
+        line='export PATH="$HOME/.local/bin:$PATH"'
+    else
+        # a folder with a quote or a dollar sign in it would change what the line means
+        printf '%s\n' "$bin" | grep -Eq '^[A-Za-z0-9_./ +@:,=-]+$' || fail "the folder name has characters that cannot be put into a startup file safely; add it to PATH yourself"
+        line="export PATH=\"$bin:\$PATH\""
+    fi
+    if [ -f "$rc" ] && grep -q '# added by the Stonewave installer' "$rc"; then
+        say "$rc already has the Stonewave PATH line"
+        return 0
+    fi
+    {
+        printf '\n# added by the Stonewave installer\n%s\n' "$line"
+    } >>"$rc" || fail "cannot write $rc"
+    say "added this line to $rc:  $line"
+    say "open a new terminal (or run: . $rc) to use it"
+}
+
+# ---------------------------------------------------------------- the whole thing
+
+usage() {
+    cat <<'USAGE'
+Stonewave CLI installer for one user (no root, no sudo).
+  --version X.Y.Z   install exactly this release (also an older one); default: the newest, never older than what you have
+  --add-to-path     add the install folder to PATH in your shell startup file (says which)
+  --no-path         do not touch or ask about PATH
+  --dry-run         download and check everything, install nothing
+  --bin-dir DIR     install here instead of ~/.local/bin
+  --from-dir DIR    take manifest and program from a folder instead of the internet (same checks)
+USAGE
+}
+
+main() {
+    want_version= add_path=ask dry_run=no bin_dir= from_dir=
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --version)
+            [ $# -ge 2 ] || fail "--version needs a number like 0.2.0"
+            want_version=$2
+            shift
+            ;;
+        --add-to-path) add_path=yes ;;
+        --no-path) add_path=no ;;
+        --dry-run) dry_run=yes ;;
+        --bin-dir)
+            [ $# -ge 2 ] || fail "--bin-dir needs a folder"
+            bin_dir=$2
+            shift
+            ;;
+        --from-dir)
+            [ $# -ge 2 ] || fail "--from-dir needs a folder"
+            from_dir=$2
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown option: $1 (try --help)" ;;
+        esac
+        shift
+    done
+    [ -z "$want_version" ] || is_semver "$want_version" || fail "--version must look like 0.2.0"
+
+    [ -n "${HOME:-}" ] || fail "HOME is not set"
+    [ "$(id -u)" -ne 0 ] || fail "run this as your normal user, not as root: it installs into your own folder and needs no sudo"
+
+    case "$(uname -s)" in
+    Linux) os=linux ;;
+    Darwin) os=macos ;;
+    *) fail "this installer is for Linux and macOS (Windows: irm https://stonewavetech.com/cli/install.ps1 | iex)" ;;
+    esac
+    case "$(uname -m)" in
+    x86_64 | amd64) arch=x86_64 ;;
+    aarch64 | arm64) arch=aarch64 ;;
+    *) fail "unsupported CPU: $(uname -m)" ;;
+    esac
+    # a shell that runs under Rosetta says x86_64 on an Apple silicon Mac: the native build is wanted
+    if [ "$os" = macos ] && [ "$arch" = x86_64 ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = 1 ]; then
+        arch=aarch64
+    fi
+    target="$arch-$os"
+    bin=${bin_dir:-$HOME/.local/bin}
+    case "$bin" in /*) ;; *) fail "--bin-dir must be a full path" ;; esac
+
+    say "Stonewave CLI installer: $target, into $bin"
+    mkdir -p "$bin" || fail "cannot make $bin"
+    tmp=$(mktemp -d "$bin/.stonewave-install.XXXXXX") || fail "cannot make a temporary folder in $bin"
+    trap 'rm -rf "$tmp"' EXIT
+    trap 'rm -rf "$tmp"; exit 130' INT TERM HUP
+
+    if [ -n "$want_version" ]; then
+        fetch "$want_version/manifest.txt" "$tmp/manifest.txt"
+    else
+        fetch "latest/manifest.txt" "$tmp/manifest.txt"
+    fi
+    read_manifest "$tmp/manifest.txt" "$target"
+    [ -z "$want_version" ] || [ "$m_version" = "$want_version" ] || fail "asked for $want_version, the manifest is for $m_version"
+    say "release   $m_version ($m_commit)"
+
+    installed_line=
+    installed=
+    if [ -x "$bin/stonewave" ]; then
+        installed_line=$("$bin/stonewave" --version 2>/dev/null | head -n 1 || true)
+        installed=$(printf '%s\n' "$installed_line" | sed -n 's/^stonewave \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+        [ -z "$installed" ] || say "installed  $installed_line"
+    fi
+    if [ -z "$want_version" ] && [ -n "$installed" ]; then
+        if [ "$(ver_older "$m_version" "$installed")" = 1 ]; then
+            fail "you have $installed, which is newer than the latest release $m_version. To go back, say so: --version $m_version"
+        fi
+        if [ "$installed_line" = "stonewave $m_version ($m_commit)" ]; then
+            say "already up to date"
+            path_help
+            return 0
+        fi
+    fi
+
+    say "downloading $m_file"
+    fetch "$m_version/$m_file" "$tmp/$m_file"
+    got_size=$(wc -c <"$tmp/$m_file" | tr -d ' ')
+    [ "$got_size" = "$m_size" ] || fail "the size is $got_size, the manifest says $m_size. Nothing was installed."
+    got=$(sha256_of "$tmp/$m_file")
+    say "sha256    $got"
+    [ "$got" = "$m_sha" ] || fail "the checksum does not match the manifest ($m_sha). Nothing was installed."
+    say "checksum ok"
+    if [ "$os" = macos ]; then
+        check_macos_signature "$tmp/$m_file"
+    fi
+    chmod 755 "$tmp/$m_file"
+    # the program has been checked: now it may run once, to say who it is
+    ran=$("$tmp/$m_file" --version 2>/dev/null | head -n 1 || true)
+    [ "$ran" = "stonewave $m_version ($m_commit)" ] || fail "the program says '$ran', not 'stonewave $m_version ($m_commit)'. Nothing was installed."
+    say "runs      $ran"
+
+    if [ "$dry_run" = yes ]; then
+        say "dry run: would install $bin/stonewave"
+        return 0
+    fi
+    # one step: a running copy keeps working, a failed step leaves the old one
+    mv -f "$tmp/$m_file" "$bin/stonewave" || fail "cannot replace $bin/stonewave"
+    say "installed $bin/stonewave"
+    path_help
+    say "next: stonewave          (the menu)     stonewave doctor     (a read-only check of a server)"
+}
+
+path_help() {
+    case ":$PATH:" in *":$bin:"*) return 0 ;; esac
+    if [ "$add_path" = no ]; then
+        say "$bin is not on your PATH; run $bin/stonewave or add the folder yourself"
+        return 0
+    fi
+    say "$bin is not on your PATH yet."
+    if [ "$dry_run" = yes ]; then
+        return 0
+    fi
+    if [ "$add_path" = yes ]; then
+        add_to_path
+    elif ask_yes "Add it to $(shell_rc)?"; then
+        add_to_path
+    else
+        say "to use it by name, add this line to your shell startup file:  export PATH=\"$bin:\$PATH\"   (or run again with --add-to-path)"
+    fi
+}
+
+# For the tests only: with STONEWAVE_INSTALL_SOURCED=1 in the environment this file only defines its functions and does nothing else (it ends with
+# exit status 0 and no output, which is NOT an install). Never set it for a real install.
+[ "${STONEWAVE_INSTALL_SOURCED:-}" = 1 ] || main "$@"
