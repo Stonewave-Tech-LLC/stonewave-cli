@@ -103,16 +103,43 @@ try {
     Ok
     Test-StonewaveSignature $donor $subject "$('0' * 40),$caPin" 6>$null     # several authorities: one of them is enough
     Ok
-    Test-StonewaveSignature $donor $subject $rootPin 6>$null                 # any authority above the certificate counts
-    Ok
+    Expect ($donorChain.ChainElements.Count -ge 3) 'the stand-in has a chain of at least three: certificate, authority, root'
+    Throws { Test-StonewaveSignature $donor $subject $rootPin } 'not issued under the authority' 'the root of the chain is not an authority that counts (a root pin would be every certificate under that root)'
     Throws { Test-StonewaveSignature $donor 'CN=Stonewave Tech LLC, O=Stonewave Tech LLC, L=Sheridan, S=Wyoming, C=US' $caPin } 'not by' 'another subject'
     Throws { Test-StonewaveSignature $donor ($subject + ', OU=x') $caPin } 'not by' 'a subject that only starts like the pinned one'
     Throws { Test-StonewaveSignature $donor $subject.ToLowerInvariant() $caPin } 'not by' 'the subject is compared exactly, also the case'
     Throws { Test-StonewaveSignature $donor $subject ('0' * 40) } 'not issued under the authority' 'another authority'
     Throws { Test-StonewaveSignature $donor $subject $thumb } 'not issued under the authority' 'the certificate itself is not an authority above itself'
+    # the certificates inside the signature
+    # (the stand-in is signed through a catalog, with nothing inside the file: look for a program that carries its signature)
+    $embDonor = $null
+    foreach ($f in (Get-ChildItem "$env:ProgramFiles\*\*.exe", "$env:ProgramFiles\*\*\*.exe", "${env:ProgramFiles(x86)}\*\*.exe", "$env:windir\*.exe" -ErrorAction SilentlyContinue | Select-Object -First 600)) {
+        if ($f.Length -gt 20MB) { continue }
+        $c = @(Get-EmbeddedCertificates $f.FullName)
+        if ($c.Count -ge 2) {
+            $sg = Get-AuthenticodeSignature -FilePath $f.FullName
+            if ($sg.Status -eq 'Valid' -and $sg.SignerCertificate -and (@($c | Where-Object { $_.Thumbprint -eq $sg.SignerCertificate.Thumbprint }).Count -eq 1)) { $embDonor = $f.FullName; break }
+        }
+    }
+    if ($embDonor) { Ok } else { Write-Host 'note: no program with an embedded signature found on this machine; that check is skipped' }
+    Expect (@(Get-EmbeddedCertificates $donor).Count -ge 0) 'a catalog-signed program gives nothing or something, never an error'
+    Expect (@(Get-EmbeddedCertificates $plain).Count -eq 0) 'a file that is not a program gives none'
+    $cut = Join-Path $T 'cut.exe'
+    [IO.File]::WriteAllBytes($cut, ([IO.File]::ReadAllBytes($donor))[0..4000])
+    Expect (@(Get-EmbeddedCertificates $cut).Count -eq 0) 'a program cut short gives none'
+    Expect (@(Get-EmbeddedCertificates (Join-Path $T 'does-not-exist.exe')).Count -eq 0) 'a missing file gives none'
     Throws { Test-StonewaveSignature $donor $subject '@WIN_CA_THUMBPRINTS@' } 'not prepared for Windows' 'an installer that was not prepared'
     Throws { Test-StonewaveSignature $donor $subject '' } 'not prepared for Windows' 'nothing pinned'
     Throws { Test-StonewaveSignature $plain $subject $caPin } 'not valid' 'an unsigned file'
+    if ($embDonor) {
+        $es = (Get-AuthenticodeSignature -FilePath $embDonor).SignerCertificate
+        $ec = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+        [void]$ec.Build($es)
+        $ePin = $ec.ChainElements[1].Certificate.Thumbprint.ToUpperInvariant()
+        Test-StonewaveSignature $embDonor $es.Subject $ePin 6>$null
+        Ok
+        Throws { Test-StonewaveSignature $embDonor $es.Subject ('0' * 40) } 'not issued under the authority' 'a program that carries its signature, another pin'
+    }
     Throws { Test-StonewaveSignature $changed $subject $caPin } 'not valid' 'a signed file with a changed byte'
     # the legacy pin of one release: the certificate's own thumbprint, with the right subject
     Test-StonewaveSignature $donor $subject ('0' * 40) @($thumb) 6>$null
@@ -132,8 +159,9 @@ try {
             $script:made += $c
             return $c
         }
-        $ca1 = New-TestCert 'CN=Test Authority One' -Authority
-        $ca2 = New-TestCert 'CN=Test Authority Two' -Authority
+        $root1 = New-TestCert 'CN=Test Root One' -Authority
+        $ca1 = New-TestCert 'CN=Test Authority One' $root1 -Authority      # like the real thing: certificate -> authority -> root
+        $ca2 = New-TestCert 'CN=Test Authority Two' $root1 -Authority      # another authority under the same root
         $leafA = New-TestCert 'CN=Stonewave Tech LLC, O=Stonewave Tech LLC, L=Sheridan, S=Wyoming, C=US' $ca1
         $want = $leafA.Subject
         $leafA2 = New-TestCert $want $ca1                       # another certificate of the same subject under the same authority (the next one Azure makes)
@@ -142,6 +170,7 @@ try {
         $other = New-TestCert 'CN=Somebody Else' $ca1           # our authority, another subject
         Expect ($leafA2.Thumbprint -ne $leafA.Thumbprint -and $leafA2.Subject -ceq $want -and $leafB.Subject -ceq $want -and $self.Subject -ceq $want) 'the test certificates are what they should be'
         $pin = @($ca1.Thumbprint.ToUpperInvariant())
+        $rootOnly = @($root1.Thumbprint.ToUpperInvariant())
         function Chain($c, [switch]$Trusted) { if ($Trusted) { return Get-SignerChain $c } else { return Get-SignerChain $c -TestOnlyAcceptUntrustedRoot } }
 
         Expect ((Test-SignerPins $leafA (Chain $leafA) $want $pin @()) -match 'issued under') 'a certificate under the pinned authority passes'
@@ -150,6 +179,14 @@ try {
         Throws { Test-SignerPins $self (Chain $self) $want $pin @() } 'not issued under the authority' 'a self-signed certificate with the same subject fails'
         Throws { Test-SignerPins $self (Chain $self) $want @($self.Thumbprint.ToUpperInvariant()) @() } 'not issued under the authority' 'its own thumbprint as an authority does not help'
         Throws { Test-SignerPins $other (Chain $other) $want $pin @() } 'not by' 'our authority and another subject fails'
+        Expect ((Chain $leafA).Thumbprints.Count -eq 3) 'the made chain is certificate, authority, root'
+        Throws { Test-SignerPins $leafA (Chain $leafA) $want $rootOnly @() } 'not issued under the authority' 'the root as the pin is refused (it would be every certificate under that root)'
+        Throws { Test-SignerPins $leafB (Chain $leafB) $want $rootOnly @() } 'not issued under the authority' 'also for the other authority under the same root'
+        Throws { Test-SignerPins $leafA (Chain $leafA) $want @($leafA.Thumbprint.ToUpperInvariant()) @() } 'not issued under the authority' 'the certificate as its own pin is refused'
+        # a made-up chain of two (the certificate and a root that is the "authority"): the root is not an authority that counts
+        $evilRoot = New-TestCert 'CN=Evil Root' -Authority
+        $evilLeaf = New-TestCert $want $evilRoot
+        Throws { Test-SignerPins $evilLeaf (Chain $evilLeaf) $want @($evilRoot.Thumbprint.ToUpperInvariant()) @() } 'not issued under the authority' 'a made-up root as the "authority" is refused'
         # Windows must also trust the chain: an authority of our own made up has no trusted root
         $untrusted = Chain $leafA -Trusted
         Expect (-not $untrusted.Ok) 'a chain that ends in a root Windows does not trust is not ok'
@@ -157,8 +194,51 @@ try {
         # the legacy pin: that very certificate, nothing else
         Expect ((Test-SignerPins $leafA $untrusted $want @('0' * 40) @($leafA.Thumbprint.ToUpperInvariant())) -match 'certificate') 'the legacy leaf pin passes by itself'
         Throws { Test-SignerPins $leafA2 (Chain $leafA2) $want @('0' * 40) @($leafA.Thumbprint.ToUpperInvariant()) } 'not issued under the authority' 'but not for another certificate'
+
+        # a machine that has never seen the authority (offline, nothing cached): a made-up chain that was never built here, kept out of the stores
+        $root3 = New-TestCert 'CN=Test Root Three' -Authority
+        $ca3 = New-TestCert 'CN=Test Authority Three' $root3 -Authority
+        $leaf3 = New-TestCert $want $ca3
+        $forged = New-TestCert 'CN=Test Authority Three' -Authority          # same name as ca3, another key, signed by nobody we know
+        $raw = @{}
+        foreach ($c in @($root3, $ca3, $leaf3, $forged)) { $raw[$c.Thumbprint] = $c.RawData }
+        $t3 = $ca3.Thumbprint.ToUpperInvariant()
+        # (building a chain copies the authorities it meets into the user's "CA" store: out of there too, or the chain is found without the extra material)
+        foreach ($c in @($root3, $ca3, $leaf3, $forged)) { foreach ($st in 'My', 'CA') { Remove-Item -LiteralPath "Cert:\CurrentUser\$st\$($c.Thumbprint)" -Force -ErrorAction SilentlyContinue } }
+        # (a fresh PowerShell: the one running here remembers the certificates it has seen)
+        [IO.File]::WriteAllBytes((Join-Path $T 'c-leaf.cer'), $raw[$leaf3.Thumbprint])
+        [IO.File]::WriteAllBytes((Join-Path $T 'c-ca.cer'), $raw[$ca3.Thumbprint])
+        [IO.File]::WriteAllBytes((Join-Path $T 'c-root.cer'), $raw[$root3.Thumbprint])
+        [IO.File]::WriteAllBytes((Join-Path $T 'c-forged.cer'), $raw[$forged.Thumbprint])
+        $child = Join-Path $T 'chain-child.ps1'
+        @'
+param($Inner, $Dir, $Want, $Pin)
+$ErrorActionPreference = 'Stop'
+. $Inner
+function Cer($n) { New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 (,[IO.File]::ReadAllBytes((Join-Path $Dir "c-$n.cer"))) }
+$leaf = Cer 'leaf'
+function Pins($chain) { try { Test-SignerPins $leaf $chain $Want @($Pin) @() } catch { 'refused: ' + $_.Exception.Message } }
+$a = Get-SignerChain $leaf -TestOnlyAcceptUntrustedRoot
+"without ok=$($a.Ok) status=$($a.Status) n=$(@($a.Thumbprints).Count)"
+"without-pins $(Pins $a)"
+$b = Get-SignerChain $leaf -TestOnlyAcceptUntrustedRoot -Extra @((Cer 'ca'), (Cer 'root'))
+"with ok=$($b.Ok) status=$($b.Status) n=$(@($b.Thumbprints).Count)"
+"with-pins $(Pins $b)"
+$c = Get-SignerChain $leaf -TestOnlyAcceptUntrustedRoot -Extra @((Cer 'forged'))
+"forged ok=$($c.Ok) status=$($c.Status)"
+"forged-pins $(Pins $c)"
+'@ | Set-Content -Encoding UTF8 -LiteralPath $child
+        $co = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $child $innerFile $T $want $t3 2>&1 | Out-String)
+        Expect ($co -match 'without ok=False') "without the authority at hand the chain cannot be built  [$($co -replace '\s+', ' ')]"
+        Expect ($co -match 'without-pins refused: .*not valid') 'and the check refuses'
+        Expect ($co -match 'with ok=True status=\S+ n=3') 'with the certificates the signature carries the chain is built'
+        Expect ($co -match 'with-pins issued under') 'and the pinned authority is found in it'
+        Expect ($co -match 'forged ok=False') 'an authority that carries the right name but not the right key does not complete the chain'
+        Expect ($co -match 'forged-pins refused: .*not valid') 'and the check refuses'
     } finally {
-        foreach ($c in $made) { Remove-Item -LiteralPath "Cert:\CurrentUser\My\$($c.Thumbprint)" -Force -ErrorAction SilentlyContinue }
+        foreach ($c in $made) { foreach ($st in 'My', 'CA') { Remove-Item -LiteralPath "Cert:\CurrentUser\$st\$($c.Thumbprint)" -Force -ErrorAction SilentlyContinue } }
+        # and what chain building left in the "CA" store from our made-up authorities (only these subjects, made in this test)
+        foreach ($c in @(Get-ChildItem Cert:\CurrentUser\CA | Where-Object { $_.Subject -match '^CN=(Test (Root|Authority) (One|Two|Three)|Evil Root)$' })) { Remove-Item -LiteralPath "Cert:\CurrentUser\CA\$($c.Thumbprint)" -Force -ErrorAction SilentlyContinue }
     }
 
     # ---------------------------------------------------------------- the whole install, with the stand-in as the program

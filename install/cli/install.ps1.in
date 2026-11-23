@@ -37,7 +37,8 @@ $Base = 'https://stonewavetech.com/cli'
 # valid because it is timestamped), so a certificate's own thumbprint cannot be pinned for good. Pinned instead, all of it required:
 #   - the exact subject of the signer certificate,
 #   - the thumbprint of the authority that issued it ("Microsoft ID Verified Code Signing PCA 2021"; written in when the release is made,
-#     scripts/release-bundle.sh): it must be in the certificate's chain, which Windows builds up to a trusted root and checks for revocation,
+#     scripts/release-bundle.sh): it must be an intermediate of the certificate's chain (between the certificate and the root), which Windows
+#     builds up to a trusted root and checks for revocation,
 #   - Windows' own verdict on the signature (Valid), and the SHA-256 of the manifest.
 $SignerSubject = 'CN=Stonewave Tech LLC, O=Stonewave Tech LLC, L=Sheridan, S=Wyoming, C=US'
 $SignerCaThumbprints = '@WIN_CA_THUMBPRINTS@'
@@ -94,13 +95,45 @@ function Get-Remote([string]$Relative, [string]$Dest) {
 
 # ---------------------------------------------------------------- the checks
 
+# The certificates a program carries inside its Authenticode signature (the signer's and the authorities above it), read from the PE file's
+# certificate table. Windows builds a chain from what it has cached or can fetch (the authority's certificate is fetched from the address in the
+# certificate); with these as extra material it can build it on a machine that is offline and has never seen them. They are only candidates: a chain
+# still has to be signed link by link up to a root that is in the machine's own store, so this adds no trust. Anything unreadable gives nothing.
+function Get-EmbeddedCertificates([string]$Path) {
+    try {
+        $file = Get-Item -LiteralPath $Path
+        if ($file.Length -gt 64MB) { return @() }
+        $bytes = [IO.File]::ReadAllBytes($Path)
+        $pe = [int][BitConverter]::ToUInt32($bytes, 0x3C)
+        if ($pe -lt 64 -or $pe + 24 -gt $bytes.Length -or [Text.Encoding]::ASCII.GetString($bytes, $pe, 2) -ne 'PE') { return @() }
+        $opt = $pe + 24
+        $magic = [BitConverter]::ToUInt16($bytes, $opt)
+        if ($magic -eq 0x20B) { $dirs = $opt + 112 } elseif ($magic -eq 0x10B) { $dirs = $opt + 96 } else { return @() }
+        $off = [long][BitConverter]::ToUInt32($bytes, $dirs + 32)       # the fifth data directory: the certificate table (a file offset)
+        $size = [long][BitConverter]::ToUInt32($bytes, $dirs + 36)
+        if ($off -le 0 -or $size -lt 8 -or $off + $size -gt $bytes.Length) { return @() }
+        $len = [long][BitConverter]::ToUInt32($bytes, [int]$off)
+        $type = [BitConverter]::ToUInt16($bytes, [int]$off + 6)         # 2: a PKCS #7 signature
+        if ($type -ne 2 -or $len -lt 16 -or $len -gt $size) { return @() }
+        $der = New-Object byte[] ($len - 8)
+        [Array]::Copy($bytes, $off + 8, $der, 0, $len - 8)
+        Add-Type -AssemblyName System.Security
+        $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms
+        $cms.Decode($der)
+        return @($cms.Certificates | ForEach-Object { $_ })
+    } catch {
+        return @()
+    }
+}
+
 # The chain of a signer certificate, as Windows builds it (up to a trusted root), with its status and the thumbprints from the certificate up.
 # The leaf of a short-lived certificate has expired long before anybody installs: the chain is judged as of the time the certificate began,
 # when the signature (timestamped, and checked by Windows as Valid) was made. Revocation is asked online; only when the answer cannot be had
 # (no network, no list) the check is repeated from what is cached, then without, and then it says so. Anything else wrong ends it.
 # -TestOnlyAcceptUntrustedRoot is for the tests (certificates made on the spot have no trusted root); the installer itself never uses it.
-function Get-SignerChain([System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert, [switch]$TestOnlyAcceptUntrustedRoot) {
+function Get-SignerChain([System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert, [switch]$TestOnlyAcceptUntrustedRoot, $Extra = @()) {
     $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+    foreach ($c in @($Extra)) { if ($c) { [void]$chain.ChainPolicy.ExtraStore.Add($c) } }
     $chain.ChainPolicy.VerificationTime = $Cert.NotBefore.AddMinutes(1)
     $chain.ChainPolicy.UrlRetrievalTimeout = [TimeSpan]::FromSeconds(20)
     $chain.ChainPolicy.RevocationFlag = [System.Security.Cryptography.X509Certificates.X509RevocationFlag]::ExcludeRoot
@@ -123,15 +156,19 @@ function Get-SignerChain([System.Security.Cryptography.X509Certificates.X509Cert
 }
 
 # The pins, on a certificate and its chain: the exact subject, then either the certificate's own thumbprint (only the legacy one of a release)
-# or an issuing authority above it in the chain. Returns what it matched, or ends.
+# or an issuing authority between it and the root of its chain. Returns what it matched, or ends.
 function Test-SignerPins($Cert, $Chain, [string]$Subject, [string[]]$CaPins, [string[]]$LeafPins) {
     if ($Cert.Subject -cne $Subject) { Fail "the download is signed by '$($Cert.Subject)', not by '$Subject'. Nothing was installed." }
     $leaf = $Cert.Thumbprint.ToUpperInvariant()
     if (@($LeafPins) -contains $leaf) { return "certificate $leaf" }
     if (-not $Chain.Ok) { Fail "the chain of the signing certificate is not valid ($($Chain.Status)). Nothing was installed." }
-    $above = @($Chain.Thumbprints | Select-Object -Skip 1)
+    # an authority BETWEEN the certificate and the root: not the certificate itself, and not the root (a root pin would be every certificate
+    # under that root, and a made-up two-link chain would put its own root there)
+    $n = @($Chain.Thumbprints).Count
+    $between = @()
+    if ($n -ge 3) { $between = @($Chain.Thumbprints[1..($n - 2)]) }
     foreach ($pin in @($CaPins)) {
-        if ($above -contains $pin) { return "issued under $pin" }
+        if ($between -contains $pin) { return "issued under $pin" }
     }
     Fail 'the signing certificate was not issued under the authority this installer pins. Nothing was installed.'
 }
@@ -147,7 +184,7 @@ function Test-StonewaveSignature([string]$Path, [string]$Subject, [string]$CaThu
     if ($sig.Status -ne 'Valid') { Fail "the signature of the download is not valid ($($sig.Status)). Nothing was installed." }
     $cert = $sig.SignerCertificate
     if ($null -eq $cert) { Fail 'the download has no signer certificate. Nothing was installed.' }
-    $chain = Get-SignerChain $cert -TestOnlyAcceptUntrustedRoot:$TestOnlyAcceptUntrustedRoot
+    $chain = Get-SignerChain $cert -TestOnlyAcceptUntrustedRoot:$TestOnlyAcceptUntrustedRoot -Extra (Get-EmbeddedCertificates $Path)
     $how = Test-SignerPins $cert $chain $Subject $ca $leaves
     Say "signature ok ($($cert.Subject.Split(',')[0].Substring(3)), $how)"
     if ($chain.Warning) { Say "note: $($chain.Warning)" }

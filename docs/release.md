@@ -49,9 +49,23 @@ runs the builds it can run here to see that they say what the manifest says.
   is fixed in the template (`CN=Stonewave Tech LLC, O=Stonewave Tech LLC, L=Sheridan, S=Wyoming, C=US`). Release 0.2.0 was signed before the authority was
   pinned: the installer also accepts that one certificate (`8A69FFDF224024FD656E942B043D92D5AA381505`), for version 0.2.0 only. If Microsoft ever issues
   under another authority, list both thumbprints (comma separated) in the release that changes it.
-- **macOS:** the team id: `codesign -dv --verbose=4 stonewave | grep TeamIdentifier`.
+  The pin is matched **between** the signing certificate and the root of the chain, never the certificate itself and never the root (a root pin would be every
+  certificate under that root). The real chain is certificate `[0]` → "Microsoft ID Verified Code Signing AOC CA 0x" `[1]` (rotates) → **PCA 2021 `[2]`** →
+  "Microsoft Identity Verification Root Certificate Authority 2020" `[3]`. The installer also reads the certificates the signature carries inside the file and offers them
+  to Windows as extra material for building the chain, so it works on a machine that is offline and has never seen the authority (they are only candidates: every
+  link must still be signed by the one above, up to a root in the machine's own store).
+- **macOS:** the team id: `codesign -dv --verbose=4 stonewave | grep TeamIdentifier`. Ours is **`TV5R62BGRZ`** ("Developer ID Application: Stonewave Tech LLC",
+  hardened runtime, timestamped, notarized): `STONEWAVE_MAC_TEAM_ID=TV5R62BGRZ`. Like the Windows pin it goes in when the bundle is made, not into the repository.
+
+**Known pin values (0.2.0 and the Azure signing in use):** `STONEWAVE_MAC_TEAM_ID=TV5R62BGRZ`, `STONEWAVE_WIN_CA_THUMBPRINTS=8E750F459DAF9A79D6370DB747AD2226866AD818`.
 
 ## The gate before it goes online
+
+**Windows, on the real file** (not the stand-in): `powershell -File scripts/check-windows-signature.ps1 -Path stonewave.exe -Pin 8E750F459DAF9A79D6370DB747AD2226866AD818 [-Version 0.2.0]`
+runs the installer's own functions on the file and prints what Windows says (must be `Valid`, also for a program whose three-day certificate has expired: the
+timestamp keeps it valid), the exact subject and whether it equals the one in the template, the certificate's validity, the chain with the position of each
+certificate and whether the installer would accept the pin (`RESULT: ok`) or refuse. Run it on the file that goes into the bundle **and** on a program freshly
+signed with the current Azure account, and compare the subject string and the authority's thumbprint with the values above.
 
 Run the installers' own check against the folder on each system the release is for. It does everything the installer does except installing:
 
