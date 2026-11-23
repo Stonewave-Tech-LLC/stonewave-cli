@@ -288,10 +288,14 @@ pub mod fake {
     use std::cell::RefCell;
     use std::collections::VecDeque;
 
+    type Hook = Box<dyn Fn(&RunReq)>;
+
     /// Answers from a list, in order, and remembers every request.
     pub struct Recorder {
         pub reqs: RefCell<Vec<RunReq>>,
         answers: RefCell<VecDeque<RunOut>>,
+        /// Called with each request before it is answered (a stand-in for what the real run does to the folder).
+        hook: RefCell<Option<Hook>>,
     }
 
     pub fn out(code: i32, stdout: &str) -> RunOut {
@@ -317,12 +321,21 @@ pub mod fake {
             Recorder {
                 reqs: RefCell::new(Vec::new()),
                 answers: RefCell::new(answers.into()),
+                hook: RefCell::new(None),
             }
+        }
+
+        pub fn with_hook(self, f: impl Fn(&RunReq) + 'static) -> Recorder {
+            *self.hook.borrow_mut() = Some(Box::new(f));
+            self
         }
     }
 
     impl Spawn for Recorder {
         fn run(&self, req: &RunReq, _stop: &AtomicBool) -> RunOut {
+            if let Some(h) = self.hook.borrow().as_ref() {
+                h(req);
+            }
             self.reqs.borrow_mut().push(req.clone());
             self.answers
                 .borrow_mut()

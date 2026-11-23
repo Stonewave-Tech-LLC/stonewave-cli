@@ -22,9 +22,9 @@ pub const SERVER: &str = "wave";
 
 /// What a wake may do besides Wave's tools: look at and change files in the working folder.
 /// The built-in tools that exist at all in a wake (`--tools`): file tools only. Wave's tools come from the MCP file.
-pub const BUILTIN_TOOLS: &str = "Read,Edit,Glob,Grep";
+pub const BUILTIN_TOOLS: &str = "Read,Write,Edit,Glob,Grep";
 /// What a wake may do besides Wave's tools: look at and change files in the working folder.
-pub const ALLOWED_TOOLS: &str = "mcp__wave,Read,Edit,Glob,Grep";
+pub const ALLOWED_TOOLS: &str = "mcp__wave,Read,Write,Edit,Glob,Grep";
 /// Said out loud as well, so a mistake in another flag cannot bring one of these back.
 pub const DENIED_TOOLS: &str = "Bash,PowerShell,WebFetch,WebSearch,Agent";
 
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(after("--output-format").as_deref(), Some("json"));
         assert_eq!(
             after("--tools").as_deref(),
-            Some("Read,Edit,Glob,Grep"),
+            Some("Read,Write,Edit,Glob,Grep"),
             "only the file tools exist"
         );
         let allowed = after("--allowedTools").unwrap();

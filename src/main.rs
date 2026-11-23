@@ -245,7 +245,7 @@ fn main() -> ExitCode {
     if raw.first().map(String::as_str) == Some("agent") {
         return agent::main(&raw[1..]);
     }
-    // the menu of coding agents (F-136): `stonewave` on a terminal, or `stonewave agents`
+    // the menu of coding agents: `stonewave` on a terminal, or `stonewave agents`
     {
         use crossterm::tty::IsTty;
         let on_terminal = std::io::stdin().is_tty() && std::io::stdout().is_tty();

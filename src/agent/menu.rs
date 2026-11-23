@@ -69,7 +69,7 @@ pub fn agents(dirs: &Dirs) -> Vec<AgentRow> {
                 key_ok: dirs.key_file(&name).exists(),
                 station_started: p.state.exists(),
                 paused: p.paused.exists(),
-                engine: st.engine,
+                engine: scrub(&st.engine),
                 name,
             })
         })

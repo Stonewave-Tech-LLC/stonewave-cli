@@ -260,7 +260,7 @@ fn print_report(rep: &Report, last_wait: &mut Option<String>) {
     for (room, how) in &rep.woke {
         say(&format!("woke the session of room {} ({how})", short(room)));
     }
-    if !rep.skipped.is_empty() {
+    if !rep.skipped.is_empty() && rep.waiting.is_none() {
         let mut counts: Vec<(&str, usize)> = Vec::new();
         for s in &rep.skipped {
             match counts.iter_mut().find(|(k, _)| k == s) {

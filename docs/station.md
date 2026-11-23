@@ -32,7 +32,7 @@ One session per **room**, not one for everything: a shared session would carry w
 | | |
 |---|---|
 | Tools | Wave's tools (one MCP server, `wave`), and reading and changing files inside the working folder. **No shell, no web.** |
-| How | `--restricted` and `--tools Read,Edit,Glob,Grep` (only the file tools exist; Claude Code 2.1.259 or newer, which the station checks before it starts), `--strict-mcp-config` with a file that names the key variable, `--permission-mode dontAsk --permission-prompts none`, `--allowedTools`/`--disallowedTools`, `--max-turns`, `--max-budget-usd` |
+| How | `--restricted` and `--tools Read,Write,Edit,Glob,Grep` (only the file tools exist; Claude Code 2.1.259 or newer, which the station checks before it starts), `--strict-mcp-config` with a file that names the key variable, `--permission-mode dontAsk --permission-prompts none`, `--allowedTools`/`--disallowedTools`, `--max-turns`, `--max-budget-usd` |
 | Folder | The agent's own folder (`--workdir`, default `~/wave-agents/<agent>`) and, inside it, **one folder per room** (`rooms/<room>`): a wake runs in its room's folder and sees only that one, so what one room's session writes is not in reach of another room's. Shared instructions go into a `CLAUDE.md` of the parent folder (Claude Code reads parent folders too). Refused: your home folder, the folders that hold keys or logins (`~/.config`, `~/.local`, `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.claude`, the state folder), a path with `..`, a link that leads to one of them or out of the folder; places are compared by their real place, and checked again before every wake |
 | Prompt | A fixed text with ids. **The text of a message never goes into a command.** The run reads it through Wave's tools, where text from outside the company comes wrapped |
 | Environment | Only what the program needs to find its login and its network, plus `WAVE_AGENT_KEY`. Other keys, tokens and cloud credentials of the user stay out |
@@ -136,3 +136,15 @@ Tested (`cargo test`; the Linux row also ran in a throw-away WSL as a normal use
 - The live line to Wave's doorbell (a wake in about a second instead of up to 15): slice 2.
 - Codex, Grok, Gemini: slice 2.
 - Commands for a wake (git, tests), the key proxy and a separate user or sandbox: slice 3. Until then a wake cannot run a command at all.
+
+## Known limits of slice 1
+
+- **At least once, not exactly once.** A mention whose wake was interrupted (the station was stopped, or a login problem stopped it) is woken again after the
+  restart; the run may already have posted before it was interrupted. A mention that was woken for is remembered by its id (the last 300), so removing a
+  mention and adding it back right away is not woken again.
+- A folder that is not acceptable at wake time (for example a link that leads out of the working folder, brought by a cloned repository) stops only that
+  room: the station writes one note into the room and goes on.
+- The folder check is a deny-list of places that hold keys or logins (home, `~/.config`, `~/.ssh`, `~/.aws`, ...), not a list of places that are allowed.
+  It is written for Linux; folders such as macOS `Library` and Windows `AppData` are guarded by name, other places are not.
+- The lock is a file whose age is checked: two stations started at the very same moment can both start (the second is refused from the next minute on);
+  a station that was killed hard blocks a restart for up to 90 seconds.

@@ -472,7 +472,7 @@ fn no_command_tools_whatever_the_settings() {
     );
     assert_eq!(
         arg_after(&req, "--tools").as_deref(),
-        Some("Read,Edit,Glob,Grep")
+        Some("Read,Write,Edit,Glob,Grep")
     );
     for bad in [
         "--dangerously-skip-permissions",
@@ -860,10 +860,24 @@ fn wave_saying_no_or_wait() {
 fn after_so_many_wakes_the_session_ends_with_a_handover_note() {
     let r = rig("rotate");
     let wave = Wave::new();
-    let spawn = Recorder::new(vec![ok_run(SID1), ok_run(SID2)]);
     let mut c = cfg(&r);
     c.session_max_wakes = 3;
     let room = c.workdir.join("rooms").join("r-1");
+    // the stand-in does what the real session does when it is asked for the note: it writes the file (with its Edit tool). The old note must
+    // already be gone by then: the station removes it first, so only a fresh note can count.
+    let note = room.join("notes/handover.md");
+    let spawn = Recorder::new(vec![ok_run(SID1), ok_run(SID2)]).with_hook({
+        let note = note.clone();
+        move |req| {
+            if req.args[1].starts_with("Write a short handover note") {
+                assert!(
+                    !note.exists(),
+                    "the old note was removed before the old session was asked"
+                );
+                fs::write(&note, "open: nothing").unwrap();
+            }
+        }
+    });
     let mut st = started(&r, c, &wave, &spawn);
     st.sessions.put(
         "r-1",
@@ -881,22 +895,7 @@ fn after_so_many_wakes_the_session_ends_with_a_handover_note() {
         "inbox",
         inbox(vec![item("e-1", "r-1", 2, "member", false, "x")], 3),
     );
-    // the stand-in writes the note once the station has removed the old one (the real session does that with its Edit tool)
-    let note = room.join("notes/handover.md");
-    let writer = std::thread::spawn({
-        let note = note.clone();
-        move || {
-            for _ in 0..400 {
-                if !note.exists() {
-                    let _ = fs::write(&note, "open: nothing");
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            }
-        }
-    });
     st.cycle();
-    writer.join().unwrap();
     let reqs = spawn.reqs.borrow();
     assert_eq!(reqs.len(), 2);
     assert_eq!(
@@ -1150,4 +1149,74 @@ fn the_status_text_says_sessions_and_counts_without_any_text() {
             && t.contains("handover note waiting"),
         "{t}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_room_folder_that_is_not_acceptable_stops_that_room_not_the_station() {
+    let r = rig("folderrefused");
+    let wave = Wave::new();
+    let spawn = Recorder::new(vec![ok_run(SID2)]);
+    let c = cfg(&r);
+    let work = c.workdir.clone();
+    let mut st = started(&r, c, &wave, &spawn);
+    // a link inside the working folder that leads out (a cloned repository could bring one)
+    std::os::unix::fs::symlink(&r.dirs.config, work.join("leak")).unwrap();
+    wave.say(
+        "inbox",
+        inbox(vec![item("e-1", "r-1", 2, "member", false, "x")], 3),
+    );
+    let rep = st.cycle();
+    assert!(rep.fatal.is_none(), "the station goes on: {rep:?}");
+    assert_eq!(
+        rep.woke,
+        vec![("r-1".to_owned(), "folder-refused".to_owned())]
+    );
+    assert!(spawn.reqs.borrow().is_empty(), "nothing was started");
+    assert!(
+        wave.last("post").unwrap()["body"]
+            .as_str()
+            .unwrap()
+            .contains("working folder")
+    );
+    assert_eq!(
+        st.state.next_seq,
+        Some(3),
+        "the item is done with, so the station does not restart in a loop"
+    );
+}
+
+#[test]
+fn an_exit_without_readable_output_is_not_repeated_when_it_exited_with_zero() {
+    let r = rig("zero");
+    let wave = Wave::new();
+    let spawn = Recorder::new(vec![out(0, "not json at all")]);
+    let mut st = started(&r, cfg(&r), &wave, &spawn);
+    wave.say(
+        "inbox",
+        inbox(vec![item("e-1", "r-1", 2, "member", false, "x")], 3),
+    );
+    let rep = st.cycle();
+    assert_eq!(rep.woke, vec![("r-1".to_owned(), "failed".to_owned())]);
+    assert_eq!(
+        spawn.reqs.borrow().len(),
+        1,
+        "a run that exited cleanly may have worked: not repeated"
+    );
+}
+
+#[test]
+fn legitimate_places_under_local_are_not_refused_but_the_keyrings_are() {
+    let r = rig("local");
+    let key = r.dirs.key_file("demo");
+    let ok = r
+        .dirs
+        .home
+        .join(".local")
+        .join("share")
+        .join("agents")
+        .join("demo");
+    assert!(check_workdir(&ok, &r.dirs, Some(&key)).is_ok());
+    let bad = r.dirs.home.join(".local").join("share").join("keyrings");
+    assert!(check_workdir(&bad, &r.dirs, Some(&key)).is_err());
 }

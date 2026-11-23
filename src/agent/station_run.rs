@@ -357,6 +357,16 @@ impl Lock {
             }
         }
         let pid = std::process::id().to_string();
+        // a first start takes the file only if nobody else made it a moment ago
+        if !path.exists() {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|_| "another station for this agent has just started".to_owned())?;
+            use std::io::Write as _;
+            let _ = f.write_all(pid.as_bytes());
+        }
         atomic_write(path, pid.as_bytes(), 0o600)
             .map_err(|e| format!("cannot write the lock file: {}", e.kind()))?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -440,7 +450,20 @@ pub fn check_workdir(
         return Err("the working folder cannot be the root or your whole home folder".into());
     }
     let guarded_homes = [
-        ".claude", ".ssh", ".grok", ".aws", ".gnupg", ".kube", ".docker", ".config", ".local",
+        ".claude",
+        ".ssh",
+        ".grok",
+        ".aws",
+        ".gnupg",
+        ".kube",
+        ".docker",
+        ".config",
+        ".npm",
+        ".cargo",
+        "Library",
+        "AppData",
+        ".local/share/keyrings",
+        ".local/share/gnome-keyring",
     ];
     let mut guarded: Vec<PathBuf> = vec![
         dirs.config.clone(),
@@ -552,6 +575,7 @@ enum Outcome {
     Login,
     TooOld,
     Stopped,
+    FolderRefused,
 }
 
 impl Outcome {
@@ -564,6 +588,7 @@ impl Outcome {
             Outcome::Login => "login",
             Outcome::TooOld => "too-old",
             Outcome::Stopped => "stopped",
+            Outcome::FolderRefused => "folder-refused",
         }
     }
 }
@@ -798,7 +823,10 @@ impl<'a> Station<'a> {
             KeySource::File(p) => Some(p.clone()),
             KeySource::Env(_) => None,
         };
-        check_workdir(&self.cfg.workdir, &self.dirs, key_file.as_deref())?;
+        // a folder that is not acceptable (a link that leads out, say) stops THIS room, not the whole station
+        if check_workdir(&self.cfg.workdir, &self.dirs, key_file.as_deref()).is_err() {
+            return Ok(Outcome::FolderRefused);
+        }
         let dir = self.room_dir(room);
         fs::create_dir_all(&dir)
             .map_err(|e| format!("cannot create the room folder: {}", e.kind()))?;
@@ -859,7 +887,11 @@ impl<'a> Station<'a> {
                     return Ok(Outcome::Ok);
                 }
                 // a run that already did something (it may have posted) is not repeated; one that never got going is, once
-                (_, v) if !retried && v.as_ref().and_then(|v| v.turns).unwrap_or(0) == 0 => {
+                (Ended::Exited(Some(c)), v)
+                    if *c != 0
+                        && !retried
+                        && v.as_ref().and_then(|v| v.turns).unwrap_or(0) == 0 =>
+                {
                     retried = true;
                     continue;
                 }
@@ -988,10 +1020,19 @@ impl<'a> Station<'a> {
                         break;
                     }
                     Ok(o) => {
-                        if matches!(o, Outcome::Timeout | Outcome::Failed | Outcome::NotStarted) {
+                        if matches!(
+                            o,
+                            Outcome::Timeout
+                                | Outcome::Failed
+                                | Outcome::NotStarted
+                                | Outcome::FolderRefused
+                        ) {
                             let why = match o {
                                 Outcome::Timeout => "time limit",
                                 Outcome::NotStarted => "the engine could not be started",
+                                Outcome::FolderRefused => {
+                                    "the working folder is not acceptable: ask whoever set the station up"
+                                }
                                 _ => "the engine ended with an error",
                             };
                             self.post_failure(&room, why);
