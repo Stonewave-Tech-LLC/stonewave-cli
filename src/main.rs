@@ -76,7 +76,7 @@ Usage: stonewave [command] [options]
 
 Commands:
   doctor         Check whether this server can be connected (real, read only)
-  agents         The menu of coding agents on this computer (also what `stonewave` alone shows on a terminal)
+  agents         The menu of coding agents on this computer (also what `stonewave` alone shows on a terminal); --plain: one plain screen, no questions
   connect        Sign in with your Stonewave account, register this server with Wave and set it up (needs sudo)
   setup          Set up this server: agent user, agent SSH, daemon, audit log (needs sudo; --dry-run only looks)
   revoke         Revoke all agent access on this server, also without internet (needs sudo)
@@ -249,11 +249,25 @@ fn main() -> ExitCode {
     {
         use crossterm::tty::IsTty;
         let on_terminal = std::io::stdin().is_tty() && std::io::stdout().is_tty();
-        if raw.is_empty() && on_terminal {
-            return agent::menu::main(true);
+        let plain = raw.iter().any(|a| a == "--plain");
+        let words: Vec<&str> = raw
+            .iter()
+            .map(String::as_str)
+            .filter(|a| *a != "--plain")
+            .collect();
+        // `--plain`: today's plain output, one screen, nobody is asked anything (scripts and agents never meet a menu)
+        if plain && (words.is_empty() || words == ["agents"]) {
+            return agent::menu::main(false);
         }
-        if raw.len() == 1 && raw[0] == "agents" {
-            return agent::menu::main(on_terminal);
+        if words.is_empty() && on_terminal {
+            return agent::tui::main();
+        }
+        if words == ["agents"] {
+            return if on_terminal {
+                agent::tui::main()
+            } else {
+                agent::menu::main(false)
+            };
         }
     }
     let args = match parse(raw) {

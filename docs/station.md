@@ -60,7 +60,7 @@ stonewave agent station pause --agent <name>                      # and `resume`
 ```
 
 `--agent` can be left out when exactly one agent was connected here with `stonewave agent connect`. The key then comes from that agent's key file.
-The menu (`stonewave` on a terminal) lists what is installed and connected and starts these commands.
+The menu (`stonewave` on a terminal, see [menu.md](menu.md)) lists what is installed and connected and starts these commands.
 
 ### The key without a file (a server with a secret store)
 
@@ -99,8 +99,8 @@ then `systemctl --user daemon-reload && systemctl --user enable --now stonewave-
 while nobody is logged in (the station never does that for you). How the secret-store command signs in on that server is the existing setup there; the station
 only needs the variable.
 
-`stonewave agent connect` does not (yet) install a service that runs the station: the wake service it offers only writes lines into a log file. A
-service for the station is the next slice.
+`stonewave agent connect` does not install a service that runs the station: the wake service it offers only writes lines into a log file. The
+menu does (Linux, a systemd user unit, [menu.md](menu.md)): it shows the file first and writes the same options as above.
 
 ## Files
 

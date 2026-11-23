@@ -190,6 +190,28 @@ fn rpc(
     Ok(data)
 }
 
+/// The rooms the agent may read, as `(id, name)`: what the menu offers when a station is set up. Rooms without a plain id are left out.
+pub fn list_rooms(http: &dyn Http, mcp: &str, key: &Key) -> Result<Vec<(String, String)>, WaveErr> {
+    let d = rpc(http, mcp, key, 1, "rooms", json!({}))?;
+    Ok(d["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            let id = r["id"].as_str().filter(|s| plain_id(s))?;
+            let name = r["name"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| r["key"].as_str())
+                .unwrap_or(id);
+            Some((
+                id.to_owned(),
+                name.chars().filter(|c| !c.is_control()).take(80).collect(),
+            ))
+        })
+        .collect())
+}
+
 // ------------------------------------------------------------------ who wakes the agent
 
 #[derive(Debug, PartialEq, Eq)]
@@ -360,6 +382,21 @@ pub fn previous_wake_running(child_file: &Path) -> Option<u32> {
     } else {
         let _ = fs::remove_file(child_file);
         None
+    }
+}
+
+/// Whether a station is running for this lock file: its process exists (Linux and macOS), or the file was touched in the last 90 seconds.
+pub fn station_running(lock: &Path) -> bool {
+    let Ok(who) = fs::read_to_string(lock) else {
+        return false;
+    };
+    match who.trim().parse::<u32>() {
+        Ok(p) if cfg!(unix) => pid_alive(p),
+        _ => fs::metadata(lock)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age < LOCK_FRESH),
     }
 }
 

@@ -71,7 +71,7 @@ pub struct Args {
     pub once: bool,
 }
 
-fn env_name_ok(s: &str) -> bool {
+pub(crate) fn env_name_ok(s: &str) -> bool {
     (1..=100).contains(&s.len())
         && s.chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')

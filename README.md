@@ -115,14 +115,17 @@ machine (`127.0.0.1`, `localhost`, `::1`), for tests.
 ## Menu and station
 
 ```bash
-stonewave                      # on a terminal: the menu (also `stonewave agents`)
+stonewave                      # on a terminal: the full-screen menu (also `stonewave agents`)
+stonewave --plain              # the same list as plain text, one screen, nothing is asked (scripts, agents)
 stonewave agent station run --agent <name> --dry-run   # what a wake would run; starts nothing
 stonewave agent station run --agent <name>             # wake the agent when a person of the company mentions it
 ```
 
-The **menu** lists which coding agents are installed on this computer (Claude Code, Codex, Grok Build; Gemini CLI is found, connecting it comes
-next), which ones are connected to Wave, and starts the next step: connect, check, show a wake, start the station. It works the same on a PC and on
-a server, and writes nothing itself.
+The **menu** is a full-screen terminal program (banner with the wave, arrow keys, Enter, Esc, `q`): it lists the agents on this computer and walks
+through connecting one and setting up its station in a few steps, each saying what it will do before it does it. It only starts the commands below
+(and writes one user service file, shown first), so every check they make stays where it is. The text is German. Without a terminal, with
+`--plain`, with `TERM=dumb` or on a terminal smaller than 50x16, the plain menu is used, in which a script cannot trip over a question.
+How it works, step by step: [docs/menu.md](docs/menu.md).
 
 The **station** keeps one long session per room for the agent and continues it on every wake, instead of starting a fresh run for each mention. A wake
 has no shell and no web, one MCP server (Wave), its own working folder and limits for time, turns, cost and count. Slice 1 supports Claude Code.
@@ -271,7 +274,8 @@ by `scripts/cast2gif.py` with Pillow.
 | `src/style.rs`, `src/ui.rs`, `src/banner.rs` | colours, building blocks, banner and wave animation |
 | `src/connect.rs` | the real device code sign-in: account address, curl transport, protocol, wait loop |
 | `src/agent/` | `stonewave agent ...`: Wave API calls, the key and its files, engine entries, Codex block, wake service, commands |
-| `src/agent/station_run.rs`, `claude.rs`, `spawn.rs`, `sessions.rs`, `menu.rs` | the station (wakes by continuing a session), the Claude Code command, starting a run with limits, the sessions per room, the menu |
+| `src/agent/station_run.rs`, `claude.rs`, `spawn.rs`, `sessions.rs`, `menu.rs` | the station (wakes by continuing a session), the Claude Code command, starting a run with limits, the sessions per room, the plain menu |
+| `src/agent/tui/` | the full-screen menu: `model.rs` (screens and wizard as a state machine), `view.rs` (how they look), `profile.rs`, `service.rs` (the user service), `mod.rs` (terminal and loop) |
 | `assets/fleet-watch.mjs` | the wake script that the wake service runs (embedded into the binary) |
 | `src/flow.rs` | the screens (real `connect` and the demos) |
 | `install/install.sh.in` | install script template |

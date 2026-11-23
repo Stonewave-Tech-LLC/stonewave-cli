@@ -32,6 +32,7 @@ pub mod station;
 pub mod station_cli;
 pub mod station_run;
 pub mod timefmt;
+pub mod tui;
 pub mod ui;
 pub mod wave;
 pub mod winproc;
