@@ -205,7 +205,7 @@ pub fn main(raw: &[String]) -> ExitCode {
                     account: account.expect("connect has an account address"),
                     wave,
                     no_browser: args.no_browser,
-                    german: german,
+                    german,
                     env: connect_flow::real_env,
                 },
             ),
