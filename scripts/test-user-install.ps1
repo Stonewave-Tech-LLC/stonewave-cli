@@ -3,7 +3,7 @@
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-user-install.ps1
 #
-# The signature check is tested with a program that Windows itself signed (a stand-in for our signed build): its signer name and thumbprint
+# The signature check is tested with a program that Windows itself signed (a stand-in for our signed build): its subject and issuing authority
 # are pinned for the test, and a changed copy, an unsigned file and a wrong pin must all be refused.
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
@@ -31,10 +31,15 @@ try {
     $cert = $donorSig.SignerCertificate
     $cn = ([regex]::Match($cert.Subject, '(^|,\s*)CN=([^,]+)')).Groups[2].Value
     $thumb = $cert.Thumbprint.ToUpperInvariant()
-    Write-Host "stand-in signer: CN=$cn $thumb ($(Split-Path -Leaf $donor))"
+    $subject = $cert.Subject
+    $donorChain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+    [void]$donorChain.Build($cert)
+    $caPin = $donorChain.ChainElements[1].Certificate.Thumbprint.ToUpperInvariant()
+    $rootPin = $donorChain.ChainElements[$donorChain.ChainElements.Count - 1].Certificate.Thumbprint.ToUpperInvariant()
+    Write-Host "stand-in signer: $subject, leaf $thumb, authority $caPin ($(Split-Path -Leaf $donor))"
 
     $rendered = Join-Path $T 'install.ps1'
-    (Get-Content -Raw -LiteralPath (Join-Path $here 'install\cli\install.ps1.in')) -replace '@WIN_THUMBPRINTS@', $thumb | Set-Content -Encoding UTF8 -LiteralPath $rendered
+    (Get-Content -Raw -LiteralPath (Join-Path $here 'install\cli\install.ps1.in')) -replace '@WIN_CA_THUMBPRINTS@', $caPin | Set-Content -Encoding UTF8 -LiteralPath $rendered
     $e = $null
     [void][System.Management.Automation.Language.Parser]::ParseFile($rendered, [ref]$null, [ref]$e)
     Expect (-not $e) "install.ps1 does not parse: $e"
@@ -46,8 +51,8 @@ try {
     $innerFile = Join-Path $T 'inner.ps1'
     ($all[($first + 1)..($last - 1)]) | Set-Content -Encoding UTF8 -LiteralPath $innerFile
     . $innerFile                                # only defines the functions
-    $SignerName = $cn
-    $SignerThumbprints = $thumb
+    $SignerSubject = $subject
+    $SignerCaThumbprints = $caPin
     $text = Get-Content -Raw -LiteralPath $rendered
     Expect ($text -match "Base = 'https://") 'the base is https'
     Expect ($text -notmatch 'http://') 'no plain http anywhere'
@@ -88,21 +93,73 @@ try {
     Throws { Read-Manifest (Bend 'x86_64-windows' 'aarch64-windows') 'x86_64-windows' } 'has no build for' 'a release without a build for this system'
     Throws { Read-Manifest (Bend 'stonewave-manifest 1' 'stonewave-manifest 2') 'x86_64-windows' } 'not in a format' 'another format'
 
-    # ---------------------------------------------------------------- the signature check
-    Test-StonewaveSignature $donor $cn $thumb 6>$null
-    Ok
-    Throws { Test-StonewaveSignature $donor 'Stonewave Tech LLC' $thumb } 'not by Stonewave Tech LLC' 'another signer name'
-    Throws { Test-StonewaveSignature $donor ($cn + ' Ltd') $thumb } 'not by' 'a name that only starts like the pinned one'
-    Throws { Test-StonewaveSignature $donor $cn ('0' * 40) } 'not one this installer pins' 'another thumbprint'
-    Throws { Test-StonewaveSignature $donor $cn '@WIN_THUMBPRINTS@' } 'not prepared for Windows' 'an installer that was not prepared'
-    Throws { Test-StonewaveSignature $donor $cn '' } 'no certificate is pinned' 'nothing pinned'
+    # ---------------------------------------------------------------- the signature check (a program Windows signed: real Authenticode, real chain)
     $plain = Join-Path $T 'plain.exe'
     [IO.File]::WriteAllText($plain, 'MZ not a program')
-    Throws { Test-StonewaveSignature $plain $cn $thumb } 'not valid' 'an unsigned file'
     $changed = Join-Path $T 'changed.exe'
     Copy-Item $donor $changed
     $fs = [IO.File]::Open($changed, 'Append'); $fs.WriteByte(0); $fs.Close()
-    Throws { Test-StonewaveSignature $changed $cn $thumb } 'not valid' 'a signed file with a changed byte'
+    Test-StonewaveSignature $donor $subject $caPin 6>$null
+    Ok
+    Test-StonewaveSignature $donor $subject "$('0' * 40),$caPin" 6>$null     # several authorities: one of them is enough
+    Ok
+    Test-StonewaveSignature $donor $subject $rootPin 6>$null                 # any authority above the certificate counts
+    Ok
+    Throws { Test-StonewaveSignature $donor 'CN=Stonewave Tech LLC, O=Stonewave Tech LLC, L=Sheridan, S=Wyoming, C=US' $caPin } 'not by' 'another subject'
+    Throws { Test-StonewaveSignature $donor ($subject + ', OU=x') $caPin } 'not by' 'a subject that only starts like the pinned one'
+    Throws { Test-StonewaveSignature $donor $subject.ToLowerInvariant() $caPin } 'not by' 'the subject is compared exactly, also the case'
+    Throws { Test-StonewaveSignature $donor $subject ('0' * 40) } 'not issued under the authority' 'another authority'
+    Throws { Test-StonewaveSignature $donor $subject $thumb } 'not issued under the authority' 'the certificate itself is not an authority above itself'
+    Throws { Test-StonewaveSignature $donor $subject '@WIN_CA_THUMBPRINTS@' } 'not prepared for Windows' 'an installer that was not prepared'
+    Throws { Test-StonewaveSignature $donor $subject '' } 'not prepared for Windows' 'nothing pinned'
+    Throws { Test-StonewaveSignature $plain $subject $caPin } 'not valid' 'an unsigned file'
+    Throws { Test-StonewaveSignature $changed $subject $caPin } 'not valid' 'a signed file with a changed byte'
+    # the legacy pin of one release: the certificate's own thumbprint, with the right subject
+    Test-StonewaveSignature $donor $subject ('0' * 40) @($thumb) 6>$null
+    Ok
+    Throws { Test-StonewaveSignature $donor 'CN=Somebody Else' ('0' * 40) @($thumb) } 'not by' 'a legacy thumbprint does not replace the subject'
+    Throws { Test-StonewaveSignature $donor $subject ('0' * 40) @('1' * 40) } 'not issued under the authority' 'another legacy thumbprint'
+
+    # ---------------------------------------------------------------- the pins on certificates made here (a chain of our own: no trusted root, so -TestOnlyAcceptUntrustedRoot)
+    $made = @()
+    try {
+        $valid = (Get-Date).AddDays(2)
+        function New-TestCert([string]$Subject, $Signer = $null, [switch]$Authority) {
+            $a = @{ Subject = $Subject; CertStoreLocation = 'Cert:\CurrentUser\My'; NotAfter = $valid }
+            if ($Authority) { $a.KeyUsage = @('CertSign', 'CRLSign'); $a.TextExtension = @('2.5.29.19={critical}{text}ca=1') } else { $a.Type = 'CodeSigningCert' }
+            if ($Signer) { $a.Signer = $Signer }
+            $c = New-SelfSignedCertificate @a
+            $script:made += $c
+            return $c
+        }
+        $ca1 = New-TestCert 'CN=Test Authority One' -Authority
+        $ca2 = New-TestCert 'CN=Test Authority Two' -Authority
+        $leafA = New-TestCert 'CN=Stonewave Tech LLC, O=Stonewave Tech LLC, L=Sheridan, S=Wyoming, C=US' $ca1
+        $want = $leafA.Subject
+        $leafA2 = New-TestCert $want $ca1                       # another certificate of the same subject under the same authority (the next one Azure makes)
+        $leafB = New-TestCert $want $ca2                        # the same subject under another authority
+        $self = New-TestCert $want                              # a certificate that signed itself, the same subject
+        $other = New-TestCert 'CN=Somebody Else' $ca1           # our authority, another subject
+        Expect ($leafA2.Thumbprint -ne $leafA.Thumbprint -and $leafA2.Subject -ceq $want -and $leafB.Subject -ceq $want -and $self.Subject -ceq $want) 'the test certificates are what they should be'
+        $pin = @($ca1.Thumbprint.ToUpperInvariant())
+        function Chain($c, [switch]$Trusted) { if ($Trusted) { return Get-SignerChain $c } else { return Get-SignerChain $c -TestOnlyAcceptUntrustedRoot } }
+
+        Expect ((Test-SignerPins $leafA (Chain $leafA) $want $pin @()) -match 'issued under') 'a certificate under the pinned authority passes'
+        Expect ((Test-SignerPins $leafA2 (Chain $leafA2) $want $pin @()) -match 'issued under') 'a DIFFERENT certificate under the same authority passes too (the next one Azure makes)'
+        Throws { Test-SignerPins $leafB (Chain $leafB) $want $pin @() } 'not issued under the authority' 'the same subject under another authority fails'
+        Throws { Test-SignerPins $self (Chain $self) $want $pin @() } 'not issued under the authority' 'a self-signed certificate with the same subject fails'
+        Throws { Test-SignerPins $self (Chain $self) $want @($self.Thumbprint.ToUpperInvariant()) @() } 'not issued under the authority' 'its own thumbprint as an authority does not help'
+        Throws { Test-SignerPins $other (Chain $other) $want $pin @() } 'not by' 'our authority and another subject fails'
+        # Windows must also trust the chain: an authority of our own made up has no trusted root
+        $untrusted = Chain $leafA -Trusted
+        Expect (-not $untrusted.Ok) 'a chain that ends in a root Windows does not trust is not ok'
+        Throws { Test-SignerPins $leafA $untrusted $want $pin @() } 'not valid' 'and is refused even under the pinned authority'
+        # the legacy pin: that very certificate, nothing else
+        Expect ((Test-SignerPins $leafA $untrusted $want @('0' * 40) @($leafA.Thumbprint.ToUpperInvariant())) -match 'certificate') 'the legacy leaf pin passes by itself'
+        Throws { Test-SignerPins $leafA2 (Chain $leafA2) $want @('0' * 40) @($leafA.Thumbprint.ToUpperInvariant()) } 'not issued under the authority' 'but not for another certificate'
+    } finally {
+        foreach ($c in $made) { Remove-Item -LiteralPath "Cert:\CurrentUser\My\$($c.Thumbprint)" -Force -ErrorAction SilentlyContinue }
+    }
 
     # ---------------------------------------------------------------- the whole install, with the stand-in as the program
     $script:says = 'stonewave 0.2.0 (cafe0123)'
@@ -161,9 +218,23 @@ try {
     Refused 'says-other' { param($d) $script:says = 'stonewave 0.2.0 (deadbeef)' } 'not ''stonewave 0.2.0 (cafe0123)'''
     $script:says = 'stonewave 0.2.0 (cafe0123)'
     Refused 'missing' { param($d) Remove-Item "$d\0.2.0\stonewave-0.2.0-x86_64-windows.exe" } 'not found in'
-    $SignerThumbprints = '0' * 40
-    Refused 'wrong-pin' { param($d) } 'not one this installer pins'
-    $SignerThumbprints = $thumb
+    $SignerCaThumbprints = '0' * 40
+    Refused 'wrong-pin' { param($d) } 'not issued under the authority'
+    $SignerCaThumbprints = $caPin
+    # the legacy certificate pin belongs to one release: 0.2.0 passes by it, another release does not
+    $LegacyLeaf = @{ '0.2.0' = $thumb }
+    $SignerCaThumbprints = '0' * 40
+    $d = Reset 'site-legacy'
+    New-Release $d '0.2.0' 'cafe0123' $donor -Latest
+    $script:says = 'stonewave 0.2.0 (cafe0123)'
+    Expect ((Run) -match 'installed') 'release 0.2.0 passes by its legacy certificate pin'
+    $d = Reset 'site-legacy2'
+    New-Release $d '0.2.1' 'cafe0124' $donor -Latest
+    $script:says = 'stonewave 0.2.1 (cafe0124)'
+    Throws { Install-Stonewave 6>$null } 'not issued under the authority' 'release 0.2.1 does not (the legacy pin is for 0.2.0 only)'
+    $LegacyLeaf = @{ '0.2.0' = '8A69FFDF224024FD656E942B043D92D5AA381505' }
+    $SignerCaThumbprints = $caPin
+    $script:says = 'stonewave 0.2.0 (cafe0123)'
 
     # downgrade and update
     $d = Reset 'site3'
@@ -235,7 +306,7 @@ try {
     Expect ($hostOut -match 'Stonewave CLI installer') 'a script block with parameters runs the installer'
     # the stand-in's own signer is not ours, so the real, unmodified pins make it refuse (and say so in red) instead of installing
     $fresh = Join-Path $T 'fresh.ps1'
-    (Get-Content -Raw -LiteralPath (Join-Path $here 'install\cli\install.ps1.in')) -replace '@WIN_THUMBPRINTS@', ('F' * 40) | Set-Content -Encoding UTF8 -LiteralPath $fresh
+    (Get-Content -Raw -LiteralPath (Join-Path $here 'install\cli\install.ps1.in')) -replace '@WIN_CA_THUMBPRINTS@', ('F' * 40) | Set-Content -Encoding UTF8 -LiteralPath $fresh
     $sb2 = [scriptblock]::Create((Get-Content -Raw -LiteralPath $fresh))
     # `irm | iex` runs the text with Invoke-Expression in the caller's scope. A child PowerShell plays the person's session: nothing of the installer
     # (functions, variables, StrictMode, the error preference, the TLS setting) may stay, and the options reach it through $args.
@@ -278,7 +349,7 @@ Write-Output ('OUT=' + ($out -replace '\r?\n', ' | '))
     Expect ($iexOut -match 'Stonewave CLI installer' -and $iexOut -match 'download failed') "the installer really ran through Invoke-Expression (and failed closed, nothing listens there): $iexOut"
     Expect (-not (Test-Path (Join-Path $iexProfile 'Stonewave\bin\stonewave.exe'))) 'and installed nothing'
     $hostOut = & $sb2 -FromDir $d -BinDir (Join-Path $T 'bin-sb2') -NoPath 6>&1 *>&1 | Out-String
-    Expect ($hostOut -match 'not by Stonewave Tech LLC|not one this installer pins|not valid') 'with other pins the program is refused'
+    Expect ($hostOut -match 'not by|not issued under the authority|not valid') 'with other pins the program is refused'
     Expect (-not (Test-Path (Join-Path $T 'bin-sb2\stonewave.exe'))) 'and not installed'
 }
 finally {

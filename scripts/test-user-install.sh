@@ -350,13 +350,13 @@ out=$(STONEWAVE_MAC_TEAM_ID="abc; rm" bundle "$T/b4" --x86_64-linux "$fake1" --x
 check "a team id with odd characters is refused" [ $code -ne 0 ]
 out=$(bundle "$T/b5" --x86_64-linux "$fake1" --x86_64-windows "$fake1"); code=$?
 check "a Windows build without thumbprints is refused" [ $code -ne 0 ]
-out=$(STONEWAVE_WIN_THUMBPRINTS=nothex bundle "$T/b6" --x86_64-linux "$fake1" --x86_64-windows "$fake1"); code=$?
+out=$(STONEWAVE_WIN_CA_THUMBPRINTS=nothex bundle "$T/b6" --x86_64-linux "$fake1" --x86_64-windows "$fake1"); code=$?
 check "bad thumbprints are refused" [ $code -ne 0 ]
 good_print=0123456789ABCDEF0123456789ABCDEF01234567
-out=$(STONEWAVE_MAC_TEAM_ID=ABCDE12345 STONEWAVE_WIN_THUMBPRINTS=$good_print bundle "$T/b7" --x86_64-linux "$fake1" --aarch64-linux "$fake1" --x86_64-macos "$fake1" --aarch64-macos "$fake1" --x86_64-windows "$fake1"); code=$?
+out=$(STONEWAVE_MAC_TEAM_ID=ABCDE12345 STONEWAVE_WIN_CA_THUMBPRINTS=$good_print bundle "$T/b7" --x86_64-linux "$fake1" --aarch64-linux "$fake1" --x86_64-macos "$fake1" --aarch64-macos "$fake1" --x86_64-windows "$fake1"); code=$?
 check "a full bundle" [ $code -eq 0 ]
 has "pins written" "$(cat "$T/b7/install.sh")" 'MAC_TEAM_ID="ABCDE12345"'
-has "pins written (windows)" "$(cat "$T/b7/install.ps1")" "SignerThumbprints = '$good_print'"
+has "pins written (windows)" "$(cat "$T/b7/install.ps1")" "SignerCaThumbprints = '$good_print'"
 has "windows name" "$(cat "$T/b7/$ver/manifest.txt")" "stonewave-$ver-x86_64-windows.exe"
 out=$(bundle "$T/b8" --x86_64-linux "$fake1" --no-latest); code=$?
 check "--no-latest" sh -c "[ $code -eq 0 ] && [ ! -e '$T/b8/latest' ]"

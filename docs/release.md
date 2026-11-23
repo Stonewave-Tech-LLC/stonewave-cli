@@ -21,7 +21,7 @@ a manifest with such a commit). A source archive without git: set `STONEWAVE_COM
 
 ```bash
 export STONEWAVE_MAC_TEAM_ID=XXXXXXXXXX                       # the 10-character Apple team id (only with macOS builds)
-export STONEWAVE_WIN_THUMBPRINTS=<40 hex>[,<40 hex>]           # thumbprint(s) of the company certificate (only with a Windows build)
+export STONEWAVE_WIN_CA_THUMBPRINTS=<40 hex>[,<40 hex>]        # thumbprint(s) of the issuing authority (only with a Windows build), see below
 scripts/release-bundle.sh out \
   --x86_64-linux  stonewave-x86_64-linux  --aarch64-linux stonewave-aarch64-linux \
   --aarch64-macos stonewave-aarch64-macos --x86_64-macos  stonewave-x86_64-macos \
@@ -31,7 +31,7 @@ scripts/release-bundle.sh out \
 `out/` is what the web server shows under `/cli/`:
 
 ```
-install.sh  install.ps1                       with the team id and the thumbprints written in
+install.sh  install.ps1                       with the team id and the authority's thumbprint written in
 latest/manifest.txt                           a copy of the newest manifest (--no-latest leaves it alone)
 <version>/manifest.txt  SHA256SUMS
 <version>/stonewave-<version>-<target>[.exe]
@@ -41,9 +41,15 @@ The manifest is plain text (`stonewave-manifest 1`, `version`, `commit`, one `fi
 refuses to overwrite a version folder (a published version does not change; a wrong release is replaced by a new version), needs a clean tree, and
 runs the builds it can run here to see that they say what the manifest says.
 
-**Where to find the pins:** the thumbprint of the company certificate: `Get-AuthenticodeSignature stonewave.exe | % { $_.SignerCertificate.Thumbprint }`;
-the team id: `codesign -dv --verbose=4 stonewave | grep TeamIdentifier`. A renewed certificate has a new thumbprint: list both, comma separated,
-for the time in between.
+**Where to find the pins:**
+- **Windows:** the thumbprint of the authority that issued the signing certificate, the second certificate of the chain:
+  `$s = Get-AuthenticodeSignature stonewave.exe; $c = New-Object Security.Cryptography.X509Certificates.X509Chain; [void]$c.Build($s.SignerCertificate); $c.ChainElements | % { $_.Certificate.Subject.Split(',')[0] + ' ' + $_.Certificate.Thumbprint }`.
+  Pin **"Microsoft ID Verified Code Signing PCA 2021"** (`8E750F459DAF9A79D6370DB747AD2226866AD818` for the 0.2.0 build), not the leaf and not "...AOC CA 0x" (which
+  Microsoft rotates): Azure Artifact Signing makes a new signing certificate every few days, and the signature stays valid because it is timestamped. The subject
+  is fixed in the template (`CN=Stonewave Tech LLC, O=Stonewave Tech LLC, L=Sheridan, S=Wyoming, C=US`). Release 0.2.0 was signed before the authority was
+  pinned: the installer also accepts that one certificate (`8A69FFDF224024FD656E942B043D92D5AA381505`), for version 0.2.0 only. If Microsoft ever issues
+  under another authority, list both thumbprints (comma separated) in the release that changes it.
+- **macOS:** the team id: `codesign -dv --verbose=4 stonewave | grep TeamIdentifier`.
 
 ## The gate before it goes online
 
@@ -92,9 +98,11 @@ Test-only settings, never for a release: `STONEWAVE_BUNDLE_TEST=1` allows `STONE
 (the bundle then carries a `TEST-BUNDLE-NOT-FOR-PUBLISHING` file; without the switch both are refused), and `STONEWAVE_INSTALL_SOURCED=1` makes
 `install.sh` only define its functions and end with status 0 without installing anything.
 
-They use no network and only temporary folders (the PowerShell one also a throw-away registry key; it never touches your real PATH). The
+They use no network of ours and only temporary folders (the PowerShell one also a throw-away registry key and a few test certificates in your own certificate store, which it removes again; Windows may ask Microsoft's revocation servers about the stand-in's chain; it never touches your real PATH). The
 macOS signature check is tested with a stand-in `codesign`; the Windows signature check with a program that Windows itself signed (its name and
-thumbprint are pinned for the test; an unsigned file, a changed copy and a wrong pin must all be refused). The macOS stand-in also checks that the
+authority are pinned for the test; an unsigned file, a changed copy and a wrong pin must all be refused). Certificates made on the spot (a test authority, a
+different certificate under it, the same subject under another authority, a self-signed one with the same subject) test the pins themselves; Windows is asked about
+the real chains of the stand-in (and Microsoft's revocation servers when online). The macOS stand-in also checks that the
 installer passes **its own requirement** (`-R=`: Apple's root, the Developer ID CA, a Developer ID Application leaf, our team as OU) and refuses a
 signature that satisfies only the text checks. The real `irm | iex` path is run (the text, with Invoke-Expression, in a session of its own, aimed at a port
 where nothing listens): it must leave no variable, function, strict mode, error preference or TLS setting behind.
