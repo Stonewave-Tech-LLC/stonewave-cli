@@ -32,9 +32,9 @@ Commands:
 Options for run:
   --agent <name>          The agent (default: the only one connected here)
   --wave <url>            Address of Wave's API (or STONEWAVE_WAVE_URL; else the one `agent connect` saved)
-  --key-env <NAME>        Take the agent's key from this environment variable (for example under `infisical run`), never from a file
+  --key-env <NAME>        Take the agent's key from this environment variable (for example from a secret-store command), never from a file
   --workdir <folder>      The agent's own folder, the only place it can read and write (default ~/wave-agents/<agent>)
-  --rooms \"A,B\"           Only serve these rooms (names, short names or ids; default: every room the agent may read)
+  --rooms \"A,B\"           The rooms to serve (required; names, short names or ids; the names become ids once, at the start)
   --poll-secs <n>         Seconds between looks at the inbox (default 15)
   --timeout-min <n>       Minutes one wake may take (default 20)
   --max-turns <n>         Turns one wake may take (default 40)
@@ -257,6 +257,9 @@ fn short(id: &str) -> String {
 }
 
 fn print_report(rep: &Report, last_wait: &mut Option<String>) {
+    for n in &rep.notes {
+        say(n);
+    }
     for (room, how) in &rep.woke {
         say(&format!("woke the session of room {} ({how})", short(room)));
     }
@@ -503,6 +506,9 @@ fn run(
     env_get: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ExitCode, String> {
     let cfg = build_config(args, dirs, env_get)?;
+    if cfg.rooms.is_empty() {
+        return Err("name the rooms to serve with --rooms \"Room A,Room B\" (a name, a short name or an id); a station that answers in every room it can read is not the default".into());
+    }
     let paths = station_run::paths(dirs, &cfg.agent);
     let key = if args.dry_run {
         // a dry run needs to know the key exists, not to use it
@@ -557,6 +563,11 @@ fn run(
     }
     // one station per agent: a second one would share the inbox position and wake twice
     let _lock = station_run::Lock::acquire(&st.paths.lock)?;
+    if let Some(pid) = station_run::previous_wake_running(&st.paths.child) {
+        return Err(format!(
+            "a wake of an earlier station is still running (process {pid}); let it end, or end it yourself, then start again"
+        ));
+    }
     let _signals = Signals::install();
     say(&format!(
         "started for agent {agent}; one session per room is continued when a person of the company mentions it"

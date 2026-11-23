@@ -26,7 +26,11 @@ pub const BUILTIN_TOOLS: &str = "Read,Write,Edit,Glob,Grep";
 /// What a wake may do besides Wave's tools: look at and change files in the working folder.
 pub const ALLOWED_TOOLS: &str = "mcp__wave,Read,Write,Edit,Glob,Grep";
 /// Said out loud as well, so a mistake in another flag cannot bring one of these back.
-pub const DENIED_TOOLS: &str = "Bash,PowerShell,WebFetch,WebSearch,Agent";
+pub const DENIED_TOOLS: &str = "Bash,PowerShell,WebFetch,WebSearch,Agent,Write(.claude/**),Edit(.claude/**),Write(.mcp.json),Edit(.mcp.json),Write(CLAUDE.local.md),Edit(CLAUDE.local.md)";
+
+/// Settings given on the command line. `--restricted` already ignores the user, project and local settings files; this says it a second time for the part
+/// that matters most: no hook runs, whatever a file in the folder says. (A hook would run as a shell command with the key in its environment.)
+pub const SETTINGS_JSON: &str = r#"{"disableAllHooks":true}"#;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -102,6 +106,8 @@ pub fn build_args(
         ALLOWED_TOOLS.into(),
         "--disallowedTools".into(),
         DENIED_TOOLS.into(),
+        "--settings".into(),
+        SETTINGS_JSON.into(),
         "--max-turns".into(),
         s.max_turns.to_string(),
         "--append-system-prompt".into(),
@@ -236,6 +242,20 @@ mod tests {
         assert_eq!(after("--permission-prompts").as_deref(), Some("none"));
         assert_eq!(after("--mcp-config").as_deref(), Some("/s/mcp.json"));
         assert_eq!(after("--max-turns").as_deref(), Some("40"));
+        assert_eq!(
+            after("--settings").as_deref(),
+            Some(r#"{"disableAllHooks":true}"#)
+        );
+        let denied_all = after("--disallowedTools").unwrap();
+        for planted in [
+            "Write(.claude/**)",
+            "Edit(.claude/**)",
+            "Write(.mcp.json)",
+            "Edit(.mcp.json)",
+            "Write(CLAUDE.local.md)",
+        ] {
+            assert!(denied_all.contains(planted), "{planted}");
+        }
         assert_eq!(after("--max-budget-usd").as_deref(), Some("2.00"));
         assert_eq!(
             after("--resume").as_deref(),

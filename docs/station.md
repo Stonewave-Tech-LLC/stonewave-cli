@@ -12,7 +12,7 @@ Slice 1 supports **Claude Code**. Codex, Grok Build and Gemini follow, each only
 1. The station asks Wave's inbox (MCP tool `inbox`, every 15 seconds) what is addressed to the agent. The first start only notes where the inbox
    stands; old items wake nobody.
 2. An item **wakes** the agent only if a **person of the company** wrote it (not an agent, not text of outside origin) and its room is one the station
-   was told to serve (`--rooms`; default: every room the agent may read). Everything else is skipped, and the station says how many and why, never what.
+   was told to serve (`--rooms`, required: the names are turned into room ids once at the start and only the ids count afterwards). Everything else is skipped, and the station says how many and why, never what.
 3. For each room it continues that room's session: `claude -p <fixed text with ids> --resume <session>`. The first wake of a room starts a session,
    the next ones continue it. If Claude Code no longer has the session, one fresh run takes its place (fallback).
 4. The run answers in Wave itself (tool `post`). A run that never got going (no turn at all) is tried once more; one that already worked and then hit a
@@ -32,7 +32,7 @@ One session per **room**, not one for everything: a shared session would carry w
 | | |
 |---|---|
 | Tools | Wave's tools (one MCP server, `wave`), and reading and changing files inside the working folder. **No shell, no web.** |
-| How | `--restricted` and `--tools Read,Write,Edit,Glob,Grep` (only the file tools exist; Claude Code 2.1.259 or newer, which the station checks before it starts), `--strict-mcp-config` with a file that names the key variable, `--permission-mode dontAsk --permission-prompts none`, `--allowedTools`/`--disallowedTools`, `--max-turns`, `--max-budget-usd` |
+| How | `--restricted` and `--tools Read,Write,Edit,Glob,Grep` (only the file tools exist; Claude Code 2.1.259 or newer, which the station checks before it starts), `--strict-mcp-config` with a file that names the key variable, `--permission-mode dontAsk --permission-prompts none`, `--allowedTools`/`--disallowedTools`, `--max-turns`, `--max-budget-usd`. **Settings and hooks:** `--restricted` ignores the user, project and local settings files, `--settings '{"disableAllHooks":true}'` says no hook runs, writes to `.claude/`, `.mcp.json` and `CLAUDE.local.md` are denied, a room folder (or any folder above it up to the working folder) that carries one of them is not woken, and whatever of that kind a wake wrote is removed after it (a hook written in one wake would run as a shell command with the key in its environment on the next resume) |
 | Folder | The agent's own folder (`--workdir`, default `~/wave-agents/<agent>`) and, inside it, **one folder per room** (`rooms/<room>`): a wake runs in its room's folder and sees only that one, so what one room's session writes is not in reach of another room's. Shared instructions go into a `CLAUDE.md` of the parent folder (Claude Code reads parent folders too). Refused: your home folder, the folders that hold keys or logins (`~/.config`, `~/.local`, `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.claude`, the state folder), a path with `..`, a link that leads to one of them or out of the folder; places are compared by their real place, and checked again before every wake |
 | Prompt | A fixed text with ids. **The text of a message never goes into a command.** The run reads it through Wave's tools, where text from outside the company comes wrapped |
 | Environment | Only what the program needs to find its login and its network, plus `WAVE_AGENT_KEY`. Other keys, tokens and cloud credentials of the user stay out |
@@ -65,7 +65,7 @@ The menu (`stonewave` on a terminal) lists what is installed and connected and s
 ### The key without a file (a server with a secret store)
 
 ```bash
-infisical run --env=<env> -- \
+<secret-store command that runs a program with secrets in its environment> -- \
   stonewave agent station run --agent demo \
     --wave https://<wave api> --key-env MY_AGENT_KEY \
     --workdir /home/<user>/demo-station/work \
@@ -89,14 +89,14 @@ Wants=network-online.target
 Type=simple
 Restart=on-failure
 RestartSec=30
-ExecStart=/usr/bin/env infisical run --env=<env> -- /usr/local/bin/stonewave agent station run --agent demo --wave https://<wave api> --key-env MY_AGENT_KEY --workdir %h/demo-station/work --rooms "Team room,Company room"
+ExecStart=/usr/bin/env <secret-store command> -- /usr/local/bin/stonewave agent station run --agent demo --wave https://<wave api> --key-env MY_AGENT_KEY --workdir %h/demo-station/work --rooms "Team room,Company room"
 
 [Install]
 WantedBy=default.target
 ```
 
 then `systemctl --user daemon-reload && systemctl --user enable --now stonewave-station-demo`, and `loginctl enable-linger <user>` to keep it running
-while nobody is logged in (the station never does that for you). How `infisical` signs in on that server is the existing setup there; the station
+while nobody is logged in (the station never does that for you). How the secret-store command signs in on that server is the existing setup there; the station
 only needs the variable.
 
 `stonewave agent connect` does not (yet) install a service that runs the station: the wake service it offers only writes lines into a log file. A
@@ -113,7 +113,8 @@ All in the same private folders as the key (`~/.config/wave`, `~/.local/state/wa
 | `<agent>.mcp.json` | the MCP file of a wake: the address and the *name* of the key variable. **No key** |
 | `<agent>.runs.log` | one line per run: time, room, how it ended, seconds, turns, estimated cost. **No text** |
 | `<agent>.station.paused` | exists while paused |
-| `<agent>.station.lock` | exists while a station runs; kept fresh every 15 seconds (a lock older than 90 seconds is taken over) |
+| `<agent>.station.lock` | exists while a station runs (created in one step that fails if it exists; holds the process id; kept fresh every 15 seconds) |
+| `<agent>.station.child` | the process id of the wake that is going; a new station refuses to start while that process is still alive |
 
 ## What was tested, and what was not
 
@@ -146,5 +147,6 @@ Tested (`cargo test`; the Linux row also ran in a throw-away WSL as a normal use
   room: the station writes one note into the room and goes on.
 - The folder check is a deny-list of places that hold keys or logins (home, `~/.config`, `~/.ssh`, `~/.aws`, ...), not a list of places that are allowed.
   It is written for Linux; folders such as macOS `Library` and Windows `AppData` are guarded by name, other places are not.
-- The lock is a file whose age is checked: two stations started at the very same moment can both start (the second is refused from the next minute on);
-  a station that was killed hard blocks a restart for up to 90 seconds.
+- The lock is one file made in a single step, with the process id of the station. On Linux and macOS a lock whose process is gone is taken over at once, and a
+  new station also refuses to start while a wake left behind by a killed station is still running (it ends nothing itself: you decide). On Windows the age of the
+  file decides (90 seconds), and the left-behind wake is not detected.

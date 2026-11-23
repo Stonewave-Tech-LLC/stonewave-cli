@@ -25,6 +25,9 @@ pub struct RunReq {
     pub cwd: PathBuf,
     pub timeout: Duration,
     pub grace: Duration,
+    /// Where the process id of the run is written while it runs (and removed when it is over), so a station that starts after a hard kill can
+    /// see that a wake of the old one is still going.
+    pub pid_file: Option<PathBuf>,
 }
 
 /// The environment holds the key, so it is never printed, not even by a `{:?}`.
@@ -226,6 +229,9 @@ impl Spawn for RealSpawn {
                 };
             }
         };
+        if let Some(p) = &req.pid_file {
+            let _ = std::fs::write(p, child.id().to_string());
+        }
         let out = child.stdout.take().map(drain);
         let err = child.stderr.take().map(drain);
         let mut asked: Option<Instant> = None;
@@ -257,6 +263,9 @@ impl Spawn for RealSpawn {
         };
         // a program that left a helper behind holding the pipes open must not keep the station waiting
         clean_up_group(&child);
+        if let Some(p) = &req.pid_file {
+            let _ = std::fs::remove_file(p);
+        }
         let take = |h: Option<thread::JoinHandle<Vec<u8>>>| -> String {
             h.and_then(|h| h.join().ok())
                 .map(|b| String::from_utf8_lossy(&b).into_owned())
@@ -377,6 +386,7 @@ mod tests {
             cwd: cwd.into(),
             timeout,
             grace: Duration::from_millis(300),
+            pid_file: None,
         }
     }
 
@@ -523,6 +533,7 @@ mod env_tests {
             cwd: "/w".into(),
             timeout: Duration::from_secs(1),
             grace: Duration::from_secs(1),
+            pid_file: None,
         };
         let t = format!("{r:?}");
         assert!(

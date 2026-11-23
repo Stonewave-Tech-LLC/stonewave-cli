@@ -13,7 +13,7 @@
 //!
 //! Slice 1 polls the inbox (every `poll`, 15 s by default). The live line to Wave's doorbell is slice 2.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -38,8 +38,6 @@ const MAX_PAGES: usize = 5;
 const MAX_BASELINE_PAGES: usize = 50;
 /// Entries a woken room is remembered for, so a wake is never repeated for the same entry.
 const DONE_KEEP: usize = 300;
-/// A room name that was read this long ago is read again.
-const NAMES_MAX_AGE: u64 = 600;
 const NOTE: &str = "notes/handover.md";
 
 /// Ids go into a prompt, so they must be plain.
@@ -53,7 +51,7 @@ fn plain_id(s: &str) -> bool {
 pub enum KeySource {
     /// A private file (`agent connect` writes one).
     File(PathBuf),
-    /// An environment variable of the station's own process (for example from `infisical run`); the key never touches a disk.
+    /// An environment variable of the station's own process (for example from a secret-store command); the key never touches a disk.
     Env(String),
 }
 
@@ -105,7 +103,7 @@ impl Config {
 pub fn load_key(src: &KeySource, env: &dyn Fn(&str) -> Option<String>) -> Result<Key, String> {
     match src {
         KeySource::Env(name) => {
-            let v = env(name).ok_or_else(|| format!("the variable {name} is not set (start the station with `infisical run -- ...` or export it)"))?;
+            let v = env(name).ok_or_else(|| format!("the variable {name} is not set (start the station through your secret-store command or export it)"))?;
             Key::parse(&v).ok_or_else(|| {
                 format!("the variable {name} does not hold an agent key (it starts with wak_)")
             })
@@ -201,11 +199,7 @@ pub enum Verdict2 {
 }
 
 /// Pure: does this inbox item wake the agent? Fails closed: an item that does not say plainly that it is not of outside origin does not wake.
-pub fn classify(
-    item: &Value,
-    rooms_wanted: &[String],
-    names: &BTreeMap<String, String>,
-) -> Verdict2 {
+pub fn classify(item: &Value, rooms: &BTreeSet<String>) -> Verdict2 {
     let Some(entry) = item
         .get("id")
         .and_then(Value::as_str)
@@ -230,15 +224,10 @@ pub fn classify(
         Some("agent") => return Verdict2::Skip("written by an agent"),
         _ => return Verdict2::Skip("not written by a person of the company"),
     }
-    if !rooms_wanted.is_empty() {
-        let label = names.get(room).map(String::as_str).unwrap_or("");
-        let ok = rooms_wanted.iter().any(|w| {
-            w.eq_ignore_ascii_case(room)
-                || (!label.is_empty() && w.trim().eq_ignore_ascii_case(label.trim()))
-        });
-        if !ok {
-            return Verdict2::Skip("a room this station does not serve");
-        }
+    // rooms are matched by their id (the names were turned into ids once, at the start): a room that is renamed, or a new room with the same
+    // name, is not served by accident
+    if !rooms.contains(room) {
+        return Verdict2::Skip("a room this station does not serve");
     }
     Verdict2::Wake {
         room: room.to_owned(),
@@ -317,6 +306,8 @@ pub struct Paths {
     pub paused: PathBuf,
     pub runs_log: PathBuf,
     pub lock: PathBuf,
+    /// The process id of the wake that is going (written by the spawner).
+    pub child: PathBuf,
 }
 
 pub fn paths(dirs: &Dirs, agent: &str) -> Paths {
@@ -327,6 +318,7 @@ pub fn paths(dirs: &Dirs, agent: &str) -> Paths {
         paused: dirs.state.join(format!("{agent}.station.paused")),
         runs_log: dirs.state.join(format!("{agent}.runs.log")),
         lock: dirs.state.join(format!("{agent}.station.lock")),
+        child: dirs.state.join(format!("{agent}.station.child")),
     }
 }
 
@@ -341,34 +333,74 @@ pub struct Lock {
 const LOCK_FRESH: Duration = Duration::from_secs(90);
 const LOCK_BEAT: Duration = Duration::from_secs(15);
 
+/// Whether a process with this id exists (Linux and macOS; elsewhere the age of the lock file decides).
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        if pid == 0 || pid > i32::MAX as u32 {
+            return false;
+        }
+        // SAFETY: signal 0 only checks that the process exists and may be signalled.
+        let r = unsafe { libc::kill(pid as i32, 0) };
+        r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// A wake of an earlier station that is still going (the station was killed hard and its run was left behind): a new wake must not start next
+/// to it. Nothing is ended here; the person decides. A stale file of a run that is over is removed.
+pub fn previous_wake_running(child_file: &Path) -> Option<u32> {
+    let pid: u32 = fs::read_to_string(child_file).ok()?.trim().parse().ok()?;
+    if pid_alive(pid) {
+        Some(pid)
+    } else {
+        let _ = fs::remove_file(child_file);
+        None
+    }
+}
+
+fn create_lock(path: &Path, pid: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| "another station for this agent has just started".to_owned())?;
+    f.write_all(pid.as_bytes())
+        .map_err(|e| format!("cannot write the lock file: {}", e.kind()))
+}
+
 impl Lock {
+    /// The lock file is made in one step that fails if it exists. One that exists blocks while its station is alive (its process id is still
+    /// there on Linux and macOS; elsewhere: its file was touched in the last 90 seconds); otherwise it is replaced.
     pub fn acquire(path: &Path) -> Result<Lock, String> {
-        if let Some(age) = fs::metadata(path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.elapsed().ok())
-        {
-            if age < LOCK_FRESH {
-                let who = fs::read_to_string(path).unwrap_or_default();
+        let pid = std::process::id().to_string();
+        if create_lock(path, &pid).is_err() {
+            let who = fs::read_to_string(path).unwrap_or_default();
+            let fresh = fs::metadata(path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age < LOCK_FRESH);
+            let alive = match who.trim().parse::<u32>() {
+                Ok(p) if cfg!(unix) => pid_alive(p),
+                _ => fresh,
+            };
+            if alive {
                 return Err(format!(
-                    "another station for this agent is running (process {}); stop it first, or wait a minute if it just stopped",
-                    who.trim().chars().take(12).collect::<String>()
+                    "another station for this agent is running (process {}); stop it first. If you are sure it is gone, delete {}",
+                    who.trim().chars().take(12).collect::<String>(),
+                    super::dirs::text(path)
                 ));
             }
+            // nobody keeps it: replace it, in a step that fails if a second new station does the same at the same moment
+            let _ = fs::remove_file(path);
+            create_lock(path, &pid)?;
         }
-        let pid = std::process::id().to_string();
-        // a first start takes the file only if nobody else made it a moment ago
-        if !path.exists() {
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .map_err(|_| "another station for this agent has just started".to_owned())?;
-            use std::io::Write as _;
-            let _ = f.write_all(pid.as_bytes());
-        }
-        atomic_write(path, pid.as_bytes(), 0o600)
-            .map_err(|e| format!("cannot write the lock file: {}", e.kind()))?;
         let stop = Arc::new(AtomicBool::new(false));
         let (p2, s2) = (path.to_path_buf(), stop.clone());
         thread::spawn(move || {
@@ -538,6 +570,51 @@ pub fn check_workdir(
     Ok(warnings)
 }
 
+/// What a folder may not carry for a wake to start in it: settings, hooks or MCP servers of their own, or a local instruction file that can hold them.
+/// Looked for in the room's folder and in every folder above it up to the working folder.
+const PLANTABLE: &[&str] = &[".claude", ".mcp.json", "CLAUDE.local.md"];
+
+pub fn settings_found(room_dir: &Path, workdir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = Some(room_dir);
+    while let Some(d) = cur {
+        for n in PLANTABLE {
+            if fs::symlink_metadata(d.join(n)).is_ok() {
+                out.push(format!(
+                    "{n} in {}",
+                    d.file_name()
+                        .map_or("?".into(), |f| f.to_string_lossy().into_owned())
+                ));
+            }
+        }
+        if d == workdir {
+            break;
+        }
+        cur = d.parent();
+    }
+    out
+}
+
+/// A wake only gets to write inside its room folder: whatever of that kind appeared there is removed.
+pub fn strip_planted(room_dir: &Path) -> Vec<String> {
+    let mut removed = Vec::new();
+    for n in PLANTABLE {
+        let p = room_dir.join(n);
+        let Ok(meta) = fs::symlink_metadata(&p) else {
+            continue;
+        };
+        let done = if meta.is_dir() {
+            fs::remove_dir_all(&p).is_ok()
+        } else {
+            fs::remove_file(&p).is_ok()
+        };
+        if done {
+            removed.push((*n).to_owned());
+        }
+    }
+    removed
+}
+
 // ------------------------------------------------------------------ the station
 
 pub struct Deps<'a> {
@@ -564,6 +641,13 @@ pub struct Report {
     pub backoff: bool,
     /// Seconds Wave asked to wait.
     pub wait_secs: Option<u64>,
+    /// Things to say once (the rooms that are served, settings a wake wrote that were removed).
+    pub notes: Vec<String>,
+}
+
+enum RoomsErr {
+    Fatal(String),
+    Wait(String, Option<u64>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -608,8 +692,10 @@ pub struct Station<'a> {
     key: Key,
     pub state: StationState,
     pub sessions: Sessions,
-    pub names: BTreeMap<String, String>,
-    names_at: u64,
+    /// The ids of the rooms that are served (the names of `Config::rooms` turned into ids once).
+    pub room_ids: BTreeSet<String>,
+    rooms_resolved: bool,
+    notes: Vec<String>,
     rpc_id: u64,
 }
 
@@ -625,8 +711,9 @@ impl<'a> Station<'a> {
             key,
             state,
             sessions,
-            names: BTreeMap::new(),
-            names_at: 0,
+            room_ids: BTreeSet::new(),
+            rooms_resolved: false,
+            notes: Vec::new(),
             rpc_id: 0,
         }
     }
@@ -648,23 +735,81 @@ impl<'a> Station<'a> {
         let _ = self.state.save(&self.paths.state);
     }
 
-    /// False when the names could not be read.
-    fn refresh_rooms(&mut self) -> bool {
-        match self.call("rooms", json!({})) {
-            Ok(d) => {
-                self.names.clear();
-                for r in d["items"].as_array().into_iter().flatten() {
-                    if let Some(id) = r["id"].as_str() {
-                        let name = r["name"].as_str().or(r["key"].as_str()).unwrap_or("");
-                        self.names
-                            .insert(id.to_owned(), name.chars().take(80).collect());
-                    }
-                }
-                self.names_at = (self.deps.now)();
-                true
-            }
-            Err(_) => false,
+    /// Turns the rooms the person named (a name, a short name or an id) into ids, once. A name that matches no room the agent can read, or more than
+    /// one, is refused: serving a room by a guess is worse than not starting.
+    fn resolve_rooms(&mut self) -> Result<(), RoomsErr> {
+        if self.cfg.rooms.is_empty() {
+            return Err(RoomsErr::Fatal(
+                "no rooms to serve: name them with --rooms (a station that answers in every room it can read is not the default)".into(),
+            ));
         }
+        let d = match self.call("rooms", json!({})) {
+            Ok(d) => d,
+            Err(WaveErr::Key(m)) => return Err(RoomsErr::Fatal(m)),
+            Err(WaveErr::Later(m, secs)) => return Err(RoomsErr::Wait(m, secs)),
+            Err(WaveErr::Other(m)) => return Err(RoomsErr::Wait(m, None)),
+        };
+        let rooms: Vec<(String, String, String)> = d["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| {
+                let id = r["id"].as_str().filter(|s| plain_id(s))?;
+                let name = r["name"].as_str().unwrap_or("");
+                let key = r["key"].as_str().unwrap_or("");
+                Some((
+                    id.to_owned(),
+                    name.chars().take(80).collect(),
+                    key.chars().take(80).collect(),
+                ))
+            })
+            .collect();
+        let mut ids = BTreeSet::new();
+        for want in self.cfg.rooms.clone() {
+            let w = want.trim();
+            let by_id: Vec<&(String, String, String)> = rooms
+                .iter()
+                .filter(|r| r.0.eq_ignore_ascii_case(w))
+                .collect();
+            let found: Vec<&(String, String, String)> = if by_id.is_empty() {
+                rooms
+                    .iter()
+                    .filter(|r| {
+                        r.1.trim().eq_ignore_ascii_case(w)
+                            || (!r.2.is_empty() && r.2.trim().eq_ignore_ascii_case(w))
+                    })
+                    .collect()
+            } else {
+                by_id
+            };
+            match found.as_slice() {
+                [one] => {
+                    self.notes.push(format!(
+                        "serving room {} ({})",
+                        if one.1.is_empty() { &one.2 } else { &one.1 },
+                        one.0.chars().take(8).collect::<String>()
+                    ));
+                    ids.insert(one.0.clone());
+                }
+                [] => {
+                    let known: Vec<&str> = rooms.iter().map(|r| r.1.as_str()).take(20).collect();
+                    return Err(RoomsErr::Fatal(format!(
+                        "no room called `{}` that the agent can read (it can read: {})",
+                        scrub(w),
+                        known.join(", ")
+                    )));
+                }
+                _ => {
+                    return Err(RoomsErr::Fatal(format!(
+                        "several rooms are called `{}`: name the one you mean by its id",
+                        scrub(w)
+                    )));
+                }
+            }
+        }
+        self.room_ids = ids;
+        self.rooms_resolved = true;
+        Ok(())
     }
 
     fn write_mcp_file(&self) -> std::io::Result<()> {
@@ -704,6 +849,7 @@ impl<'a> Station<'a> {
             cwd: cwd.to_path_buf(),
             timeout: self.cfg.timeout,
             grace: self.cfg.grace,
+            pid_file: Some(self.paths.child.clone()),
         })
     }
 
@@ -817,8 +963,32 @@ impl<'a> Station<'a> {
         }
     }
 
-    /// One wake of one room.
+    /// One wake of one room. Before it: a folder that carries settings, hooks or MCP servers of its own is refused. After it: anything of that kind the
+    /// wake wrote is removed (it would be read on the next resume).
     fn wake_room(&mut self, room: &str, entries: &[String]) -> Result<Outcome, String> {
+        let dir = self.room_dir(room);
+        let found = settings_found(&dir, &self.cfg.workdir);
+        if !found.is_empty() {
+            self.notes.push(format!(
+                "room {} is not woken: its folder (or one above it) has {}; remove it, a wake must not start with settings of its own",
+                room.chars().take(8).collect::<String>(),
+                found.join(", ")
+            ));
+            return Ok(Outcome::FolderRefused);
+        }
+        let outcome = self.wake_room_inner(room, entries);
+        let removed = strip_planted(&dir);
+        if !removed.is_empty() {
+            self.notes.push(format!(
+                "removed {} that a wake wrote into the folder of room {}",
+                removed.join(", "),
+                room.chars().take(8).collect::<String>()
+            ));
+        }
+        outcome
+    }
+
+    fn wake_room_inner(&mut self, room: &str, entries: &[String]) -> Result<Outcome, String> {
         let key_file = match &self.cfg.key {
             KeySource::File(p) => Some(p.clone()),
             KeySource::Env(_) => None,
@@ -909,10 +1079,31 @@ impl<'a> Station<'a> {
 
     /// One look at the inbox and the wakes it calls for.
     pub fn cycle(&mut self) -> Report {
+        let mut rep = self.cycle_inner();
+        rep.notes.append(&mut self.notes);
+        rep
+    }
+
+    fn cycle_inner(&mut self) -> Report {
         let mut rep = Report::default();
         if self.paths.paused.exists() {
             rep.waiting = Some("paused (`stonewave agent station resume` ends the pause)".into());
             return rep;
+        }
+        if !self.rooms_resolved {
+            match self.resolve_rooms() {
+                Ok(()) => rep.notes.append(&mut self.notes),
+                Err(RoomsErr::Fatal(m)) => {
+                    rep.fatal = Some(m);
+                    return rep;
+                }
+                Err(RoomsErr::Wait(m, secs)) => {
+                    rep.waiting = Some(m);
+                    rep.backoff = true;
+                    rep.wait_secs = secs;
+                    return rep;
+                }
+            }
         }
         let mut pages = 0;
         loop {
@@ -949,27 +1140,11 @@ impl<'a> Station<'a> {
                 }
                 continue;
             }
-            // room names are only needed when rooms were named; a name that cannot be read holds the page back instead of skipping its entries
-            if !self.cfg.rooms.is_empty() {
-                let unknown = items.iter().any(|i| {
-                    i["room_id"]
-                        .as_str()
-                        .is_some_and(|r| !self.names.contains_key(r))
-                });
-                let stale = (self.deps.now)().saturating_sub(self.names_at) > NAMES_MAX_AGE;
-                if (unknown || stale) && !self.refresh_rooms() && (unknown || self.names.is_empty())
-                {
-                    rep.waiting =
-                        Some("cannot read the room names from Wave; will try again".into());
-                    rep.backoff = true;
-                    return rep;
-                }
-            }
             // who is woken, room by room in the order of the first entry
             let mut order: Vec<String> = Vec::new();
             let mut by_room: BTreeMap<String, (Vec<String>, u64)> = BTreeMap::new();
             for it in &items {
-                match classify(it, &self.cfg.rooms, &self.names) {
+                match classify(it, &self.room_ids) {
                     Verdict2::Skip(why) => rep.skipped.push(why),
                     Verdict2::Wake { room, entry } => {
                         if self.state.done.contains(&entry) {

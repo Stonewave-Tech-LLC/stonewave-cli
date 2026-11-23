@@ -296,6 +296,41 @@ fn the_dry_run_starts_nothing_and_asks_nobody() {
 }
 
 #[test]
+fn without_rooms_the_station_does_not_start() {
+    let home = Home::new();
+    let work = home.0.join("wave-agents").join("demo");
+    let record = home.0.join("record.txt");
+    let claude = fake_claude(&home.0, &record);
+    let wave = serve(vec![inbox(vec![], 1)]);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_stonewave"));
+    c.env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", &home.0)
+        .env("DEMO_KEY", KEY)
+        .args([
+            "agent",
+            "station",
+            "run",
+            "--agent",
+            "demo",
+            "--wave",
+            &wave.url,
+            "--key-env",
+            "DEMO_KEY",
+            "--workdir",
+        ])
+        .arg(&work)
+        .arg("--claude")
+        .arg(&claude)
+        .arg("--once");
+    let o = c.output().unwrap();
+    let t = text(&o);
+    assert_eq!(o.status.code(), Some(2), "{t}");
+    assert!(t.contains("name the rooms to serve"), "{t}");
+    assert!(wave.seen.lock().unwrap().is_empty());
+}
+
+#[test]
 fn a_claude_code_that_is_too_old_is_refused_before_anything_is_asked() {
     let home = Home::new();
     let work = home.0.join("wave-agents").join("demo");
