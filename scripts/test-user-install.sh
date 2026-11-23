@@ -251,7 +251,19 @@ cat >"$fakebin/codesign" <<'EOF'
 #!/bin/sh
 # stand-in: behaviour set by FAKE_CS_* in the environment
 case "$1" in
---verify) [ "${FAKE_CS_VALID:-yes}" = yes ] && exit 0 || { echo "invalid signature" >&2; exit 1; } ;;
+--verify)
+    # the check must bring its own requirement (-R=text): without it codesign would measure the file against the one written into the file
+    printf '%s\n' "$*" >>"${FAKE_CS_LOG:-/dev/null}"
+    req=
+    for a in "$@"; do
+        case "$a" in -R=*) req=${a#-R=} ;; esac
+    done
+    [ -n "$req" ] || { echo "checked against its own requirement" >&2; exit 1; }
+    [ "${FAKE_CS_VALID:-yes}" = yes ] || { echo "invalid signature" >&2; exit 1; }
+    # a certificate the maker made himself: the text checks of -dv would pass, the requirement does not
+    [ "${FAKE_CS_APPLE_CHAIN:-yes}" = yes ] || { echo "does not satisfy the requirement" >&2; exit 3; }
+    exit 0
+    ;;
 -dv)
     echo "Executable=/x/stonewave" >&2
     echo "Authority=${FAKE_CS_AUTHORITY:-Developer ID Application: Stonewave Tech LLC (ABCDE12345)}" >&2
@@ -273,13 +285,27 @@ check "a good Developer ID signature of our team passes" [ $code -eq 0 ]
 has "mac good" "$out" "signature ok (Developer ID, team ABCDE12345)"
 out=$(FAKE_CS_VALID=no mac); code=$?
 check "an invalid signature is refused" [ $code -ne 0 ]
-has "mac invalid" "$out" "not valid"
+has "mac invalid" "$out" "not a valid Developer ID signature"
 out=$(FAKE_CS_TEAM=ZZZZZ99999 mac); code=$?
 check "another team is refused" [ $code -ne 0 ]
 has "mac team" "$out" "signed by another team (ZZZZZ99999)"
 out=$(FAKE_CS_AUTHORITY="Apple Development: someone" mac); code=$?
 check "a development certificate is refused" [ $code -ne 0 ]
 has "mac authority" "$out" "not signed with a Developer ID"
+# the requirement is ours and carries the pinned team: Apple's root, the Developer ID CA, a Developer ID Application leaf, our OU
+FAKE_CS_LOG="$T/cs.log"
+export FAKE_CS_LOG
+: >"$FAKE_CS_LOG"
+out=$(mac); code=$?
+want='-R=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "ABCDE12345"'
+check "codesign was given exactly our requirement" grep -Fq -- "$want" "$FAKE_CS_LOG"
+check "with --strict" grep -Fq -- "--verify --strict" "$FAKE_CS_LOG"
+out=$(FAKE_CS_APPLE_CHAIN=no mac); code=$?
+check "a self-made 'Developer ID' certificate with our team id is refused" [ $code -ne 0 ]
+has "mac self-made" "$out" "not a valid Developer ID signature of our team"
+out=$(MAC_TEAM_ID_FOR_TEST="abc; touch x" mac); code=$?
+check "an odd pinned team id is refused before anything runs" [ $code -ne 0 ]
+has "mac odd team" "$out" "team id pinned in this installer is not valid"
 out=$(MAC_TEAM_ID_FOR_TEST="@MAC_TEAM_ID@" mac); code=$?
 check "an installer that was not prepared for macOS refuses" [ $code -ne 0 ]
 has "mac unprepared" "$out" "not prepared for macOS"
@@ -291,9 +317,15 @@ B="$T/bundle"
 fake1="$T/fake-linux"
 printf '#!/bin/sh\necho "stonewave 0.2.0 (cafe0123)"\n' >"$fake1"
 chmod 755 "$fake1"
-ver=$(sed -n 's/^version = "\(.*\)"/\1/p' "$here/Cargo.toml" | head -n 1)
+ver=$(sed -n 's/^version = "\(.*\)"/\1/p' "$here/Cargo.toml" | tr -d '\r' | head -n 1)
 printf '#!/bin/sh\necho "stonewave %s (cafe0123)"\n' "$ver" >"$fake1"
-bundle() { STONEWAVE_BUNDLE_COMMIT=cafe0123 STONEWAVE_ALLOW_DIRTY=1 sh "$here/scripts/release-bundle.sh" "$@" 2>&1; }
+bundle() { STONEWAVE_BUNDLE_TEST=1 STONEWAVE_BUNDLE_COMMIT=cafe0123 STONEWAVE_ALLOW_DIRTY=1 sh "$here/scripts/release-bundle.sh" "$@" 2>&1; }
+# the test-only settings are refused without the test switch, and a test bundle says what it is
+out=$(STONEWAVE_BUNDLE_COMMIT=cafe0123 sh "$here/scripts/release-bundle.sh" "$T/bx" --x86_64-linux "$fake1" 2>&1); code=$?
+check "a made-up commit is refused without the test switch" [ $code -ne 0 ]
+has "test switch" "$out" "STONEWAVE_BUNDLE_TEST=1"
+out=$(STONEWAVE_ALLOW_DIRTY=1 sh "$here/scripts/release-bundle.sh" "$T/by" --x86_64-linux "$fake1" 2>&1); code=$?
+check "a dirty tree is refused without the test switch" [ $code -ne 0 ]
 out=$(bundle "$B" --x86_64-linux "$fake1"); code=$?
 check "a bundle with one Linux build" [ $code -eq 0 ]
 mf="$B/$ver/manifest.txt"
@@ -302,6 +334,8 @@ version $ver
 commit cafe0123" ]
 has "manifest line" "$(cat "$mf")" "file x86_64-linux $(sha "$fake1") $(wc -c <"$fake1" | tr -d ' ') stonewave-$ver-x86_64-linux"
 check "latest is a copy" cmp -s "$mf" "$B/latest/manifest.txt"
+check "a test bundle carries its mark" [ -f "$B/TEST-BUNDLE-NOT-FOR-PUBLISHING" ]
+has "test bundle says so" "$out" "TEST BUNDLE"
 check "installers are there" sh -c "[ -f '$B/install.sh' ] && [ -f '$B/install.ps1' ]"
 check "SHA256SUMS can be checked" sh -c "cd '$B/$ver' && sha256sum -c SHA256SUMS"
 out=$(bundle "$B" --x86_64-linux "$fake1"); code=$?
@@ -330,7 +364,7 @@ printf '#!/bin/sh\necho "stonewave 9.9.9 (cafe0123)"\n' >"$T/fake-wrong"
 chmod 755 "$T/fake-wrong"
 out=$(bundle "$T/b9" --x86_64-linux "$T/fake-wrong"); code=$?
 check "a program that says another version is refused" [ $code -ne 0 ]
-out=$(STONEWAVE_BUNDLE_COMMIT=cafe0123 sh "$here/scripts/release-bundle.sh" "$T/b10" --x86_64-linux "$fake1" 2>&1); code=$?
+out=$(STONEWAVE_BUNDLE_TEST=1 STONEWAVE_BUNDLE_COMMIT=cafe0123 sh "$here/scripts/release-bundle.sh" "$T/b10" --x86_64-linux "$fake1" 2>&1); code=$?
 if [ -n "$(cd "$here" && git status --porcelain --untracked-files=no 2>/dev/null)" ]; then
     check "a dirty tree is refused" [ $code -ne 0 ]
 fi
@@ -346,7 +380,7 @@ has "end to end" "$out" "release   $ver (cafe0123)"
 if [ -n "$real" ]; then
     R="$T/real"
     mkdir -p "$R"
-    out=$(STONEWAVE_BUNDLE_COMMIT=cafe0123 STONEWAVE_ALLOW_DIRTY=1 sh "$here/scripts/release-bundle.sh" "$R" --x86_64-linux "$real" 2>&1); code=$?
+    out=$(STONEWAVE_BUNDLE_TEST=1 STONEWAVE_BUNDLE_COMMIT=cafe0123 STONEWAVE_ALLOW_DIRTY=1 sh "$here/scripts/release-bundle.sh" "$R" --x86_64-linux "$real" 2>&1); code=$?
     check "the real program goes into a bundle" [ $code -eq 0 ]
     H7="$T/h7"
     mkdir -p "$H7"

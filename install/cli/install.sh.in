@@ -1,8 +1,8 @@
 #!/bin/sh
 # Stonewave CLI installer for one user. No root, no sudo.
 #
-#   curl -fsSL https://stonewavetech.com/cli/install.sh | sh
-#   curl -fsSL https://stonewavetech.com/cli/install.sh | sh -s -- --version 0.2.0 --add-to-path
+#   curl --proto '=https' --tlsv1.2 -fsSL https://stonewavetech.com/cli/install.sh | sh
+#   curl --proto '=https' --tlsv1.2 -fsSL https://stonewavetech.com/cli/install.sh | sh -s -- --version 0.2.0 --add-to-path
 #
 # Short on purpose, so you can read it before running it. It:
 #   1. works out your system (Linux or macOS, x86_64 or arm64),
@@ -80,7 +80,7 @@ fetch() {
     elif command -v curl >/dev/null 2>&1; then
         curl -fsSL --proto '=https' --tlsv1.2 --retry 2 --connect-timeout 20 --max-time 300 -o "$2" "$BASE/$1" || fail "download failed: $BASE/$1"
     elif command -v wget >/dev/null 2>&1; then
-        wget -q --https-only --secure-protocol=TLSv1_2 --tries=3 --timeout=60 -O "$2" "$BASE/$1" || fail "download failed: $BASE/$1"
+        wget -q --https-only --secure-protocol=TLSv1_2 --tries=3 --timeout=60 -O "$2" "$BASE/$1" || fail "download failed: $BASE/$1 (a BusyBox wget cannot do HTTPS with these settings: install curl, or a full wget)"
     else
         fail "needs curl or wget"
     fi
@@ -118,8 +118,14 @@ check_macos_signature() {
     case "$MAC_TEAM_ID" in
     @*) fail "this installer was not prepared for macOS (no team id pinned). Nothing was installed." ;;
     esac
+    printf '%s\n' "$MAC_TEAM_ID" | grep -Eq '^[A-Z0-9]{10}$' || fail "the team id pinned in this installer is not valid. Nothing was installed."
     command -v codesign >/dev/null 2>&1 || fail "codesign is missing, the signature cannot be checked"
-    codesign --verify --strict "$1" >/dev/null 2>&1 || fail "the code signature of the download is not valid. Nothing was installed."
+    # Without -R, codesign checks the file against the requirement written INTO the file, which its maker chooses: a certificate of the maker's
+    # own would pass. This requirement is ours: the chain ends at Apple's root (anchor apple generic), runs through Apple's Developer ID
+    # Certification Authority (the intermediate, OID 1.2.840.113635.100.6.2.6), the leaf is a "Developer ID Application" certificate (OID
+    # 1.2.840.113635.100.6.1.13), and its organizational unit is our team. The "=" in front makes it a text requirement.
+    mac_req="anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$MAC_TEAM_ID\""
+    codesign --verify --strict "-R=$mac_req" "$1" >/dev/null 2>&1 || fail "the code signature of the download is not a valid Developer ID signature of our team. Nothing was installed."
     cs_info=$(codesign -dv --verbose=4 "$1" 2>&1) || fail "cannot read the code signature. Nothing was installed."
     printf '%s\n' "$cs_info" | grep -q '^Authority=Developer ID Application' || fail "the download is not signed with a Developer ID certificate. Nothing was installed."
     cs_team=$(printf '%s\n' "$cs_info" | sed -n 's/^TeamIdentifier=//p' | head -n 1)
@@ -319,5 +325,6 @@ path_help() {
     fi
 }
 
-# `STONEWAVE_INSTALL_SOURCED=1 . ./install.sh` only defines the functions (the tests use it); nothing else changes
+# For the tests only: with STONEWAVE_INSTALL_SOURCED=1 in the environment this file only defines its functions and does nothing else (it ends with
+# exit status 0 and no output, which is NOT an install). Never set it for a real install.
 [ "${STONEWAVE_INSTALL_SOURCED:-}" = 1 ] || main "$@"

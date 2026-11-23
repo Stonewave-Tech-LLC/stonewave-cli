@@ -73,6 +73,12 @@ Upload the new version folder first, then `latest/manifest.txt`, then the script
 does nothing. To pull a bad release, put the previous manifest back as `latest/manifest.txt` (installers never move back by themselves, so someone who
 already has the bad one is told how to go back with `--version`).
 
+**Pulling it from `latest` is not enough when the release has a security problem.** `latest/manifest.txt` is what a fresh install is served, and
+it is a plain file on our server: anybody (or anything that can write there) can point it at an older release, and every version folder that stays
+online stays installable with `--version X.Y.Z` (the checks pass for it: its file matches its own manifest). So a version found vulnerable is
+**deleted from the server** (its whole `<version>/` folder), not only taken out of `latest`. The installers refuse to go back by themselves, but only
+for a person who already has a newer one.
+
 ## Tests
 
 ```bash
@@ -82,6 +88,13 @@ scripts/test-user-install.sh [path-to-a-linux-build-made-with-STONEWAVE_COMMIT=c
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-user-install.ps1             # Windows PowerShell 5.1: ps1 installer
 ```
 
+Test-only settings, never for a release: `STONEWAVE_BUNDLE_TEST=1` allows `STONEWAVE_BUNDLE_COMMIT` and `STONEWAVE_ALLOW_DIRTY` in `release-bundle.sh`
+(the bundle then carries a `TEST-BUNDLE-NOT-FOR-PUBLISHING` file; without the switch both are refused), and `STONEWAVE_INSTALL_SOURCED=1` makes
+`install.sh` only define its functions and end with status 0 without installing anything.
+
 They use no network and only temporary folders (the PowerShell one also a throw-away registry key; it never touches your real PATH). The
 macOS signature check is tested with a stand-in `codesign`; the Windows signature check with a program that Windows itself signed (its name and
-thumbprint are pinned for the test; an unsigned file, a changed copy and a wrong pin must all be refused).
+thumbprint are pinned for the test; an unsigned file, a changed copy and a wrong pin must all be refused). The macOS stand-in also checks that the
+installer passes **its own requirement** (`-R=`: Apple's root, the Developer ID CA, a Developer ID Application leaf, our team as OU) and refuses a
+signature that satisfies only the text checks. The real `irm | iex` path is run (the text, with Invoke-Expression, in a session of its own, aimed at a port
+where nothing listens): it must leave no variable, function, strict mode, error preference or TLS setting behind.

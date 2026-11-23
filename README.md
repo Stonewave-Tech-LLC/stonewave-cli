@@ -53,7 +53,7 @@ anything. Exit code 0 means no check failed.
 For you, on your own computer (no root, no administrator rights; installs into your user folder, tells you about PATH, updates in place):
 
 ```bash
-curl -fsSL https://stonewavetech.com/cli/install.sh | sh          # Linux, macOS
+curl --proto '=https' --tlsv1.2 -fsSL https://stonewavetech.com/cli/install.sh | sh          # Linux, macOS
 ```
 ```powershell
 irm https://stonewavetech.com/cli/install.ps1 | iex                # Windows (PowerShell)

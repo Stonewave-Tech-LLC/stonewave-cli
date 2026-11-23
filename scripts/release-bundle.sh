@@ -16,6 +16,8 @@
 # anything and no key is involved: the installers check the code signatures of the Windows and macOS builds against what is pinned below.
 #
 # Environment:
+#   STONEWAVE_BUNDLE_TEST=1      TESTS ONLY: allows STONEWAVE_BUNDLE_COMMIT (a made-up commit) and STONEWAVE_ALLOW_DIRTY=1 (a tree with changes);
+#                                the bundle then carries a TEST-BUNDLE-NOT-FOR-PUBLISHING file. Without it both are refused.
 #   STONEWAVE_MAC_TEAM_ID        the Apple team id (10 characters), needed when a macOS file is given
 #   STONEWAVE_WIN_THUMBPRINTS    thumbprint(s) of the code-signing certificate, comma separated, needed when a Windows file is given
 #
@@ -52,8 +54,18 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$x86_64_linux" ] || { echo "release-bundle: a Linux x86_64 build is the least a release has (--x86_64-linux)" >&2; exit 1; }
 
-version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | tr -d '\r' | head -n 1)
 printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "release-bundle: Cargo.toml has no x.y.z version" >&2; exit 1; }
+# STONEWAVE_BUNDLE_COMMIT and STONEWAVE_ALLOW_DIRTY exist for the tests of this script and of the installers, which build bundles of made-up programs.
+# They only work together with STONEWAVE_BUNDLE_TEST=1, and a bundle made that way says so in a file and in its last line: never publish one.
+test_bundle=no
+if [ -n "${STONEWAVE_BUNDLE_COMMIT:-}${STONEWAVE_ALLOW_DIRTY:-}" ]; then
+    if [ "${STONEWAVE_BUNDLE_TEST:-}" != 1 ]; then
+        echo "release-bundle: STONEWAVE_BUNDLE_COMMIT and STONEWAVE_ALLOW_DIRTY are for the tests only (they need STONEWAVE_BUNDLE_TEST=1). A release is made from a clean commit." >&2
+        exit 1
+    fi
+    test_bundle=yes
+fi
 commit=${STONEWAVE_BUNDLE_COMMIT:-$(git rev-parse --short=8 HEAD)}
 printf '%s\n' "$commit" | grep -Eq '^[0-9a-f]{8}$' || { echo "release-bundle: no commit" >&2; exit 1; }
 if [ "${STONEWAVE_ALLOW_DIRTY:-}" != 1 ] && [ -n "$(git status --porcelain --untracked-files=no)" ]; then
@@ -122,5 +134,10 @@ chmod 644 "$out/install.sh" "$out/install.ps1"
 if [ "$latest" = yes ]; then
     mkdir -p "$out/latest"
     cp "$manifest" "$out/latest/manifest.txt"
+fi
+if [ "$test_bundle" = yes ]; then
+    echo "TEST BUNDLE: made with test-only settings, the commit is not the one the programs were built from. NOT FOR PUBLISHING." >"$out/TEST-BUNDLE-NOT-FOR-PUBLISHING"
+    echo "release-bundle: $out is a TEST BUNDLE (STONEWAVE_BUNDLE_TEST=1). Do not publish it."
+    exit 0
 fi
 echo "release-bundle: $out ($version, $commit) is ready. Check it with the installers before it goes online (see the top of this script)."

@@ -38,13 +38,25 @@ try {
     $e = $null
     [void][System.Management.Automation.Language.Parser]::ParseFile($rendered, [ref]$null, [ref]$e)
     Expect (-not $e) "install.ps1 does not parse: $e"
-    . $rendered                                 # only defines the functions
-    $script:SignerName = $cn
-    $script:SignerThumbprints = $thumb
+    # the installer is one script block (& { ... } @args): for the tests the wrapper lines are taken off, so that dot-sourcing defines the functions here
+    $all = @(Get-Content -LiteralPath $rendered)
+    $first = [array]::FindIndex($all, [Predicate[string]]{ param($l) $l -like '*stonewave-installer-begin' })
+    $last = [array]::FindIndex($all, [Predicate[string]]{ param($l) $l -like '*stonewave-installer-end' })
+    Expect (($first -ge 0) -and ($last -gt $first)) 'the wrapper markers are there'
+    $innerFile = Join-Path $T 'inner.ps1'
+    ($all[($first + 1)..($last - 1)]) | Set-Content -Encoding UTF8 -LiteralPath $innerFile
+    . $innerFile                                # only defines the functions
+    $SignerName = $cn
+    $SignerThumbprints = $thumb
     $text = Get-Content -Raw -LiteralPath $rendered
     Expect ($text -match "Base = 'https://") 'the base is https'
     Expect ($text -notmatch 'http://') 'no plain http anywhere'
     Expect ($text -notmatch '(?i)RunAs|Start-Process.*-Verb') 'no elevation'
+    Expect ($text -match '\$oldProtocol -bor \[Net\.SecurityProtocolType\]::Tls12' -and $text -notmatch '12288') 'TLS 1.2 is added, nothing is replaced, TLS 1.3 is not forced'
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$null, [ref]$null)
+    Expect ($ast.EndBlock.Statements.Count -eq 1) 'the whole installer is ONE statement (& { ... } @args): nothing else runs in the scope of the caller'
+    Expect ($ast.ParamBlock -eq $null) 'no param block at the top: under irm | iex it would overwrite the variables of the caller'
+    Expect ($text -notmatch '\$script:') 'no script-scope variables: under irm | iex that would be the global scope'
 
     # ---------------------------------------------------------------- the manifest
     function Sha([string]$p) { (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant() }
@@ -149,9 +161,9 @@ try {
     Refused 'says-other' { param($d) $script:says = 'stonewave 0.2.0 (deadbeef)' } 'not ''stonewave 0.2.0 (cafe0123)'''
     $script:says = 'stonewave 0.2.0 (cafe0123)'
     Refused 'missing' { param($d) Remove-Item "$d\0.2.0\stonewave-0.2.0-x86_64-windows.exe" } 'not found in'
-    $script:SignerThumbprints = '0' * 40
+    $SignerThumbprints = '0' * 40
     Refused 'wrong-pin' { param($d) } 'not one this installer pins'
-    $script:SignerThumbprints = $thumb
+    $SignerThumbprints = $thumb
 
     # downgrade and update
     $d = Reset 'site3'
@@ -199,6 +211,11 @@ try {
         Expect ($k.GetValueKind('Path') -eq 'ExpandString') 'and stays an expandable string'
         $k.Close()
         Expect (-not (Add-ToUserPath 'c:\new folder\BIN\' $sub)) 'the same folder (other case, a slash) is not added twice'
+        # the folder is in PATH already, written with %LOCALAPPDATA%
+        $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($sub, $true)
+        $k.SetValue('Path', 'C:\x;%LOCALAPPDATA%\Stonewave\bin', [Microsoft.Win32.RegistryValueKind]::ExpandString)
+        $k.Close()
+        Expect (-not (Add-ToUserPath (Join-Path $env:LOCALAPPDATA 'Stonewave\bin') $sub)) 'an entry written with %LOCALAPPDATA% counts as the folder'
         $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($sub, $true)
         $k.SetValue('Path', '', [Microsoft.Win32.RegistryValueKind]::ExpandString)
         $k.Close()
@@ -220,6 +237,46 @@ try {
     $fresh = Join-Path $T 'fresh.ps1'
     (Get-Content -Raw -LiteralPath (Join-Path $here 'install\cli\install.ps1.in')) -replace '@WIN_THUMBPRINTS@', ('F' * 40) | Set-Content -Encoding UTF8 -LiteralPath $fresh
     $sb2 = [scriptblock]::Create((Get-Content -Raw -LiteralPath $fresh))
+    # `irm | iex` runs the text with Invoke-Expression in the caller's scope. A child PowerShell plays the person's session: nothing of the installer
+    # (functions, variables, StrictMode, the error preference, the TLS setting) may stay, and the options reach it through $args.
+    # (the text is pointed at a port where nothing listens, and the profile folder is a temporary one: no internet, nothing of the real profile)
+    $iexText = Join-Path $T 'iex-text.ps1'
+    (Get-Content -Raw -LiteralPath $rendered).Replace('https://stonewavetech.com/cli', 'https://127.0.0.1:9/cli') | Set-Content -Encoding UTF8 -LiteralPath $iexText
+    $iexProfile = Join-Path $T 'iex-profile'
+    New-Item -ItemType Directory -Force -Path $iexProfile | Out-Null
+    $check = Join-Path $T 'iexcheck.ps1'
+    @'
+# the options of the installer come in as this script's own arguments ($args), as they would be in a session
+$out = $null; $vars1 = $null; $fn1 = $null; $new = $null; $newfn = $null; $eap1 = $null; $tls1 = $null; $strict = $null; $text = $null
+$vars0 = $null; $fn0 = $null; $eap0 = $null; $tls0 = $null
+$vars0 = @(Get-Variable | ForEach-Object Name); $fn0 = @(Get-ChildItem Function: | ForEach-Object Name)
+$eap0 = $ErrorActionPreference; $tls0 = [string][Net.ServicePointManager]::SecurityProtocol
+$text = Get-Content -Raw -LiteralPath $env:SW_TEXT
+$out = Invoke-Expression $text *>&1 | Out-String
+$vars1 = @(Get-Variable | ForEach-Object Name); $fn1 = @(Get-ChildItem Function: | ForEach-Object Name)
+$new = @($vars1 | Where-Object { ($vars0 -notcontains $_) -and ($_ -ne 'LASTEXITCODE') })   # LASTEXITCODE is the one thing it sets, on purpose, when it fails
+$newfn = @($fn1 | Where-Object { $fn0 -notcontains $_ })
+$strict = 'off'; try { $undefinedVariableXyz | Out-Null } catch { $strict = 'ON' }
+$eap1 = $ErrorActionPreference; $tls1 = [string][Net.ServicePointManager]::SecurityProtocol
+Write-Output "NEWVARS=$($new -join ',')"
+Write-Output "NEWFUNCS=$($newfn -join ',')"
+Write-Output "EAP=$eap0>$eap1"
+Write-Output "TLS=$($tls0 -eq $tls1)"
+Write-Output "STRICT=$strict"
+Write-Output ('OUT=' + ($out -replace '\r?\n', ' | '))
+'@ | Set-Content -Encoding UTF8 -LiteralPath $check
+    $env:SW_TEXT = $iexText
+    $realProfile = $env:LOCALAPPDATA
+    $env:LOCALAPPDATA = $iexProfile
+    try { $iexOut = (& powershell -NoProfile -ExecutionPolicy Bypass -File $check) | Out-String }
+    finally { $env:LOCALAPPDATA = $realProfile; Remove-Item Env:SW_TEXT }
+    Expect ($iexOut -match 'NEWVARS=\s*\r?\n') "irm | iex leaves no variables behind: $iexOut"
+    Expect ($iexOut -match 'NEWFUNCS=\s*\r?\n') "and no functions: $iexOut"
+    Expect ($iexOut -match 'EAP=Continue>Continue') 'the error preference is untouched'
+    Expect ($iexOut -match 'TLS=True') 'the TLS setting is untouched'
+    Expect ($iexOut -match 'STRICT=off') 'strict mode did not leak'
+    Expect ($iexOut -match 'Stonewave CLI installer' -and $iexOut -match 'download failed') "the installer really ran through Invoke-Expression (and failed closed, nothing listens there): $iexOut"
+    Expect (-not (Test-Path (Join-Path $iexProfile 'Stonewave\bin\stonewave.exe'))) 'and installed nothing'
     $hostOut = & $sb2 -FromDir $d -BinDir (Join-Path $T 'bin-sb2') -NoPath 6>&1 *>&1 | Out-String
     Expect ($hostOut -match 'not by Stonewave Tech LLC|not one this installer pins|not valid') 'with other pins the program is refused'
     Expect (-not (Test-Path (Join-Path $T 'bin-sb2\stonewave.exe'))) 'and not installed'

@@ -15,8 +15,17 @@ fn git(args: &[&str]) -> Option<String> {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=STONEWAVE_COMMIT");
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/index");
+    // what a new commit changes: HEAD, the branch it points to, the packed refs and the index (`--git-path` also finds them in a worktree)
+    for what in ["HEAD", "index", "packed-refs"] {
+        if let Some(p) = git(&["rev-parse", "--git-path", what]) {
+            println!("cargo:rerun-if-changed={p}");
+        }
+    }
+    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(p) = git(&["rev-parse", "--git-path", &branch]) {
+            println!("cargo:rerun-if-changed={p}");
+        }
+    }
     let commit = std::env::var("STONEWAVE_COMMIT")
         .ok()
         .filter(|c| {

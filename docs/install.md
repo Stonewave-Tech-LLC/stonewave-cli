@@ -4,7 +4,7 @@ One command, for you only (no root, no administrator rights):
 
 ```bash
 # Linux and macOS
-curl -fsSL https://stonewavetech.com/cli/install.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://stonewavetech.com/cli/install.sh | sh
 ```
 
 ```powershell
@@ -19,7 +19,7 @@ Run the same command again to update. It never goes back to an older release unl
 
 ## What the installer does
 
-Both installers are short on purpose, so you can read them before running them (`curl -fsSL https://stonewavetech.com/cli/install.sh | less`).
+Both installers are short on purpose, so you can read them before running them (`curl --proto '=https' --tlsv1.2 -fsSL https://stonewavetech.com/cli/install.sh | less`).
 They print each step.
 
 1. Work out your system: Linux or macOS on x86_64 or arm64; Windows on x86_64.
@@ -39,7 +39,7 @@ Any check that fails ends the installer with a message, and **nothing is install
 | System | Checks | What it protects against |
 |---|---|---|
 | Windows | SHA-256 and size from the manifest; the **Authenticode signature** must be valid and made by the certificate of **Stonewave Tech LLC** (the name and the certificate's thumbprint are pinned in the script) | a damaged or swapped file, and a file that somebody else signed |
-| macOS | SHA-256 and size; `codesign --verify --strict`; a **Developer ID** signature whose Team ID is the pinned one (Gatekeeper's verdict is shown, but it is informational for a bare command-line tool) | the same |
+| macOS | SHA-256 and size; `codesign --verify --strict -R=<our requirement>`: the signature must chain to **Apple's root** through the Developer ID Certification Authority, the leaf must be a **Developer ID Application** certificate, and its organizational unit must be our **Team ID** (pinned in the script). The requirement is ours, not the one written into the file (a file's own requirement would let a certificate of the maker's own pass). Gatekeeper's verdict is shown, but it is informational for a bare command-line tool | the same, and a file signed with some other certificate |
 | Linux | SHA-256 and size from the manifest, which comes from the same HTTPS site as the program | a damaged or swapped download. **Not** against someone who controls stonewavetech.com: they could change the manifest too. There is no signature on Linux builds. |
 
 The honest limit for all three: the installer itself also comes from stonewavetech.com. If that site were taken over, the attacker could serve
@@ -62,7 +62,7 @@ The folder is on your PATH or it is not; the installer says which.
 Linux and macOS (`sh -s -- ...` passes them when the script is piped in):
 
 ```bash
-curl -fsSL https://stonewavetech.com/cli/install.sh | sh -s -- --version 0.2.0 --add-to-path
+curl --proto '=https' --tlsv1.2 -fsSL https://stonewavetech.com/cli/install.sh | sh -s -- --version 0.2.0 --add-to-path
 ```
 
 | Option | Meaning |

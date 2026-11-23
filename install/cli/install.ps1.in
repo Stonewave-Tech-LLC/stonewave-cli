@@ -17,6 +17,9 @@
 #   -DryRun          download and check everything, install nothing
 #   -BinDir DIR      install here instead of %LOCALAPPDATA%\Stonewave\bin
 #   -FromDir DIR     take manifest and program from this folder instead of the internet (same checks): for tests and offline installs
+# The whole installer is one script block (`& { ... } @args`): its functions, its variables, StrictMode and $ErrorActionPreference end with it,
+# so `irm | iex` leaves nothing of them in your session. The options reach it through @args (they are read by the block's own param list).
+& { # stonewave-installer-begin
 param(
     [string]$Version = '',
     [switch]$NoPath,
@@ -28,11 +31,11 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 
-$script:Base = 'https://stonewavetech.com/cli'
+$Base = 'https://stonewavetech.com/cli'
 # Who signs the Windows build: the certificate's common name and its thumbprint(s), pinned when the release is made
 # (scripts/release-bundle.sh). More than one thumbprint is a certificate that was renewed.
-$script:SignerName = 'Stonewave Tech LLC'
-$script:SignerThumbprints = '@WIN_THUMBPRINTS@'
+$SignerName = 'Stonewave Tech LLC'
+$SignerThumbprints = '@WIN_THUMBPRINTS@'
 
 function Say([string]$Text) { Write-Host "  $Text" }
 function Fail([string]$Text) { throw "stonewave install: $Text" }
@@ -66,18 +69,19 @@ function Get-Remote([string]$Relative, [string]$Dest) {
         Copy-Item -LiteralPath $src -Destination $Dest
         return
     }
-    # PowerShell 5.1 starts with TLS 1.0 on some systems: ask for 1.2 (and 1.3 where this .NET knows it)
-    $p = [Net.SecurityProtocolType]::Tls12
-    try { $p = $p -bor [Net.SecurityProtocolType]12288 } catch { }
-    [Net.ServicePointManager]::SecurityProtocol = $p
+    # PowerShell 5.1 can start with TLS 1.0 on some systems: TLS 1.2 is ADDED to what is allowed (nothing is taken away, and TLS 1.3 is not
+    # forced on a .NET that does not do it well), and the setting is put back afterwards
+    $oldProtocol = [Net.ServicePointManager]::SecurityProtocol
+    [Net.ServicePointManager]::SecurityProtocol = $oldProtocol -bor [Net.SecurityProtocolType]::Tls12
     $old = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'
     try {
-        Invoke-WebRequest -UseBasicParsing -Uri "$script:Base/$Relative" -OutFile $Dest -TimeoutSec 300
+        Invoke-WebRequest -UseBasicParsing -Uri "$Base/$Relative" -OutFile $Dest -TimeoutSec 300
     } catch {
-        Fail "download failed: $script:Base/$Relative ($($_.Exception.Message))"
+        Fail "download failed: $Base/$Relative ($($_.Exception.Message))"
     } finally {
         $ProgressPreference = $old
+        [Net.ServicePointManager]::SecurityProtocol = $oldProtocol
     }
 }
 
@@ -121,7 +125,9 @@ function Add-ToUserPath([string]$Dir, [string]$SubKey = 'Environment') {
         $old = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
         $want = $Dir.TrimEnd('\')
         foreach ($e in ($old -split ';')) {
-            if ($e.Trim().TrimEnd('\') -ieq $want) { return $false }
+            # an entry may be written with %LOCALAPPDATA% and the like: it is compared as it reads once expanded
+            $here = [Environment]::ExpandEnvironmentVariables($e.Trim()).TrimEnd('\')
+            if ($here -ieq [Environment]::ExpandEnvironmentVariables($want)) { return $false }
         }
         $new = if ($old.Trim() -eq '') { $Dir } else { $old.TrimEnd(';') + ';' + $Dir }
         $key.SetValue('Path', $new, [Microsoft.Win32.RegistryValueKind]::ExpandString)
@@ -183,7 +189,7 @@ function Install-Stonewave {
         Say "sha256    $hash"
         if ($hash -ne $m.Sha) { Fail "the checksum does not match the manifest ($($m.Sha)). Nothing was installed." }
         Say 'checksum ok'
-        Test-StonewaveSignature $file $script:SignerName $script:SignerThumbprints
+        Test-StonewaveSignature $file $SignerName $SignerThumbprints
         # the program has been checked: now it may run once, to say who it is
         $ran = Get-BinaryVersion $file
         if ($ran -ne $want) { Fail "the program says '$ran', not '$want'. Nothing was installed." }
@@ -237,3 +243,4 @@ if ($MyInvocation.InvocationName -ne '.') {
         $global:LASTEXITCODE = 1
     }
 }
+} @args # stonewave-installer-end
