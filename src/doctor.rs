@@ -221,9 +221,20 @@ fn os(p: &dyn Probe) -> Finding {
     }
 }
 
+/// A name that did not resolve is often a cached "no such name" from before a new DNS record existed: say so.
+fn with_dns_hint(why: &str) -> String {
+    if why == "name not resolved" {
+        format!("{why}; DNS cache? try again in a few minutes")
+    } else {
+        why.to_owned()
+    }
+}
+
 fn arch(p: &dyn Probe) -> Finding {
     match p.run("uname", &["-m"]).as_deref() {
         Some(a @ ("x86_64" | "aarch64")) => found(Level::Ok, a),
+        // macOS (and some BSDs) call the same architecture arm64
+        Some("arm64") => found(Level::Ok, "aarch64 (reported as arm64)"),
         Some(other) => found(Level::Fail, format!("{other} · only x86_64 and aarch64")),
         None => found(Level::Warn, "unknown (uname failed)"),
     }
@@ -319,8 +330,9 @@ fn outbound(p: &dyn Probe) -> Finding {
                 Err(why) => found(
                     Level::Warn,
                     format!(
-                        "account reachable ({} ms) · relay {host}:{port} not reachable ({why}): the daemon needs it",
-                        d.as_millis()
+                        "account reachable ({} ms) · relay {host}:{port} not reachable ({}): the daemon needs it",
+                        d.as_millis(),
+                        with_dns_hint(&why)
                     ),
                 ),
             }
@@ -342,7 +354,8 @@ fn outbound(p: &dyn Probe) -> Finding {
                 found(
                     Level::Fail,
                     format!(
-                        "{OUTBOUND_HOST}:443 not reachable ({why}) · the daemon only connects outbound"
+                        "{OUTBOUND_HOST}:443 not reachable ({}) · the daemon only connects outbound",
+                        with_dns_hint(&why)
                     ),
                 )
             }
@@ -697,6 +710,26 @@ mod tests {
         assert_eq!(level(&checks, "systemd"), Level::Fail);
         assert_eq!(level(&checks, "outbound"), Level::Fail);
         assert_eq!(level(&checks, "openssh"), Level::Fail);
+    }
+
+    #[test]
+    fn macos_calls_aarch64_arm64() {
+        let mut s = good_server();
+        s.cmds.insert("uname -m", "arm64");
+        let checks = run_all(&s);
+        let c = get(&checks, "arch");
+        assert_eq!(c.level, Level::Ok, "{c:?}");
+        assert!(c.detail.contains("aarch64"), "{}", c.detail);
+        s.cmds.insert("uname -m", "riscv64");
+        assert_eq!(get(&run_all(&s), "arch").level, Level::Fail);
+    }
+
+    #[test]
+    fn an_unresolved_name_suggests_a_dns_cache_and_other_errors_do_not() {
+        assert!(
+            with_dns_hint("name not resolved").contains("DNS cache? try again in a few minutes")
+        );
+        assert_eq!(with_dns_hint("timed out"), "timed out");
     }
 
     #[test]
