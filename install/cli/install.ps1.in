@@ -233,7 +233,8 @@ function Show-PathHelp([string]$Bin) {
     $env:Path = $env:Path.TrimEnd(';') + ';' + $Bin
 }
 
-# Dot-sourcing this file (`. .\install.ps1`) only defines the functions (the tests use it); running or piping it installs.
+# Running or piping this file installs: the whole file is one `& { ... } @args` block. Only the tests dot-source what is INSIDE the block (they cut
+# off the first and the last line, marked stonewave-installer-begin / -end): then this guard sees `.` and the functions are only defined.
 if ($MyInvocation.InvocationName -ne '.') {
     try {
         Install-Stonewave
