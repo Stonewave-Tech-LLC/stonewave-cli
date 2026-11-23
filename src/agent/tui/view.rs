@@ -10,7 +10,7 @@ use crate::ui::{MARGIN, wave_spinner};
 
 use super::model::{
     AgentRow, App, Confirm, Level, Mode, Screen, Snapshot, Step, Wizard, agent_actions,
-    engine_choosable, engine_note, engine_rows, install_hint,
+    connect_engines, engine_choosable, engine_note, engine_rows, install_hint,
 };
 use super::service::{self, ServiceState};
 
@@ -534,29 +534,22 @@ fn confirm_screen(p: &P, c: &Confirm, rows: usize) -> (Vec<String>, &'static str
 
 // ------------------------------------------------------------------ the wizard
 
-fn steps_of(w: &Wizard) -> Vec<Step> {
-    let mut v = vec![Step::Mode, Step::Engine, Step::Name];
-    match w.mode {
-        Mode::New => {
-            v.push(Step::SignIn);
-            if w.engine.is_none_or(|e| e == Engine::ClaudeCode) {
-                v.extend([Step::StationAsk, Step::WaveUrl]);
-            }
-        }
-        Mode::Existing => v.extend([Step::WaveUrl, Step::KeySource]),
-    }
-    if w.engine.is_none_or(|e| e == Engine::ClaudeCode) {
-        v.extend([
-            Step::Rooms,
-            Step::Workdir,
-            Step::Limits,
-            Step::Preview,
-            Step::Test,
-            Step::Service,
-        ]);
-    }
-    v.push(Step::Done);
-    v
+/// The numbered steps of the way for a server with a secret store (the simple way has few enough screens not to be numbered).
+fn steps_of(_w: &Wizard) -> Vec<Step> {
+    vec![
+        Step::Mode,
+        Step::Engine,
+        Step::Name,
+        Step::WaveUrl,
+        Step::KeySource,
+        Step::Rooms,
+        Step::Workdir,
+        Step::Limits,
+        Step::Preview,
+        Step::Test,
+        Step::Service,
+        Step::Done,
+    ]
 }
 
 fn step_title(s: Step) -> &'static str {
@@ -566,7 +559,8 @@ fn step_title(s: Step) -> &'static str {
         Step::Name => "Wie heißt der Agent?",
         Step::WaveUrl => "Wo liegt Wave?",
         Step::KeySource => "Woher kommt der Schlüssel?",
-        Step::SignIn => "Bei Wave anmelden",
+        Step::Connect => "Agent mit Wave verbinden",
+        Step::Defaults => "Die Station mit den üblichen Einstellungen",
         Step::StationAsk => "Station einrichten?",
         Step::Rooms => "In welchen Räumen soll der Agent geweckt werden?",
         Step::Workdir => "Der Arbeitsordner des Agenten",
@@ -581,31 +575,92 @@ fn step_title(s: Step) -> &'static str {
 fn wizard_screen(app: &App, p: &P, w: &Wizard, rows: usize) -> (Vec<String>, &'static str) {
     let steps = steps_of(w);
     let at = steps.iter().position(|s| *s == w.step).map_or(1, |i| i + 1);
-    let mut o = vec![p.heading(&format!(
-        "Agent verbinden · Schritt {at} von {}",
-        steps.len()
-    ))];
+    let server_way = w.mode == Mode::Existing && w.step != Step::Mode;
+    let mut o = vec![p.heading(&if server_way {
+        format!(
+            "Agent verbinden · Server mit Secret-Store · Schritt {at} von {}",
+            steps.len()
+        )
+    } else {
+        "Agent verbinden".to_owned()
+    })];
     o.push(p.grey(step_title(w.step)));
+    if server_way && w.step != Step::Done && w.step != Step::Service {
+        // nobody should land here by mistake and not know
+        o.extend(p.note("Dieser Weg ist für einen Server, dessen Agent schon in Wave besteht und dessen Schlüssel in einem Secret-Store liegt. Auf einem normalen Computer brauchst du ihn nicht: Esc bis zum Anfang, dann \"Neuen Agenten anmelden\"."));
+    }
     o.push(String::new());
     let mut keys = "Enter weiter · Esc zurück";
     match w.step {
         Step::Mode => {
-            let items = [
-                (
-                    "Neuen Agenten anmelden",
-                    "Du bestätigst die Anmeldung im Browser; Wave legt den Agenten an und gibt ihm einen Schlüssel für diesen Computer.",
-                ),
-                (
-                    "Vorhandenen Agenten anbinden",
-                    "Der Agent besteht in Wave schon und sein Schlüssel liegt in einem Secret-Store (typisch: ein Server). Der Schlüssel wird nie angezeigt und nie gespeichert; hier trägst du nur den Namen der Umgebungsvariable ein.",
-                ),
-            ];
+            let items: [(&str, &str); 2] = if w.more {
+                [
+                    (
+                        "Auf einem Server mit Secret-Store",
+                        "Für einen Agenten, der in Wave schon besteht und dessen Schlüssel in einem Secret-Store liegt (typisch ein Server). Der Schlüssel wird nie angezeigt oder gespeichert; du trägst nur den Namen der Umgebungsvariable ein. Auf einem normalen Computer brauchst du das nicht.",
+                    ),
+                    ("Zurück", ""),
+                ]
+            } else {
+                [
+                    (
+                        "Neuen Agenten anmelden",
+                        "Dein Browser öffnet sich, du gibst den Code ein und wählst in Wave den Agenten. Danach ist dieser Computer verbunden. Das ist der Weg für jeden normalen Computer.",
+                    ),
+                    (
+                        "Mehr …",
+                        "Weitere Wege, zum Beispiel für einen Server mit Secret-Store.",
+                    ),
+                ]
+            };
             for (i, (t, _)) in items.iter().enumerate() {
                 o.push(p.row(i == w.cursor, t));
             }
             o.push(String::new());
             o.extend(p.note(items[w.cursor.min(1)].1));
-            keys = "↑↓ wählen · Enter weiter · Esc zurück zum Menü";
+            keys = if w.more {
+                "↑↓ wählen · Enter weiter · Esc zurück"
+            } else {
+                "↑↓ wählen · Enter weiter · Esc zurück zum Menü"
+            };
+        }
+        Step::Connect => {
+            let list = connect_engines(&app.snap);
+            if list.is_empty() {
+                o.extend(p.paragraph("Auf diesem Computer ist kein Coding-Agent installiert, den das Menü verbinden kann."));
+                o.push(String::new());
+                o.push(p.kv("Installieren", install_hint(Engine::ClaudeCode)));
+            } else if list.len() == 1 {
+                let found = app.snap.engine(list[0]).and_then(|r| r.version.clone());
+                o.push(p.kv(
+                    "Programm",
+                    &format!(
+                        "{}{}",
+                        list[0].label(),
+                        found.map_or(String::new(), |v| format!(" ({v})"))
+                    ),
+                ));
+            } else {
+                for (i, e) in list.iter().enumerate() {
+                    o.push(p.row(i == w.cursor, e.label()));
+                }
+            }
+            o.push(String::new());
+            o.extend(p.paragraph("Wenn du Enter drückst:"));
+            for l in [
+                "1. Dein Browser öffnet die Anmeldeseite von Wave (gibt es keinen, steht der Link hier).",
+                "2. Gib dort den Code ein, der hier erscheint. Prüfe, dass dieselben vier Wörter dort stehen, und wähle in Wave den Agenten.",
+                "3. Danach ist dieser Computer verbunden. Den Namen des Agenten musst du nicht tippen.",
+            ] {
+                o.extend(p.note(l));
+            }
+            if let Some((l, m)) = &w.message {
+                o.push(String::new());
+                for line in wrap(m, p.w.saturating_sub(2)) {
+                    o.push(p.level(*l, &line));
+                }
+            }
+            keys = "Enter anmelden · Esc zurück";
         }
         Step::Engine => {
             for (i, e) in engine_rows().into_iter().enumerate() {
@@ -679,31 +734,67 @@ fn wizard_screen(app: &App, p: &P, w: &Wizard, rows: usize) -> (Vec<String>, &'s
             }
             keys = "Tab wechselt das Feld · Enter weiter · Esc zurück";
         }
-        Step::SignIn => {
-            o.extend(p.paragraph("Gleich macht das Menü Platz für die bekannte Anmeldung: du bekommst einen Code und vier Wörter, bestätigst im Browser und das Menü kommt zurück."));
+        Step::StationAsk => {
+            o.push(p.level(Level::Ok, &format!("Verbunden: {}", w.agent())));
             o.push(String::new());
-            o.push(p.kv(
-                "Befehl",
-                &format!(
-                    "stonewave agent connect --engine {} --name {} --no-station",
-                    w.engine.unwrap_or(Engine::ClaudeCode).name(),
-                    w.agent()
-                ),
+            o.extend(p.paragraph("Soll der Agent auch aufwachen, wenn ihn jemand in Wave erwähnt? Dafür läuft hier eine Station: eine lange Sitzung je Raum, ohne Befehls-Werkzeuge, mit festen Grenzen."));
+            o.push(String::new());
+            o.push(p.row(
+                w.cursor == 0,
+                "Später (geht jederzeit auf der Seite des Agenten)",
+            ));
+            o.push(p.row(w.cursor == 1, "Ja, jetzt mit den üblichen Einstellungen"));
+            keys = "↑↓ wählen · Enter weiter";
+        }
+        Step::Defaults => {
+            o.extend(p.paragraph(
+                "Das nimmt das Menü, wenn du Enter drückst (die Buchstaben ändern es):",
             ));
             o.push(String::new());
-            o.extend(p.note("Der Schlüssel wird in eine private Datei geschrieben und nie angezeigt. Bestätige nur, wenn die vier Wörter im Browser dieselben sind und du die Anmeldung selbst gestartet hast."));
+            o.push(p.kv(
+                "Wave",
+                &format!("{}   · w ändert", w.wave_url.value().trim()),
+            ));
+            if w.rooms_loaded {
+                let chosen = w.chosen_rooms();
+                let names: Vec<&str> = chosen.iter().map(|r| r.name.as_str()).collect();
+                let head = if chosen.len() == w.rooms.len() {
+                    format!("alle {}", w.rooms.len())
+                } else {
+                    format!("{} von {}", chosen.len(), w.rooms.len())
+                };
+                o.push(p.kv(
+                    "Räume",
+                    &format!("{head}: {}   · r ändert", names.join(", ")),
+                ));
+            } else {
+                o.push(p.kv("Räume", "werden von Wave geholt …"));
+            }
+            o.push(p.kv(
+                "Ordner",
+                &format!("{}   · o ändert", w.workdir.value().trim()),
+            ));
+            o.push(p.kv(
+                "Grenzen",
+                "20 Min · 40 Züge · 2 USD je Weckruf, 10 pro Stunde, 50 pro Tag",
+            ));
+            o.push(p.kv(
+                "",
+                "geweckt nur von Personen der Firma, ohne Befehls-Werkzeuge",
+            ));
+            o.push(String::new());
+            o.extend(p.note("Danach prüft das Menü alles mit einer Vorschau (nichts wird gestartet), merkt sich die Einrichtung und fragt, ob die Station dauerhaft laufen soll."));
             if let Some((l, m)) = &w.message {
                 o.push(String::new());
-                o.push(p.level(*l, m));
+                for line in wrap(m, p.w.saturating_sub(2)) {
+                    o.push(p.level(*l, &line));
+                }
             }
-            keys = "Enter anmelden · Esc zurück";
-        }
-        Step::StationAsk => {
-            o.extend(p.paragraph("Die Station weckt den Agenten, wenn eine Person der Firma ihn in Wave erwähnt: eine lange Sitzung je Raum, ohne Befehls-Werkzeuge, mit festen Grenzen."));
-            o.push(String::new());
-            o.push(p.row(w.cursor == 0, "Ja, jetzt einrichten"));
-            o.push(p.row(w.cursor == 1, "Später"));
-            keys = "↑↓ wählen · Enter weiter";
+            keys = if w.rooms_loaded {
+                "Enter einrichten · r Räume · o Ordner · w Wave · Esc zurück"
+            } else {
+                "Enter versucht es noch einmal · w Wave · o Ordner · Esc zurück"
+            };
         }
         Step::Rooms => {
             if w.rooms_loaded {
@@ -812,7 +903,18 @@ fn wizard_screen(app: &App, p: &P, w: &Wizard, rows: usize) -> (Vec<String>, &'s
             }
         }
         Step::Done => {
-            o.push(p.level(Level::Ok, &format!("{} ist eingerichtet.", w.agent())));
+            o.push(p.level(
+                Level::Ok,
+                &format!(
+                    "{} ist {}.",
+                    w.agent(),
+                    if w.mode == Mode::New && w.chosen_rooms().is_empty() {
+                        "verbunden"
+                    } else {
+                        "eingerichtet"
+                    }
+                ),
+            ));
             for n in &w.notes {
                 o.extend(p.note(n));
             }
@@ -829,6 +931,10 @@ fn wizard_screen(app: &App, p: &P, w: &Wizard, rows: usize) -> (Vec<String>, &'s
                     ),
                 );
                 o.push(p.kv("Ordner", w.workdir.value().trim()));
+            }
+            if w.mode == Mode::New {
+                o.push(String::new());
+                o.extend(p.note("Weiteres (Testlauf, Dienst, Räume ändern, Trennen) steht auf der Seite des Agenten."));
             }
             keys = "Enter zurück zum Menü";
         }

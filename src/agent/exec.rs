@@ -64,6 +64,8 @@ pub trait Exec {
     /// same program name, checked on the very process that is then ended. The only way this tool ends a process. Windows only;
     /// elsewhere the service managers do the stopping.
     fn end_if_same(&self, pid: u32, start: i64, image: &str) -> io::Result<End>;
+    /// Starts a program and does not wait for it (opening a link in the browser: some openers stay until the browser is closed).
+    fn start_detached(&self, program: &str, args: &[String]) -> io::Result<()>;
 }
 
 /// The real machine.
@@ -130,6 +132,16 @@ impl Exec for System {
                 None => Err(io::Error::other("unexpected answer about a process")),
             },
         }
+    }
+
+    fn start_detached(&self, program: &str, args: &[String]) -> io::Result<()> {
+        Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|_| ())
     }
 
     fn run(&self, program: &str, args: &[String]) -> io::Result<Output> {
@@ -205,6 +217,8 @@ pub mod fake {
         pub ended: RefCell<Vec<u32>>,
         /// Ids that cannot be ended.
         pub fail_end: RefCell<Vec<u32>>,
+        /// `start_detached` fails (no browser).
+        pub fail_start: std::cell::Cell<bool>,
         script: Script,
     }
 
@@ -238,6 +252,7 @@ pub mod fake {
                 procs: RefCell::new(Vec::new()),
                 ended: RefCell::new(Vec::new()),
                 fail_end: RefCell::new(Vec::new()),
+                fail_start: std::cell::Cell::new(false),
                 script: Box::new(|_, _| None),
             }
         }
@@ -286,6 +301,16 @@ pub mod fake {
                     Ok(End::Ended)
                 }
             }
+        }
+
+        fn start_detached(&self, program: &str, args: &[String]) -> io::Result<()> {
+            self.calls
+                .borrow_mut()
+                .push((format!("start:{program}"), args.to_vec()));
+            if self.fail_start.get() {
+                return Err(io::Error::other("no opener"));
+            }
+            Ok(())
         }
 
         fn run(&self, program: &str, args: &[String]) -> io::Result<Output> {

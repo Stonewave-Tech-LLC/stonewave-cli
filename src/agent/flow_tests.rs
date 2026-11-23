@@ -122,6 +122,9 @@ fn opts(engine: Option<Engine>) -> ConnectOpts {
         yes: false,
         account: Account::parse("https://account.test").unwrap(),
         wave: None,
+        no_browser: true,
+        german: false,
+        env: |_| None,
     }
 }
 
@@ -1138,4 +1141,224 @@ fn a_step_that_cannot_be_undone_keeps_the_state_file_for_another_try() {
     assert!(rig.dirs.state_file("agent-demo").exists());
     assert!(ui.has(Kind::Fail, "Could not remove `wave`"));
     assert!(ui.has(Kind::Warn, "can be run again"));
+}
+
+// ---------------------------------------------------------------- the browser, the waiting lines, the long wait for an admin
+
+fn open_calls(f: &Fake) -> Vec<String> {
+    f.lines()
+        .into_iter()
+        .filter(|l| l.starts_with("start:"))
+        .collect()
+}
+
+fn run_with_browser(os: Os, exec: &Fake, env: fn(&str) -> Option<String>, started: &str) -> TestUi {
+    let mut account = account_ok(json!({}));
+    account[0] = reply(200, started);
+    let rig = Rig::new(os, account, vec![reply(201, &minted(false))]);
+    let mut ui = TestUi::new(&[]);
+    let mut o = opts(Some(Engine::Grok));
+    o.no_station = true;
+    o.no_browser = false;
+    o.env = env;
+    assert!(matches!(rig.connect(exec, &mut ui, &o), Outcome::Done));
+    ui
+}
+
+#[test]
+fn the_browser_is_opened_on_the_account_page_and_the_code_is_still_shown() {
+    let exec = Fake::new(&["grok", "open"]);
+    let ui = run_with_browser(Os::Mac, &exec, |_| None, STARTED);
+    assert_eq!(
+        open_calls(&exec),
+        vec!["start:open https://account.test/link"]
+    );
+    assert!(
+        ui.has(Kind::Kv, "WAVE-7K4Q-X2MP"),
+        "the code stays on the screen"
+    );
+    assert!(
+        ui.has(Kind::Kv, "amber"),
+        "and the four words, the person's check"
+    );
+    assert!(ui.has(
+        Kind::Note,
+        "Your browser is open. Type the code on the page."
+    ));
+    assert!(ui.has(Kind::Note, "same four words"));
+
+    let exec = Fake::new(&["grok"]);
+    run_with_browser(Os::Windows, &exec, |_| None, STARTED);
+    assert_eq!(
+        open_calls(&exec),
+        vec!["start:rundll32 url.dll,FileProtocolHandler https://account.test/link"]
+    );
+
+    // Linux: only where there is a screen
+    let exec = Fake::new(&["grok"]);
+    run_with_browser(
+        Os::Linux,
+        &exec,
+        |n| (n == "DISPLAY").then(|| ":0".into()),
+        STARTED,
+    );
+    assert_eq!(
+        open_calls(&exec),
+        vec!["start:xdg-open https://account.test/link"]
+    );
+    let exec = Fake::new(&["grok"]);
+    let ui = run_with_browser(Os::Linux, &exec, |_| None, STARTED);
+    assert!(
+        open_calls(&exec).is_empty(),
+        "a server over ssh has no browser to open"
+    );
+    assert!(ui.has(Kind::Note, "Open the link on any device with a browser"));
+}
+
+#[test]
+fn a_browser_that_cannot_be_started_or_is_not_wanted_says_where_to_go() {
+    let exec = Fake::new(&["grok"]);
+    exec.fail_start.set(true);
+    let ui = run_with_browser(Os::Mac, &exec, |_| None, STARTED);
+    assert!(ui.has(Kind::Note, "Open the link on any device with a browser"));
+    // --no-browser
+    let exec = Fake::new(&["grok"]);
+    let rig = Rig::new(
+        Os::Mac,
+        account_ok(json!({})),
+        vec![reply(201, &minted(false))],
+    );
+    let mut ui = TestUi::new(&[]);
+    let mut o = opts(Some(Engine::Grok));
+    o.no_station = true;
+    o.no_browser = true;
+    assert!(matches!(rig.connect(&exec, &mut ui, &o), Outcome::Done));
+    assert!(open_calls(&exec).is_empty());
+}
+
+#[test]
+fn a_link_with_the_code_in_it_is_used_only_when_it_is_the_accounts_own_page() {
+    let with = |uri: &str| {
+        STARTED.replace(
+            r#""expires_in":600"#,
+            &format!(r#""verification_uri_complete":"{uri}","expires_in":600"#),
+        )
+    };
+    let exec = Fake::new(&["grok"]);
+    let ui = run_with_browser(
+        Os::Mac,
+        &exec,
+        |_| None,
+        &with("https://account.test/link?code=WAVE-7K4Q-X2MP"),
+    );
+    assert_eq!(
+        open_calls(&exec),
+        vec!["start:open https://account.test/link?code=WAVE-7K4Q-X2MP"]
+    );
+    assert!(ui.has(Kind::Note, "the code is already filled in"));
+    // another host, another path, a look-alike host, plain http, spaces: the plain page is opened instead
+    for bad in [
+        "https://evil.test/link?code=X",
+        "https://account.test/other?code=X",
+        "https://account.test.evil.test/link?code=X",
+        "http://account.test/link?code=X",
+        "https://account.test/link?code=X Y",
+        "https://account.test/linkx",
+    ] {
+        let exec = Fake::new(&["grok"]);
+        run_with_browser(Os::Mac, &exec, |_| None, &with(bad));
+        assert_eq!(
+            open_calls(&exec),
+            vec!["start:open https://account.test/link"],
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn a_long_wait_says_plainly_that_wave_waits_for_an_admin_and_how_long_it_may_take() {
+    let many: Vec<_> = (0..200).map(|_| not_ready()).collect();
+    let rig = Rig::new(Os::Linux, account_ok(json!({})), many);
+    let exec = Fake::new(&["grok"]);
+    let mut ui = TestUi::new(&[]);
+    let mut o = opts(Some(Engine::Grok));
+    o.no_station = true;
+    assert!(matches!(rig.connect(&exec, &mut ui, &o), Outcome::Failed));
+    // at first: setting up, with the time so far and the most it can take
+    assert!(
+        ui.pauses[0].1.contains("Wave is setting up the agent"),
+        "{:?}",
+        ui.pauses[0]
+    );
+    assert!(
+        ui.pauses[0].1.contains("0:00 of at most 10:00"),
+        "{:?}",
+        ui.pauses[0]
+    );
+    assert!(
+        ui.pauses[3].1.contains("0:15 of at most 10:00"),
+        "{:?}",
+        ui.pauses[3]
+    );
+    // after 90 seconds: the plain words, said once as a note too
+    assert!(
+        ui.pauses[30]
+            .1
+            .contains("Wave is waiting for an admin to apply the plan"),
+        "{:?}",
+        ui.pauses[30]
+    );
+    assert_eq!(
+        ui.events
+            .iter()
+            .filter(|(k, a, _)| *k == Kind::Note && a.contains("takes longer than usual"))
+            .count(),
+        1
+    );
+    assert!(ui.has(Kind::Fail, "did not finish setting up the agent"));
+    assert!(ui.has(Kind::Note, "Tell an admin of the company"));
+    assert!(ui.has(Kind::Note, "When the plan is applied"));
+    assert!(!rig.dirs.key_file("agent-demo").exists());
+}
+
+#[test]
+fn the_same_in_german_when_asked() {
+    let many: Vec<_> = (0..200).map(|_| not_ready()).collect();
+    let rig = Rig::new(Os::Linux, account_ok(json!({})), many);
+    let exec = Fake::new(&["grok"]);
+    let mut ui = TestUi::new(&[]);
+    let mut o = opts(Some(Engine::Grok));
+    o.no_station = true;
+    o.german = true;
+    assert!(matches!(rig.connect(&exec, &mut ui, &o), Outcome::Failed));
+    assert!(ui.has(Kind::Heading, "Im Browser anmelden"));
+    assert!(ui.has(Kind::Kv, "amber"));
+    assert!(
+        ui.pauses[0]
+            .1
+            .contains("Wave richtet den Agenten ein · 0:00 von höchstens 10:00"),
+        "{:?}",
+        ui.pauses[0]
+    );
+    assert!(
+        ui.pauses[30]
+            .1
+            .contains("Wave wartet auf einen Admin, der den Plan anwendet")
+    );
+    assert!(ui.has(Kind::Note, "Deine Bestätigung bleibt gültig"));
+}
+
+#[test]
+fn a_short_wait_never_mentions_an_admin() {
+    let rig = Rig::new(
+        Os::Linux,
+        account_ok(json!({})),
+        vec![not_ready(), not_ready(), reply(201, &minted(false))],
+    );
+    let exec = Fake::new(&["grok"]);
+    let mut ui = TestUi::new(&[]);
+    let mut o = opts(Some(Engine::Grok));
+    o.no_station = true;
+    assert!(matches!(rig.connect(&exec, &mut ui, &o), Outcome::Done));
+    assert!(!ui.text().contains("admin"), "{}", ui.text());
 }

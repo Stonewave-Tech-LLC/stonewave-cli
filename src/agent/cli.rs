@@ -22,6 +22,8 @@ Options:
   --company <slug>      connect: suggest a company on the confirmation page
   --name <name>         connect: suggest a name for the agent on the confirmation page
   --no-station          connect: do not offer the wake service
+  --no-browser          connect: do not open the browser, only show the link and the code
+  --lang <de|en>        connect: the language of the sign-in screens (default: from your locale)
   --yes                 connect: set up the wake service without asking; disconnect: do not ask
   --keep-remote         disconnect: only clean up here; the key keeps working in Wave until someone revokes it
   --json                status: machine-readable output
@@ -61,6 +63,10 @@ pub struct Args {
     pub json: bool,
     pub keep_remote: bool,
     pub no_anim: bool,
+    /// `connect`: do not open the browser.
+    pub no_browser: bool,
+    /// `connect`: the language of the sign-in screens (`de` or `en`); none: from the locale.
+    pub lang: Option<bool>,
     /// `run`: the command after `--`.
     pub cmd: Vec<String>,
 }
@@ -85,6 +91,8 @@ pub fn parse(raw: &[String]) -> Result<Args, String> {
         json: false,
         keep_remote: false,
         no_anim: false,
+        no_browser: false,
+        lang: None,
         cmd: Vec::new(),
     };
     let mut sub_set = false;
@@ -170,6 +178,19 @@ pub fn parse(raw: &[String]) -> Result<Args, String> {
                 used.push("--json");
             }
             "--no-anim" => a.no_anim = true,
+            "--no-browser" => {
+                a.no_browser = true;
+                used.push("--no-browser");
+            }
+            "--lang" => {
+                let v = value("--lang")?;
+                a.lang = Some(match v.as_str() {
+                    "de" => true,
+                    "en" => false,
+                    _ => return Err("--lang: de or en".into()),
+                });
+                used.push("--lang");
+            }
             s if s.starts_with('-') => return Err(format!("unknown option {s}")),
             word if !sub_set => {
                 a.sub = match word {
@@ -201,6 +222,8 @@ pub fn parse(raw: &[String]) -> Result<Args, String> {
             "--yes",
             "--account",
             "--wave",
+            "--no-browser",
+            "--lang",
         ],
         Sub::Status => &["--json", "--agent", "--wave"],
         Sub::Rotate => &["--agent", "--wave"],

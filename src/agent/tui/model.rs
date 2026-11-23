@@ -135,6 +135,8 @@ pub struct AgentRow {
     pub key: KeyState,
     /// A state file of `agent connect` exists (the agent was signed in from this computer).
     pub connected: bool,
+    /// When `agent connect` made it (the state file's own time): tells a fresh sign-in from an old one.
+    pub connected_at: String,
     pub running: bool,
     pub paused: bool,
     pub service: ServiceState,
@@ -232,6 +234,10 @@ pub enum Await {
     SaveAfterPreview,
     Test,
     Install,
+    /// The sign-in is done: the agent it made is looked for in the fresh snapshot.
+    ConnectDone,
+    /// A test run from an agent's page.
+    Probe,
     /// A command whose output goes on a screen of its own.
     Show(String),
     /// Something that just needs a line saying it worked.
@@ -256,6 +262,7 @@ pub enum AgentAction {
     CheckWave,
     SetUpStation,
     RunHere,
+    Test,
     Pause,
     Resume,
     StopService,
@@ -272,6 +279,7 @@ impl AgentAction {
             AgentAction::CheckWave => "Verbindung zu Wave prüfen",
             AgentAction::SetUpStation => "Station einrichten …",
             AgentAction::RunHere => "Station jetzt hier starten (Vordergrund)",
+            AgentAction::Test => "Testlauf: einmal in den Posteingang schauen",
             AgentAction::Pause => "Pausieren",
             AgentAction::Resume => "Fortsetzen",
             AgentAction::StopService => "Station stoppen (Dienst anhalten)",
@@ -295,6 +303,7 @@ pub fn agent_actions(a: &AgentRow, os: Os) -> Vec<AgentAction> {
         }
     } else {
         v.push(AgentAction::RunHere);
+        v.push(AgentAction::Test);
         v.push(if a.paused {
             AgentAction::Resume
         } else {
@@ -367,12 +376,15 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Step {
     Mode,
+    /// The simple way: which program, then the browser opens (a new agent).
+    Connect,
     Engine,
     Name,
     WaveUrl,
     KeySource,
-    SignIn,
     StationAsk,
+    /// The station with what is usually right: all rooms, the default folder, the limits; each can be changed.
+    Defaults,
     Rooms,
     Workdir,
     Limits,
@@ -413,6 +425,16 @@ pub struct Wizard {
     pub test_ok: bool,
     /// The Wave address was typed by the person: it is not replaced by a proposal any more.
     pub wave_edited: bool,
+    /// The mode screen shows the less usual ways (a server with a secret store).
+    pub more: bool,
+    /// The agents that were connected here before the sign-in (name, time), to find the one it made.
+    pub before: Vec<(String, String)>,
+    /// Rooms that are chosen when the list arrives (an agent whose station is set up again); none: all (new) or nothing (server way).
+    pub preselect: Vec<String>,
+    /// The Wave address the rooms in the list were asked for (another address means another list).
+    pub rooms_for: String,
+    /// How the sign-in command ended (0: fine).
+    pub connect_code: i32,
     /// The dry run of this setup was clean: only then the choices are remembered and a service may follow.
     pub preview_ok: bool,
     pub notes: Vec<String>,
@@ -440,6 +462,11 @@ impl Wizard {
             signed_in: false,
             test_ok: false,
             wave_edited: false,
+            more: false,
+            before: Vec::new(),
+            preselect: Vec::new(),
+            rooms_for: String::new(),
+            connect_code: 0,
             preview_ok: false,
             notes: Vec::new(),
         }
@@ -457,8 +484,15 @@ impl Wizard {
             } else {
                 Mode::Existing
             },
-            Step::Rooms,
+            if a.connected {
+                Step::Defaults
+            } else {
+                Step::Rooms
+            },
         );
+        if let Some(p) = &a.profile {
+            w.preselect = p.rooms.clone();
+        }
         w.engine = Some(Engine::ClaudeCode);
         w.name = Input::with(&a.name);
         w.signed_in = a.connected;
@@ -523,25 +557,22 @@ impl Wizard {
 
     fn next_step(&self) -> Step {
         match (self.step, self.mode) {
-            (Step::Mode, _) => Step::Engine,
+            (Step::Mode, Mode::New) => Step::Connect,
+            (Step::Mode, Mode::Existing) => Step::Engine,
+            (Step::Connect, _) => Step::StationAsk,
             (Step::Engine, _) => Step::Name,
-            (Step::Name, Mode::New) => Step::SignIn,
-            (Step::Name, Mode::Existing) => Step::WaveUrl,
+            (Step::Name, _) => Step::WaveUrl,
+            // the simple way only visits these three to change something, and goes back to the defaults
+            (Step::WaveUrl | Step::Rooms | Step::Workdir, Mode::New) => Step::Defaults,
             (Step::WaveUrl, Mode::Existing) => Step::KeySource,
-            (Step::WaveUrl, Mode::New) => Step::Rooms,
             (Step::KeySource, _) => Step::Rooms,
-            (Step::SignIn, _) => {
-                if self.engine == Some(Engine::ClaudeCode) {
-                    Step::StationAsk
-                } else {
-                    Step::Done
-                }
-            }
-            (Step::StationAsk, _) => Step::WaveUrl,
+            (Step::StationAsk, _) => Step::Defaults,
+            (Step::Defaults, _) => Step::Preview,
             (Step::Rooms, _) => Step::Workdir,
             (Step::Workdir, _) => Step::Limits,
             (Step::Limits, _) => Step::Preview,
-            (Step::Preview, _) => Step::Test,
+            (Step::Preview, Mode::New) => Step::Service,
+            (Step::Preview, Mode::Existing) => Step::Test,
             (Step::Test, _) => Step::Service,
             (Step::Service, _) | (Step::Done, _) => Step::Done,
         }
@@ -553,24 +584,34 @@ impl Wizard {
         }
         Some(match (self.step, self.mode) {
             (Step::Mode, _) => return None,
+            (Step::Connect, _) => Step::Mode,
             (Step::Engine, _) => Step::Mode,
             (Step::Name, _) => Step::Engine,
             (Step::WaveUrl, Mode::Existing) => Step::Name,
-            (Step::WaveUrl, Mode::New) => Step::StationAsk,
             (Step::KeySource, _) => Step::WaveUrl,
             // after signing in there is no way back to signing in
-            (Step::SignIn, _) => Step::Name,
             (Step::StationAsk, _) => return None,
-            (Step::Rooms, Mode::New) => Step::WaveUrl,
+            (Step::Defaults, _) => Step::StationAsk,
+            (Step::WaveUrl | Step::Rooms | Step::Workdir, Mode::New) => Step::Defaults,
             (Step::Rooms, Mode::Existing) => Step::KeySource,
             (Step::Workdir, _) => Step::Rooms,
             (Step::Limits, _) => Step::Workdir,
-            (Step::Preview, _) => Step::Limits,
+            (Step::Preview, Mode::New) => Step::Defaults,
+            (Step::Preview, Mode::Existing) => Step::Limits,
             (Step::Test, _) => Step::Preview,
-            (Step::Service, _) => Step::Test,
+            (Step::Service, Mode::New) => Step::Defaults,
+            (Step::Service, Mode::Existing) => Step::Test,
             (Step::Done, _) => return None,
         })
     }
+}
+
+/// The programs that can be connected the simple way and are installed here.
+pub fn connect_engines(snap: &Snapshot) -> Vec<Engine> {
+    engine_rows()
+        .into_iter()
+        .filter(|e| snap.engine(*e).is_some_and(|r| r.found) && engine_choosable(*e, Mode::New))
+        .collect()
 }
 
 pub fn default_workdir(snap: &Snapshot, agent: &str) -> String {
@@ -923,6 +964,20 @@ impl App {
                 );
                 vec![]
             }
+            AgentAction::Test => {
+                let Some(p) = &row.profile else { return vec![] };
+                let mut args = vec!["agent".to_owned()];
+                args.extend(station_command(p, claude.as_deref(), &["--once"]));
+                self.confirm(
+                    format!("Testlauf für {name}?"),
+                    vec![
+                        "Die Station schaut einmal in den Posteingang von Wave und hört wieder auf. Beim allerersten Start merkt sie sich nur den Stand und weckt niemanden. Gibt es schon einen Stand, kann ein offener Aufruf jetzt den Agenten wecken.".to_owned(),
+                    ],
+                    Effect::Interactive { args },
+                    Await::Probe,
+                );
+                vec![]
+            }
             AgentAction::Pause => {
                 let said = "Pausiert: es startet kein neuer Weckruf (ein laufender endet normal).";
                 self.confirm(
@@ -1049,6 +1104,12 @@ impl App {
 
     fn key_wizard(&mut self, mut w: Wizard, key: Key) -> Vec<Effect> {
         let mut fx = Vec::new();
+        if key == Key::Esc && w.step == Step::Mode && w.more {
+            w.more = false;
+            w.cursor = 0;
+            self.stack.push(Screen::Wizard(Box::new(w)));
+            return fx;
+        }
         if key == Key::Esc || (key == Key::Left && !wizard_has_text(&w)) {
             // back one step; where the wizard was opened, it closes
             return match w.prev_step() {
@@ -1067,12 +1128,66 @@ impl App {
             Step::Mode => {
                 w.cursor = App::move_cursor(w.cursor, 2, key);
                 if key == Key::Enter {
-                    w.mode = if w.cursor == 0 {
-                        Mode::New
+                    if !w.more && w.cursor == 0 {
+                        w.mode = Mode::New;
+                        self.advance(&mut w, &mut fx);
+                    } else if !w.more {
+                        w.more = true;
+                        w.cursor = 0;
+                    } else if w.cursor == 0 {
+                        w.mode = Mode::Existing;
+                        w.more = false;
+                        self.advance(&mut w, &mut fx);
                     } else {
-                        Mode::Existing
-                    };
-                    self.advance(&mut w, &mut fx);
+                        w.more = false;
+                        w.cursor = 0;
+                    }
+                }
+            }
+            Step::Connect => {
+                let list = connect_engines(&self.snap);
+                if list.len() > 1 {
+                    w.cursor = App::move_cursor(w.cursor, list.len(), key).min(list.len() - 1);
+                    w.engine = Some(list[w.cursor]);
+                }
+                if key == Key::Enter {
+                    match w.engine.or_else(|| list.first().copied()) {
+                        None => {
+                            w.message = Some((
+                                Level::Warn,
+                                format!(
+                                    "Kein Coding-Agent gefunden. Installiere zum Beispiel Claude Code ({}) und starte das Menü noch einmal.",
+                                    install_hint(Engine::ClaudeCode)
+                                ),
+                            ));
+                        }
+                        Some(e) => {
+                            w.engine = Some(e);
+                            w.message = None;
+                            w.before = self
+                                .snap
+                                .agents
+                                .iter()
+                                .filter(|a| a.connected)
+                                .map(|a| (a.name.clone(), a.connected_at.clone()))
+                                .collect();
+                            // the name of the agent is not asked: it is the one the person picks in Wave, and it is read back afterwards
+                            let args = [
+                                "agent",
+                                "connect",
+                                "--engine",
+                                e.name(),
+                                "--no-station",
+                                "--lang",
+                                "de",
+                            ]
+                            .iter()
+                            .map(|s| (*s).to_owned())
+                            .collect();
+                            self.awaiting = Await::Connect;
+                            fx.push(Effect::Interactive { args });
+                        }
+                    }
                 }
             }
             Step::Engine => {
@@ -1128,6 +1243,10 @@ impl App {
                 if key == Key::Enter {
                     match Account::parse_as("Wave", w.wave_url.value().trim()) {
                         Ok(a) => {
+                            if w.mode == Mode::New && w.rooms_for != a.base() {
+                                w.rooms_loaded = false;
+                                w.rooms.clear();
+                            }
                             w.wave_url = Input::with(a.base());
                             self.advance(&mut w, &mut fx);
                         }
@@ -1165,39 +1284,49 @@ impl App {
                     }
                 }
             },
-            Step::SignIn => {
-                if key == Key::Enter {
-                    let engine = w.engine.unwrap_or(Engine::ClaudeCode).name().to_owned();
-                    let args = [
-                        "agent",
-                        "connect",
-                        "--engine",
-                        &engine,
-                        "--name",
-                        &w.agent(),
-                        "--no-station",
-                    ]
-                    .iter()
-                    .map(|s| (*s).to_owned())
-                    .collect();
-                    self.awaiting = Await::Connect;
-                    fx.push(Effect::Interactive { args });
-                }
-            }
             Step::StationAsk => {
                 w.cursor = App::move_cursor(w.cursor, 2, key);
                 if key == Key::Enter {
-                    if w.cursor == 0 {
+                    if w.cursor == 1 {
                         self.advance(&mut w, &mut fx);
                     } else {
                         w.step = Step::Done;
                         w.notes.push(
-                            "Die Station kannst du später auf der Seite des Agenten einrichten."
+                            "Die Station (der Agent wacht auf, wenn ihn jemand in Wave erwähnt) lässt sich jederzeit auf der Seite des Agenten einrichten."
                                 .into(),
                         );
                     }
                 }
             }
+            Step::Defaults => match key {
+                Key::Enter => {
+                    if !w.rooms_loaded {
+                        w.message = None;
+                        fx = self.fetch_rooms(&w);
+                    } else if w.chosen_rooms().is_empty() {
+                        w.message = Some((
+                            Level::Warn,
+                            "Wähle mindestens einen Raum aus (r ändert die Auswahl).".into(),
+                        ));
+                    } else {
+                        self.advance(&mut w, &mut fx);
+                    }
+                }
+                Key::Char('r' | 'R') if w.rooms_loaded => {
+                    w.step = Step::Rooms;
+                    w.cursor = 0;
+                    w.message = None;
+                }
+                Key::Char('o' | 'O') => {
+                    w.step = Step::Workdir;
+                    w.message = None;
+                }
+                Key::Char('w' | 'W') => {
+                    w.step = Step::WaveUrl;
+                    w.message = None;
+                }
+                _ => {}
+            },
             Step::Rooms => {
                 if !w.rooms_loaded {
                     // Enter or R tries again after a failure
@@ -1298,7 +1427,7 @@ impl App {
         w.step = w.next_step();
         match w.step {
             Step::WaveUrl if !w.wave_edited => w.wave_url = Input::with(&self.wave_prefill(w)),
-            Step::Rooms if !w.rooms_loaded => fx.extend(self.fetch_rooms(w)),
+            Step::Rooms | Step::Defaults if !w.rooms_loaded => fx.extend(self.fetch_rooms(w)),
             Step::Preview => self.start_preview(w, fx),
             _ => {}
         }
@@ -1381,9 +1510,13 @@ impl App {
         }
         match ev {
             Event::Snapshot(s) => {
-                self.awaiting = awaiting;
                 self.snap = *s;
                 self.fix_cursors();
+                if awaiting == Await::ConnectDone {
+                    self.finish_connect();
+                } else {
+                    self.awaiting = awaiting;
+                }
             }
             Event::Output { code, lines } => match awaiting {
                 Await::Preview => {
@@ -1426,25 +1559,19 @@ impl App {
             },
             Event::Returned { code } => match awaiting {
                 Await::Connect => {
-                    let ok = code == 0;
+                    // also when the command says it failed: a late step (the entry in the program) can fail after the agent and its
+                    // key were made, and then the agent is there all the same
                     if let Some(w) = self.wizard() {
-                        if ok {
-                            w.signed_in = true;
-                            w.message = None;
-                            w.step = w.next_step();
-                            w.cursor = 0;
-                            if w.step == Step::Done {
-                                w.notes.push("Die Station gibt es bisher nur für Claude Code; für diesen Agenten kommt sie noch.".into());
-                            }
-                        } else {
-                            w.message = Some((
-                                Level::Bad,
-                                format!(
-                                    "Die Anmeldung wurde nicht abgeschlossen (Code {code}). Enter versucht es noch einmal."
-                                ),
-                            ));
-                        }
+                        w.connect_code = code;
                     }
+                    self.awaiting = Await::ConnectDone;
+                    return vec![Effect::Refresh];
+                }
+                Await::Probe => {
+                    self.say(
+                        if code == 0 { Level::Ok } else { Level::Warn },
+                        "Der Testlauf ist beendet.",
+                    );
                     return vec![Effect::Refresh];
                 }
                 Await::Test => {
@@ -1494,15 +1621,24 @@ impl App {
                             w.message = Some((Level::Warn, "Der Agent darf noch keinen Raum lesen. Gib ihm in Wave Zugriff auf Räume und drücke dann Enter.".into()));
                         }
                         Ok(rooms) => {
+                            // the simple way starts with every room the agent may read (it is only woken where a person mentions it);
+                            // an agent whose station is set up again keeps its rooms; the server way starts with none
+                            let all = w.mode == Mode::New;
+                            let keep = w.preselect.clone();
                             w.rooms = rooms
                                 .into_iter()
                                 .map(|r| RoomChoice {
+                                    on: if keep.is_empty() {
+                                        all
+                                    } else {
+                                        keep.contains(&r.id)
+                                    },
                                     id: r.id,
                                     name: r.name,
-                                    on: false,
                                 })
                                 .collect();
                             w.rooms_loaded = true;
+                            w.rooms_for = w.wave_url.value().trim().to_owned();
                             w.cursor = 0;
                             w.message = None;
                         }
@@ -1545,10 +1681,28 @@ impl App {
                     return vec![Effect::Refresh];
                 }
                 Await::SaveAfterPreview => {
-                    if let Err(e) = r {
-                        if let Some(w) = self.wizard() {
-                            w.preview_ok = false;
-                            w.message = Some((Level::Bad, e));
+                    match r {
+                        Err(e) => {
+                            if let Some(w) = self.wizard() {
+                                w.preview_ok = false;
+                                w.message = Some((Level::Bad, e));
+                            }
+                        }
+                        Ok(_) => {
+                            // the simple way does not stop at the preview: the next question is the service (or the end)
+                            let info = self.wizard().map(|w| (w.mode, w.profile()));
+                            if let Some((Mode::New, p)) = info {
+                                let possible = self.service_possible(&p);
+                                if let Some(w) = self.wizard() {
+                                    w.cursor = 0;
+                                    w.scroll = 0;
+                                    w.message = None;
+                                    w.step = if possible { Step::Service } else { Step::Done };
+                                    if !possible {
+                                        w.notes.push("Einen Dienst kann das Menü hier noch nicht einrichten: starte die Station von der Seite des Agenten.".into());
+                                    }
+                                }
+                            }
                         }
                     }
                     return vec![Effect::Refresh];
@@ -1562,6 +1716,56 @@ impl App {
             },
         }
         vec![]
+    }
+
+    /// After the sign-in: which agent was made (or signed in again) is read from what is on the machine now. The wizard goes on with that
+    /// agent's own name, its address of Wave and a folder that carries its name.
+    fn finish_connect(&mut self) {
+        let snap = self.snap.clone();
+        let Some(w) = self.wizard() else { return };
+        let mut fresh: Vec<&AgentRow> = snap
+            .agents
+            .iter()
+            .filter(|a| {
+                a.connected
+                    && w.before
+                        .iter()
+                        .find(|(n, _)| *n == a.name)
+                        .is_none_or(|(_, at)| *at != a.connected_at)
+            })
+            .collect();
+        fresh.sort_by(|a, b| a.connected_at.cmp(&b.connected_at));
+        let Some(a) = fresh.last() else {
+            w.message = Some((
+                Level::Bad,
+                if w.connect_code == 0 {
+                    "Es wurde kein Agent angelegt. Enter versucht es noch einmal.".to_owned()
+                } else {
+                    format!(
+                        "Die Anmeldung wurde nicht abgeschlossen (Code {}). Enter versucht es noch einmal.",
+                        w.connect_code
+                    )
+                },
+            ));
+            return;
+        };
+        if w.connect_code != 0 {
+            w.notes.push("Ein Schritt beim Verbinden ist nicht gelungen (siehe die Ausgabe davor), der Agent ist aber angelegt. Die Seite des Agenten zeigt den Stand.".into());
+        }
+        w.name = Input::with(&a.name);
+        w.signed_in = true;
+        w.workdir = Input::with(&default_workdir(&snap, &a.name));
+        w.wave_url = Input::with(a.wave_url.as_deref().unwrap_or(DEFAULT_WAVE));
+        w.wave_edited = true;
+        w.engine = Engine::parse(&a.engine).or(w.engine);
+        w.message = None;
+        w.cursor = 0;
+        if w.engine == Some(Engine::ClaudeCode) {
+            w.step = Step::StationAsk;
+        } else {
+            w.step = Step::Done;
+            w.notes.push("Die Station gibt es bisher nur für Claude Code; für diesen Agenten kommt sie noch.".into());
+        }
     }
 
     fn wizard(&mut self) -> Option<&mut Wizard> {

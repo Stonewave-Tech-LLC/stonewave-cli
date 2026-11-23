@@ -257,6 +257,9 @@ fn connect_status_rotate_disconnect_with_the_real_curl_against_a_stub() {
             yes: false,
             account,
             wave: None,
+            no_browser: true,
+            german: false,
+            env: |_| None,
         },
     )
     .unwrap();
@@ -407,6 +410,9 @@ fn nothing_listens_is_a_network_error_not_a_hang() {
             yes: false,
             account: Account::parse("http://127.0.0.1:1").unwrap(),
             wave: None,
+            no_browser: true,
+            german: false,
+            env: |_| None,
         },
     )
     .unwrap();

@@ -145,8 +145,11 @@ This turns a coding agent on **any** machine (your Mac, a Linux server, a Window
 It is separate from `connect` above, which connects a *server*. Everything lives in your home folder and runs as you: no
 sudo, and root is refused (a key made by root would belong to nobody).
 
-`connect` shows a code and four words, like the server sign-in. You confirm on the account's "connect an agent" page (company,
-team, name, engine), and Wave hands the agent's key **to this machine only**: it never passes the account, a chat or any other
+`connect` shows a code and four words, like the server sign-in, and **opens your browser** on the account's page (not on a machine without a
+display, not with `--no-browser`: then it only shows the link; `--lang de|en` sets the language of these screens, the default follows your locale). The
+code is typed on that page; the four words are your check that the page is the one you started. While it waits, it says what for and for how long, and
+after a long "not ready" it says plainly that Wave is waiting for an admin to apply the plan. You confirm on the account's "connect an agent" page
+(company, team, name, engine), and Wave hands the agent's key **to this machine only**: it never passes the account, a chat or any other
 service. Then, step by step and each one checking first:
 
 1. the key goes into `~/.config/wave/<agent>.key` (Windows `%LOCALAPPDATA%\wave\`, never the roaming profile: nothing secret may roam), the folder 0700, the file 0600 (Windows: only
