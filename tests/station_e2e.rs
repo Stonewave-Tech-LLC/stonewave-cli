@@ -296,6 +296,40 @@ fn the_dry_run_starts_nothing_and_asks_nobody() {
 }
 
 #[test]
+fn a_dry_run_that_would_be_refused_says_so_and_ends_with_an_error_and_makes_nothing() {
+    let home = Home::new();
+    let record = home.0.join("record.txt");
+    let claude = fake_claude(&home.0, &record);
+    let wave = serve(vec![inbox(vec![], 1)]);
+    // the folder with the keys, and the home folder as a whole
+    for bad in [home.0.join(".config").join("wave"), home.0.clone()] {
+        let o = station(&home, &wave, &claude, &bad, &["--dry-run"]);
+        let t = text(&o);
+        assert_eq!(o.status.code(), Some(1), "{t}");
+        assert!(t.contains("refused: the working folder"), "{t}");
+    }
+    // a fine folder is not refused, and a dry run does not make it
+    let work = home.0.join("wave-agents").join("demo");
+    let o = station(&home, &wave, &claude, &work, &["--dry-run"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(!work.exists(), "a dry run creates nothing");
+    // without Claude Code a wake cannot be planned: also an error
+    let o = station(
+        &home,
+        &wave,
+        Path::new("/nonexistent/claude"),
+        &work,
+        &["--dry-run"],
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    assert!(
+        text(&o).contains("Claude Code (`claude`) was not found"),
+        "{}",
+        text(&o)
+    );
+}
+
+#[test]
 fn without_rooms_the_station_does_not_start() {
     let home = Home::new();
     let work = home.0.join("wave-agents").join("demo");

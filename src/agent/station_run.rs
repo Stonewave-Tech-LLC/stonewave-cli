@@ -190,6 +190,31 @@ fn rpc(
     Ok(data)
 }
 
+/// The rooms the agent may read, as `(id, name)`: what the menu offers when a station is set up. Rooms without a plain id are left out.
+pub fn list_rooms(http: &dyn Http, mcp: &str, key: &Key) -> Result<Vec<(String, String)>, WaveErr> {
+    let d = rpc(http, mcp, key, 1, "rooms", json!({}))?;
+    Ok(d["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            let id = r["id"].as_str().filter(|s| plain_id(s))?;
+            let name = r["name"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| r["key"].as_str())
+                .unwrap_or(id);
+            Some((
+                id.to_owned(),
+                name.chars()
+                    .filter(|c| !super::key::is_invisible(*c))
+                    .take(80)
+                    .collect(),
+            ))
+        })
+        .collect())
+}
+
 // ------------------------------------------------------------------ who wakes the agent
 
 #[derive(Debug, PartialEq, Eq)]
@@ -363,6 +388,21 @@ pub fn previous_wake_running(child_file: &Path) -> Option<u32> {
     }
 }
 
+/// Whether a station is running for this lock file: its process exists (Linux and macOS), or the file was touched in the last 90 seconds.
+pub fn station_running(lock: &Path) -> bool {
+    let Ok(who) = fs::read_to_string(lock) else {
+        return false;
+    };
+    match who.trim().parse::<u32>() {
+        Ok(p) if cfg!(unix) => pid_alive(p),
+        _ => fs::metadata(lock)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age < LOCK_FRESH),
+    }
+}
+
 fn create_lock(path: &Path, pid: &str) -> Result<(), String> {
     use std::io::Write as _;
     let mut f = fs::OpenOptions::new()
@@ -471,6 +511,16 @@ pub fn check_workdir(
     dirs: &Dirs,
     key_file: Option<&Path>,
 ) -> Result<Vec<String>, String> {
+    check_workdir_place(work, dirs, key_file)?;
+    check_workdir_content(work)
+}
+
+/// The checks of the place alone: nothing is created or changed, so `--dry-run` can say "refused" too.
+pub fn check_workdir_place(
+    work: &Path,
+    dirs: &Dirs,
+    key_file: Option<&Path>,
+) -> Result<(), String> {
     if !work.is_absolute() {
         return Err("the working folder must be a full path".into());
     }
@@ -519,6 +569,11 @@ pub fn check_workdir(
             return Err("the key file lies inside the working folder".into());
         }
     }
+    Ok(())
+}
+
+/// Makes the folder (private) and looks inside it: links that lead out are refused, instruction files are warned about.
+fn check_workdir_content(work: &Path) -> Result<Vec<String>, String> {
     fs::create_dir_all(work)
         .map_err(|e| format!("cannot create the working folder: {}", e.kind()))?;
     #[cfg(unix)]
@@ -1229,6 +1284,11 @@ impl<'a> Station<'a> {
                 return rep;
             }
         }
+    }
+
+    /// Whether a wake can be planned at all (Claude Code is found, the settings are valid): what `--dry-run` shows before it says anything else.
+    pub fn can_plan(&self) -> bool {
+        self.plan("x", None, &self.room_dir("ROOM-ID")).is_ok()
     }
 
     /// What `--dry-run` shows: the exact command of a wake and everything around it, without starting anything or asking Wave.

@@ -71,7 +71,7 @@ pub struct Args {
     pub once: bool,
 }
 
-fn env_name_ok(s: &str) -> bool {
+pub(crate) fn env_name_ok(s: &str) -> bool {
     (1..=100).contains(&s.len())
         && s.chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
@@ -545,6 +545,25 @@ fn run(
     let mut st = Station::new(cfg, deps, dirs.clone(), paths, key);
     if args.dry_run {
         print!("{}", st.dry_run_text());
+        // a dry run that would be refused for real says so, and ends with an error: the menu saves nothing after one
+        let mut refused = !st.can_plan();
+        let key_file = match &st.cfg.key {
+            KeySource::File(p) => Some(p.as_path()),
+            KeySource::Env(_) => None,
+        };
+        match super::spawn::find_program(st.cfg.program.as_deref(), "claude", &which) {
+            Some(p) if p.is_file() => {}
+            _ => {
+                println!(
+                    "\nrefused: Claude Code (`claude`) was not found; install it or give its path with --claude"
+                );
+                refused = true;
+            }
+        }
+        if let Err(e) = station_run::check_workdir_place(&st.cfg.workdir, dirs, key_file) {
+            println!("\nrefused: the working folder {}", scrub(&e));
+            refused = true;
+        }
         match &st.cfg.key {
             KeySource::Env(n) if env_get(n).is_none() => {
                 println!("note: {n} is not set in this shell; the real run needs it")
@@ -554,7 +573,11 @@ fn run(
             ),
             _ => {}
         }
-        return Ok(ExitCode::SUCCESS);
+        return Ok(if refused {
+            ExitCode::from(1)
+        } else {
+            ExitCode::SUCCESS
+        });
     }
     check_claude(&st.cfg, &which)?;
     let warnings = station_run::prepare(&st)?;
