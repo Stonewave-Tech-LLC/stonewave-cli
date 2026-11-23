@@ -28,6 +28,8 @@ use std::process::ExitCode;
 use flow::Outcome;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The commit this program was built from (`-dirty` when the tree had changes, see `build.rs`).
+pub const COMMIT: &str = env!("STONEWAVE_COMMIT");
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Command {
@@ -286,7 +288,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Command::Version => {
-            println!("stonewave {VERSION} (early build)");
+            println!("stonewave {VERSION} ({COMMIT})");
             return ExitCode::SUCCESS;
         }
         Command::Doctor if args.json => {

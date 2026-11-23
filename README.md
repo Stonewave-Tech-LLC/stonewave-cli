@@ -48,9 +48,25 @@ anything. Exit code 0 means no check failed.
 | Outbound | port 443 to the account service not reachable (only warns when an HTTPS proxy is set) |
 | Root, Clock, Disk, Firewall, Stonewave | only warn or inform |
 
-## Install (not released yet)
+## Install
 
-When a release exists, Wave shows a command like this one, with the real checksum:
+For you, on your own computer (no root, no administrator rights; installs into your user folder, tells you about PATH, updates in place):
+
+```bash
+curl -fsSL https://stonewavetech.com/cli/install.sh | sh          # Linux, macOS
+```
+```powershell
+irm https://stonewavetech.com/cli/install.ps1 | iex                # Windows (PowerShell)
+```
+
+The installers check the download against a manifest (SHA-256, size), the Windows build against the Authenticode signature of Stonewave Tech
+LLC and the macOS build against our Developer ID, and they run the program once before they put it in place. On Linux the checksum comes from
+the same HTTPS site as the program: that protects against a damaged or swapped download, not against someone who controls the site. Options,
+what is checked per system and how to uninstall: [docs/install.md](docs/install.md). How a release is made: [docs/release.md](docs/release.md).
+
+### On a server (as root, pinned checksum)
+
+When a server release exists, Wave shows a command like this one, with the real checksum:
 
 ```bash
 curl -fsSLO https://stonewavetech.com/install/0.1.0/install.sh \
@@ -75,6 +91,9 @@ scripts/test-install.sh dist/0.1.0              # on a Linux machine: doctor + i
 `.cargo/config.toml`), writes `SHA256SUMS`, writes the checksums into `install.sh` and prints the command for Wave.
 With `STONEWAVE_MINISIGN_KEY` set to a minisign secret key it also signs the files. The key is never part of this
 repository; without it the release is unsigned.
+
+`release.sh` is for the server installer above. The release of the user installers (all systems, manifest, `/cli/` folder) is
+`scripts/release-bundle.sh`: [docs/release.md](docs/release.md). `stonewave --version` prints `stonewave <version> (<commit>)`.
 
 ## Connect: sign in with a device code
 

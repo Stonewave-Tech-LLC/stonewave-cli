@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "stonewave-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossterm",
  "ed25519-dalek",
