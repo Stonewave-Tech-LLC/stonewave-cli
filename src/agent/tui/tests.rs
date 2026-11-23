@@ -1156,6 +1156,62 @@ fn the_snapshot_reads_state_profile_key_file_and_lock_from_disk() {
     assert_eq!(s.claude.as_deref(), Some("/fake/bin/claude"));
 }
 
+#[test]
+fn a_long_question_scrolls_above_its_answers_and_the_answers_stay_on_the_screen() {
+    let mut s = snap();
+    s.agents = vec![with_profile(row("claude"))];
+    let mut r = Rig::with(s);
+    r.keys(&[
+        Key::Enter,
+        Key::Down,
+        Key::Down,
+        Key::Down,
+        Key::Down,
+        Key::Enter,
+    ]);
+    assert!(matches!(r.app.top(), Screen::Confirm(_)));
+    // a plain 80x24 terminal: the service file does not fit, the question does
+    let lines = view::render(&r.app, 80, 24, ColorMode::None, 0.0);
+    let text = lines.join(
+        "
+",
+    );
+    assert!(
+        text.contains("Nein") && text.contains("Ja") && text.contains("▼ mehr"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("WantedBy"),
+        "the end of the file is further down"
+    );
+    r.press(Key::PageDown);
+    r.press(Key::PageDown);
+    let text = view::render(&r.app, 80, 24, ColorMode::None, 0.0).join(
+        "
+",
+    );
+    assert!(
+        text.contains("WantedBy") && text.contains("Nein") && text.contains("Ja"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_refusal_shows_right_under_the_field_even_on_a_small_terminal() {
+    let mut r = Rig::new();
+    r.keys(&[Key::Enter, Key::Down, Key::Enter, Key::Enter, Key::Enter]);
+    assert_eq!(r.wizard().step, Step::WaveUrl);
+    r.press(Key::CtrlU);
+    r.text("http://example.com");
+    r.press(Key::Enter);
+    let lines = view::render(&r.app, 80, 24, ColorMode::None, 0.0);
+    let at = lines.iter().position(|l| l.contains("Wave  http")).unwrap();
+    assert!(
+        lines[at + 1].contains("Diese Adresse geht nicht"),
+        "{lines:?}"
+    );
+}
+
 /// `cargo test print_screens -- --ignored --nocapture` shows the screens as text (for a look at the layout).
 #[test]
 #[ignore]

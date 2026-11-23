@@ -339,6 +339,8 @@ pub struct Confirm {
     pub lines: Vec<String>,
     /// 0 = no, 1 = yes.
     pub cursor: usize,
+    /// First visible line of a text that is longer than the screen.
+    pub scroll: usize,
     pub yes: Effect,
     pub await_: Await,
 }
@@ -784,6 +786,7 @@ impl App {
             title,
             lines,
             cursor: 0,
+            scroll: 0,
             yes,
             await_,
         })));
@@ -793,6 +796,8 @@ impl App {
         match key {
             Key::Esc | Key::Char('n' | 'N' | 'q') => return vec![],
             Key::Char('y' | 'Y' | 'j' | 'J') => return self.confirmed(c),
+            Key::PageUp => c.scroll = c.scroll.saturating_sub(5),
+            Key::PageDown => c.scroll += 5,
             Key::Up | Key::Down | Key::Left | Key::Right | Key::Tab | Key::BackTab => {
                 c.cursor = 1 - c.cursor
             }

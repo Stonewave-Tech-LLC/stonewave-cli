@@ -350,7 +350,7 @@ fn screen_body(app: &App, p: &P, rows: usize) -> (Vec<String>, &'static str) {
             lines,
             scroll,
         } => output_screen(p, title, lines, *scroll, rows),
-        Screen::Confirm(c) => confirm_screen(p, c),
+        Screen::Confirm(c) => confirm_screen(p, c, rows),
     }
 }
 
@@ -478,19 +478,36 @@ fn output_screen(
     (o, "↑↓ blättern · Enter oder Esc zurück")
 }
 
-fn confirm_screen(p: &P, c: &Confirm) -> (Vec<String>, &'static str) {
-    let mut o = vec![p.heading(&c.title), String::new()];
+fn confirm_screen(p: &P, c: &Confirm, rows: usize) -> (Vec<String>, &'static str) {
+    let mut text: Vec<String> = Vec::new();
     for l in &c.lines {
         if l.is_empty() {
-            o.push(String::new());
+            text.push(String::new());
         } else {
-            o.extend(p.paragraph(l));
+            text.extend(p.paragraph(l));
         }
     }
-    o.push(String::new());
+    // the question and its two answers always stay on the screen; a long text scrolls above them
+    let room = rows.saturating_sub(2 + 3).max(1);
+    let scroll = c.scroll.min(text.len().saturating_sub(room));
+    let mut o = vec![p.heading(&c.title), String::new()];
+    o.extend(text.iter().skip(scroll).take(room).cloned());
+    let more = text.len() > scroll + room;
+    o.push(if more {
+        p.grey("▼ mehr: Bild ↓")
+    } else {
+        String::new()
+    });
     o.push(p.row(c.cursor == 0, "Nein"));
     o.push(p.row(c.cursor == 1, "Ja"));
-    (o, "↑↓ wählen · Enter bestätigt · j ja · n oder Esc nein")
+    (
+        o,
+        if text.len() > room {
+            "Bild ↑↓ blättert · ↑↓ wählen · Enter bestätigt · j ja · n oder Esc nein"
+        } else {
+            "↑↓ wählen · Enter bestätigt · j ja · n oder Esc nein"
+        },
+    )
 }
 
 // ------------------------------------------------------------------ the wizard
@@ -606,12 +623,14 @@ fn wizard_screen(app: &App, p: &P, w: &Wizard, rows: usize) -> (Vec<String>, &'s
         }
         Step::Name => {
             o.push(p.field("Name", &w.name, true));
+            o.extend(message_lines(p, &w.message));
             o.push(String::new());
             o.extend(p.note("Kleinbuchstaben, Ziffern und Bindestriche. Unter diesem Namen führt das Menü den Agenten, seine Dateien und seinen Dienst."));
             keys = "tippen · Enter weiter · Esc zurück";
         }
         Step::WaveUrl => {
             o.push(p.field("Wave", &w.wave_url, true));
+            o.extend(message_lines(p, &w.message));
             o.push(String::new());
             o.extend(p.note("Die Adresse von Wave (https). Das Menü fragt nach den Räumen des Agenten unter dieser Adresse."));
             keys = "tippen · Enter weiter · Esc zurück";
@@ -629,6 +648,7 @@ fn wizard_screen(app: &App, p: &P, w: &Wizard, rows: usize) -> (Vec<String>, &'s
             ));
             o.push(String::new());
             o.push(p.field("Start-Befehl", &w.launcher, w.field == 1));
+            o.extend(message_lines(p, &w.message));
             o.push(String::new());
             o.extend(p.note("Variable: der NAME, unter dem der Schlüssel in der Umgebung liegt (nie der Schlüssel selbst)."));
             o.extend(p.note("Start-Befehl: der Befehl deines Secret-Stores, der ein Programm mit den Geheimnissen in der Umgebung startet, zum Beispiel `secrets-run run --env=prod --`. Der Dienst startet die Station dadurch. Ohne ihn geht nur der Start von Hand."));
@@ -683,6 +703,7 @@ fn wizard_screen(app: &App, p: &P, w: &Wizard, rows: usize) -> (Vec<String>, &'s
         }
         Step::Workdir => {
             o.push(p.field("Ordner", &w.workdir, true));
+            o.extend(message_lines(p, &w.message));
             o.push(String::new());
             o.extend(p.note("Der Agent liest und schreibt nur hier (je Raum ein Unterordner). Die Station prüft vor jedem Weckruf, dass der Ordner kein Ort mit Schlüsseln oder Einstellungen ist, und lehnt sonst ab."));
             keys = "tippen · Enter weiter · Esc zurück";
@@ -784,16 +805,7 @@ fn wizard_screen(app: &App, p: &P, w: &Wizard, rows: usize) -> (Vec<String>, &'s
             keys = "Enter zurück zum Menü";
         }
     }
-    if matches!(
-        w.step,
-        Step::Mode
-            | Step::Engine
-            | Step::Name
-            | Step::WaveUrl
-            | Step::KeySource
-            | Step::Rooms
-            | Step::Workdir
-    ) {
+    if matches!(w.step, Step::Mode | Step::Engine | Step::Rooms) {
         if let Some((l, m)) = &w.message {
             o.push(String::new());
             for line in wrap(m, p.w.saturating_sub(2)) {
@@ -802,6 +814,18 @@ fn wizard_screen(app: &App, p: &P, w: &Wizard, rows: usize) -> (Vec<String>, &'s
         }
     }
     (o, keys)
+}
+
+/// The message of a step (a refusal, an error), wrapped, right under the field it is about.
+fn message_lines(p: &P, m: &Option<(Level, String)>) -> Vec<String> {
+    m.as_ref()
+        .map(|(l, t)| {
+            wrap(t, p.w.saturating_sub(2))
+                .iter()
+                .map(|x| p.level(*l, x))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn greyed(p: &P, on: bool, text: &str) -> String {
