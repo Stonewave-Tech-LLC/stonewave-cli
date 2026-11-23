@@ -76,7 +76,8 @@ Usage: stonewave [command] [options]
 
 Commands:
   doctor         Check whether this server can be connected (real, read only)
-  connect        Sign in with your Stonewave account, register this server with Wave and set it up (default; needs sudo)
+  agents         The menu of coding agents on this computer (also what `stonewave` alone shows on a terminal)
+  connect        Sign in with your Stonewave account, register this server with Wave and set it up (needs sudo)
   setup          Set up this server: agent user, agent SSH, daemon, audit log (needs sudo; --dry-run only looks)
   revoke         Revoke all agent access on this server, also without internet (needs sudo)
   status         The line to Wave, the agent SSH and the last health report (--demo: made-up screens)
@@ -243,6 +244,17 @@ fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.first().map(String::as_str) == Some("agent") {
         return agent::main(&raw[1..]);
+    }
+    // the menu of coding agents: `stonewave` on a terminal, or `stonewave agents`
+    {
+        use crossterm::tty::IsTty;
+        let on_terminal = std::io::stdin().is_tty() && std::io::stdout().is_tty();
+        if raw.is_empty() && on_terminal {
+            return agent::menu::main(true);
+        }
+        if raw.len() == 1 && raw[0] == "agents" {
+            return agent::menu::main(on_terminal);
+        }
     }
     let args = match parse(raw) {
         Ok(a) => a,

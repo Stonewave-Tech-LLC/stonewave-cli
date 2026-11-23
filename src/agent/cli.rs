@@ -15,6 +15,7 @@ Commands:
   rotate       Replace the key with a new one (the old one stops working); the expiry date stays the same
   disconnect   Revoke the key in Wave, then remove the key file, the `wave` entry and the wake service this tool made
   run          Start a command with the key in its environment: stonewave agent run [--agent <name>] -- claude
+  station      Wake the agent when a person mentions it in Wave, by continuing its session (one per room): `stonewave agent station --help`
 
 Options:
   --engine <claude-code|codex|grok|other>  connect: which agent (default: the one found on your PATH)
