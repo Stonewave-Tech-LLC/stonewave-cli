@@ -1,5 +1,5 @@
 //! The menu (`stonewave` on a terminal, or `stonewave agents`): which coding agents are installed here, which are connected to Wave, and the
-//! next step for each (F-136, D-254). It only lists and starts the commands that exist (`agent connect`, `agent status`, `agent station ...`);
+//! next step for each. It only lists and starts the commands that exist (`agent connect`, `agent status`, `agent station ...`);
 //! it keeps no state and writes nothing itself.
 
 use std::io::{BufRead, Write};

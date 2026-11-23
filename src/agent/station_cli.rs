@@ -1,4 +1,4 @@
-//! `stonewave agent station ...`: the station that wakes a coding agent by continuing its session (F-136, D-254).
+//! `stonewave agent station ...`: the station that wakes a coding agent by continuing its session.
 //!
 //! ```text
 //! stonewave agent station run [--agent <name>] [--workdir <folder>] [--rooms "A,B"] [--key-env NAME] [--wave <url>] [--dry-run] [--once]
@@ -217,13 +217,33 @@ extern "C" fn on_signal(_: i32) {
     STOP.store(true, Ordering::SeqCst);
 }
 
-fn install_signals() {
-    #[cfg(unix)]
-    {
-        // SAFETY: the handler only stores into an atomic.
-        unsafe {
-            libc::signal(libc::SIGINT, on_signal as extern "C" fn(i32) as usize);
-            libc::signal(libc::SIGTERM, on_signal as extern "C" fn(i32) as usize);
+/// While the station runs, Ctrl-C and SIGTERM only ask it to stop (a wake that is going is ended too); afterwards the signals work as before,
+/// so the menu can be left with Ctrl-C again.
+struct Signals;
+
+impl Signals {
+    fn install() -> Signals {
+        #[cfg(unix)]
+        {
+            // SAFETY: the handler only stores into an atomic.
+            unsafe {
+                libc::signal(libc::SIGINT, on_signal as extern "C" fn(i32) as usize);
+                libc::signal(libc::SIGTERM, on_signal as extern "C" fn(i32) as usize);
+            }
+        }
+        Signals
+    }
+}
+
+impl Drop for Signals {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            // SAFETY: restoring the default action.
+            unsafe {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            }
         }
     }
 }
@@ -353,7 +373,11 @@ pub fn build_config(
     if let Some(n) = args.session_max_wakes {
         cfg.session_max_wakes = n;
     }
-    cfg.program = args.claude.clone();
+    // a relative path would be looked up from the room folder after the station changes into it: make it a full one now
+    cfg.program = args
+        .claude
+        .as_ref()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()));
     cfg.settings.model = args.model.clone();
     Ok(cfg)
 }
@@ -448,6 +472,31 @@ pub fn status_text(agent: &str, p: &station_run::Paths, now: u64) -> String {
     o
 }
 
+/// Claude Code must know the flags the station gives it: ask it for its version before the first wake.
+fn check_claude(cfg: &Config, which: &dyn Fn(&str) -> Option<PathBuf>) -> Result<(), String> {
+    let program = super::spawn::find_program(cfg.program.as_deref(), "claude", which).ok_or(
+        "Claude Code (`claude`) is not on the PATH; install it or give its path with --claude",
+    )?;
+    let out = System
+        .run(&program.display().to_string(), &["--version".to_owned()])
+        .map_err(|e| {
+            format!(
+                "cannot start Claude Code ({}): {}",
+                super::dirs::text(&program),
+                e.kind()
+            )
+        })?;
+    if !out.ok || !super::claude::version_ok(&out.stdout) {
+        let v = crate::connect::tame(out.stdout.lines().next().unwrap_or("").trim(), 40);
+        let m = super::claude::MIN_VERSION;
+        return Err(format!(
+            "Claude Code `{v}` is too old or not Claude Code: the station needs {}.{}.{} or newer (`claude update`)",
+            m.0, m.1, m.2
+        ));
+    }
+    Ok(())
+}
+
 fn run(
     args: &Args,
     dirs: &Dirs,
@@ -469,18 +518,25 @@ fn run(
         allow_plain_http: !mcp.is_https(),
     };
     let which = |n: &str| System.which(n);
-    let env_all = || std::env::vars().collect::<Vec<_>>();
+    // `vars_os`: a variable that is not valid text must not stop the station; it is simply not passed on
+    let env_all = || {
+        std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect::<Vec<_>>()
+    };
     let now = now_secs;
     let spawn: &dyn Spawn = &RealSpawn;
+    STOP.store(false, Ordering::SeqCst);
     let deps = Deps {
         http: &http as &dyn Http,
         spawn,
         now: &now,
         env: &env_all,
         which: &which,
+        stop: &STOP,
     };
     let agent = cfg.agent.clone();
-    let mut st = Station::new(cfg, deps, paths, key);
+    let mut st = Station::new(cfg, deps, dirs.clone(), paths, key);
     if args.dry_run {
         print!("{}", st.dry_run_text());
         match &st.cfg.key {
@@ -494,11 +550,14 @@ fn run(
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let warnings = station_run::prepare(&st, dirs)?;
+    check_claude(&st.cfg, &which)?;
+    let warnings = station_run::prepare(&st)?;
     for w in &warnings {
         say(&format!("warning: {w}"));
     }
-    install_signals();
+    // one station per agent: a second one would share the inbox position and wake twice
+    let _lock = station_run::Lock::acquire(&st.paths.lock)?;
+    let _signals = Signals::install();
     say(&format!(
         "started for agent {agent}; one session per room is continued when a person of the company mentions it"
     ));
@@ -514,14 +573,15 @@ fn run(
         if args.once {
             return Ok(ExitCode::SUCCESS);
         }
-        errors = if rep.waiting.is_some() {
-            (errors + 1).min(6)
-        } else {
-            0
-        };
-        let pause = st.cfg.poll * 2u32.pow(errors.min(5));
+        // only trouble on the way to Wave makes the station wait longer and longer; a pause or a limit is looked at again at the normal pace
+        errors = if rep.backoff { (errors + 1).min(6) } else { 0 };
+        let mut pause = st.cfg.poll * 2u32.pow(errors.min(5));
+        if let Some(s) = rep.wait_secs {
+            pause = pause.max(Duration::from_secs(s.min(3600)));
+        }
+        let pause = pause.min(Duration::from_secs(3600));
         let mut waited = Duration::ZERO;
-        while waited < pause.min(Duration::from_secs(300)) {
+        while waited < pause {
             if STOP.load(Ordering::SeqCst) {
                 say("stopped");
                 return Ok(ExitCode::SUCCESS);

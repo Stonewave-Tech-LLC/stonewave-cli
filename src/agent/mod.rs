@@ -98,7 +98,7 @@ pub(crate) fn running_as_root() -> bool {
 }
 
 pub fn main(raw: &[String]) -> ExitCode {
-    // `stonewave agent station ...` has its own words and options (F-136)
+    // `stonewave agent station ...` has its own words and options
     if raw.first().map(String::as_str) == Some("station") {
         return station_cli::main(&raw[1..]);
     }

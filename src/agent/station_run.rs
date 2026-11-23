@@ -1,17 +1,24 @@
-//! The station that runs (F-136, D-254): it asks Wave's inbox for what is addressed to the agent, and for each room where a person of the company
+//! The station that runs: it asks Wave's inbox for what is addressed to the agent, and for each room where a person of the company
 //! mentioned it, **continues that room's session** of the engine (Claude Code) with one wake: a fixed text with ids, strict configuration, limits.
 //!
-//! Who wakes it: only a person of the company (author kind `member`), never an agent, never text of outside origin, and only in the rooms it was
-//! told to serve (all rooms it may read if none were named). Everything else is skipped and said once with its reason, never with its text.
+//! Who wakes it: only a person of the company (author kind `member`, text not of outside origin), never an agent, and only in the rooms it was
+//! told to serve (all rooms it may read if none were named). Everything else is skipped and said with its reason, never with its text.
 //!
 //! What it never does: put the text of a message into a prompt, a log or a line; start a run without the limits below; start a second run at the
-//! same time; hand the run more of the environment than [`spawn::clean_env`] lets through; write the key anywhere.
+//! same time (also not from a second station of the same agent: a lock file); hand the run more of the environment than
+//! [`spawn::clean_env`] lets through; write the key anywhere.
+//!
+//! Each room has its own folder inside the working folder (`<workdir>/rooms/<room>`): a run sees only that folder, so what one room's session
+//! writes is not read by another room's. Claude Code also reads a `CLAUDE.md` of the parent folders, which is where shared instructions go.
 //!
 //! Slice 1 polls the inbox (every `poll`, 15 s by default). The live line to Wave's doorbell is slice 2.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -28,6 +35,13 @@ pub const DEFAULT_POLL: Duration = Duration::from_secs(15);
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const PAGE: u64 = 20;
 const MAX_PAGES: usize = 5;
+const MAX_BASELINE_PAGES: usize = 50;
+/// Entries a woken room is remembered for, so a wake is never repeated for the same entry.
+const DONE_KEEP: usize = 300;
+/// A room name that was read this long ago is read again.
+const NAMES_MAX_AGE: u64 = 600;
+const NOTE: &str = "notes/handover.md";
+
 /// Ids go into a prompt, so they must be plain.
 fn plain_id(s: &str) -> bool {
     (1..=80).contains(&s.len())
@@ -186,7 +200,7 @@ pub enum Verdict2 {
     Skip(&'static str),
 }
 
-/// Pure: does this inbox item wake the agent?
+/// Pure: does this inbox item wake the agent? Fails closed: an item that does not say plainly that it is not of outside origin does not wake.
 pub fn classify(
     item: &Value,
     rooms_wanted: &[String],
@@ -206,8 +220,10 @@ pub fn classify(
     else {
         return Verdict2::Skip("an entry without a plain room id");
     };
-    if item.get("untrusted").and_then(Value::as_bool) == Some(true) {
-        return Verdict2::Skip("text of outside origin");
+    match item.get("untrusted").and_then(Value::as_bool) {
+        Some(false) => {}
+        Some(true) => return Verdict2::Skip("text of outside origin"),
+        None => return Verdict2::Skip("an entry that does not say where its text comes from"),
     }
     match item.pointer("/author/kind").and_then(Value::as_str) {
         Some("member") => {}
@@ -238,6 +254,8 @@ pub struct StationState {
     pub next_seq: Option<u64>,
     /// Unix times of the runs of the last day (for the limits).
     pub runs: Vec<u64>,
+    /// Entries already woken for (ids only), so a page that is asked for again does not wake twice.
+    pub done: Vec<String>,
 }
 
 impl StationState {
@@ -248,20 +266,28 @@ impl StationState {
         else {
             return StationState::default();
         };
+        let list = |k: &str| -> Vec<Value> {
+            v.get(k)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        };
         StationState {
             next_seq: v.get("next_seq").and_then(Value::as_u64),
-            runs: v
-                .get("runs")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_u64).collect())
-                .unwrap_or_default(),
+            runs: list("runs").iter().filter_map(Value::as_u64).collect(),
+            done: list("done")
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|s| plain_id(s))
+                .map(str::to_owned)
+                .collect(),
         }
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         atomic_write(
             path,
-            json!({ "next_seq": self.next_seq, "runs": self.runs })
+            json!({ "next_seq": self.next_seq, "runs": self.runs, "done": self.done })
                 .to_string()
                 .as_bytes(),
             0o600,
@@ -274,6 +300,14 @@ impl StationState {
             .filter(|t| now.saturating_sub(**t) < secs)
             .count() as u32
     }
+
+    fn remember(&mut self, entries: &[String]) {
+        self.done.extend(entries.iter().cloned());
+        let n = self.done.len();
+        if n > DONE_KEEP {
+            self.done.drain(..n - DONE_KEEP);
+        }
+    }
 }
 
 pub struct Paths {
@@ -282,6 +316,7 @@ pub struct Paths {
     pub mcp: PathBuf,
     pub paused: PathBuf,
     pub runs_log: PathBuf,
+    pub lock: PathBuf,
 }
 
 pub fn paths(dirs: &Dirs, agent: &str) -> Paths {
@@ -291,12 +326,104 @@ pub fn paths(dirs: &Dirs, agent: &str) -> Paths {
         mcp: dirs.state.join(format!("{agent}.mcp.json")),
         paused: dirs.state.join(format!("{agent}.station.paused")),
         runs_log: dirs.state.join(format!("{agent}.runs.log")),
+        lock: dirs.state.join(format!("{agent}.station.lock")),
+    }
+}
+
+// ------------------------------------------------------------------ one station per agent
+
+/// A lock file that a running station keeps fresh: a second station for the same agent would share the inbox position and wake twice.
+pub struct Lock {
+    path: PathBuf,
+    stop: Arc<AtomicBool>,
+}
+
+const LOCK_FRESH: Duration = Duration::from_secs(90);
+const LOCK_BEAT: Duration = Duration::from_secs(15);
+
+impl Lock {
+    pub fn acquire(path: &Path) -> Result<Lock, String> {
+        if let Some(age) = fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+        {
+            if age < LOCK_FRESH {
+                let who = fs::read_to_string(path).unwrap_or_default();
+                return Err(format!(
+                    "another station for this agent is running (process {}); stop it first, or wait a minute if it just stopped",
+                    who.trim().chars().take(12).collect::<String>()
+                ));
+            }
+        }
+        let pid = std::process::id().to_string();
+        atomic_write(path, pid.as_bytes(), 0o600)
+            .map_err(|e| format!("cannot write the lock file: {}", e.kind()))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (p2, s2) = (path.to_path_buf(), stop.clone());
+        thread::spawn(move || {
+            let mut waited = Duration::ZERO;
+            while !s2.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(250));
+                waited += Duration::from_millis(250);
+                if waited >= LOCK_BEAT {
+                    waited = Duration::ZERO;
+                    let _ = atomic_write(&p2, pid.as_bytes(), 0o600);
+                }
+            }
+        });
+        Ok(Lock {
+            path: path.to_path_buf(),
+            stop,
+        })
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = fs::remove_file(&self.path);
     }
 }
 
 // ------------------------------------------------------------------ the working folder
 
-/// The working folder is where the wake may read and write. It must not be a place the key or the engine's login live in or above.
+fn same_place(a: &Path, b: &Path) -> bool {
+    if cfg!(any(windows, target_os = "macos")) {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    } else {
+        a == b
+    }
+}
+
+fn starts_with_place(path: &Path, prefix: &Path) -> bool {
+    let (p, q): (Vec<_>, Vec<_>) = (path.components().collect(), prefix.components().collect());
+    p.len() >= q.len()
+        && p.iter()
+            .zip(q.iter())
+            .all(|(x, y)| same_place(Path::new(x.as_os_str()), Path::new(y.as_os_str())))
+}
+
+/// The real place of a path, or the path itself where it does not exist (yet).
+fn real(p: &Path) -> PathBuf {
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = p.to_path_buf();
+    loop {
+        if let Ok(c) = fs::canonicalize(&cur) {
+            return rest.iter().rev().fold(c, |a, r| a.join(r));
+        }
+        match (cur.file_name().map(ToOwned::to_owned), cur.parent()) {
+            (Some(n), Some(par)) => {
+                rest.push(n);
+                cur = par.to_path_buf();
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
+}
+
+/// The working folder is where the wake may read and write. It must not be a place the key or the engine's login live in or above, and it is
+/// compared by its real place (links, `..` and capital letters do not get around it).
 pub fn check_workdir(
     work: &Path,
     dirs: &Dirs,
@@ -305,27 +432,35 @@ pub fn check_workdir(
     if !work.is_absolute() {
         return Err("the working folder must be a full path".into());
     }
-    if work.parent().is_none() || work == dirs.home {
+    if work.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err("the working folder cannot contain `..`".into());
+    }
+    let canon = real(work);
+    if canon.parent().is_none() || same_place(&canon, &real(&dirs.home)) {
         return Err("the working folder cannot be the root or your whole home folder".into());
     }
-    let inside = |outer: &Path, inner: &Path| inner.starts_with(outer);
-    for guarded in [
-        &dirs.config,
-        &dirs.state,
-        &dirs.codex_home,
-        &dirs.home.join(".claude"),
-        &dirs.home.join(".ssh"),
-        &dirs.home.join(".grok"),
-    ] {
-        if inside(work, guarded) || inside(guarded, work) {
+    let guarded_homes = [
+        ".claude", ".ssh", ".grok", ".aws", ".gnupg", ".kube", ".docker", ".config", ".local",
+    ];
+    let mut guarded: Vec<PathBuf> = vec![
+        dirs.config.clone(),
+        dirs.state.clone(),
+        dirs.codex_home.clone(),
+    ];
+    guarded.extend(guarded_homes.iter().map(|n| dirs.home.join(n)));
+    for g in guarded {
+        let g = real(&g);
+        // the folders under the user's own config and state folders that are NOT keys are fine only if they are the agent's room folders;
+        // `.config` and `.local` are guarded as a whole unless the working folder is nowhere in them
+        if starts_with_place(&canon, &g) || starts_with_place(&g, &canon) {
             return Err(format!(
                 "the working folder cannot be or contain {} (it holds keys or logins)",
-                super::dirs::text(guarded)
+                super::dirs::text(&g)
             ));
         }
     }
     if let Some(k) = key_file {
-        if inside(work, k) {
+        if starts_with_place(&real(k), &canon) {
             return Err("the key file lies inside the working folder".into());
         }
     }
@@ -361,13 +496,13 @@ pub fn check_workdir(
                         super::dirs::text(&p)
                     )
                 })?;
-                if !target.starts_with(&canon) {
+                if !starts_with_place(&target, &canon) {
                     return Err(format!(
                         "{} is a link that leads out of the working folder; remove it",
                         super::dirs::text(&p)
                     ));
                 }
-            } else if meta.is_dir() && depth < 2 {
+            } else if meta.is_dir() && depth < 3 {
                 stack.push((p, depth + 1));
             }
         }
@@ -389,6 +524,8 @@ pub struct Deps<'a> {
     /// The whole environment of this process (the run gets only the allowed part of it).
     pub env: &'a dyn Fn() -> Vec<(String, String)>,
     pub which: &'a dyn Fn(&str) -> Option<PathBuf>,
+    /// Set by a signal: a run that is going is ended and the station stops.
+    pub stop: &'a AtomicBool,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -400,31 +537,71 @@ pub struct Report {
     pub waiting: Option<String>,
     /// Something that needs a person (the key is refused, the engine is not logged in).
     pub fatal: Option<String>,
+    /// The waiting is a problem on the way to Wave (not a pause or a limit): wait longer and longer.
+    pub backoff: bool,
+    /// Seconds Wave asked to wait.
+    pub wait_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Ok,
+    Timeout,
+    Failed,
+    NotStarted,
+    Login,
+    TooOld,
+    Stopped,
+}
+
+impl Outcome {
+    fn word(self) -> &'static str {
+        match self {
+            Outcome::Ok => "ok",
+            Outcome::Timeout => "timeout",
+            Outcome::Failed => "failed",
+            Outcome::NotStarted => "not-started",
+            Outcome::Login => "login",
+            Outcome::TooOld => "too-old",
+            Outcome::Stopped => "stopped",
+        }
+    }
+}
+
+struct Ran {
+    ended: Ended,
+    verdict: Option<Verdict>,
+    /// Claude Code did not know a flag (it is older than the station needs).
+    usage_error: bool,
 }
 
 pub struct Station<'a> {
     pub cfg: Config,
     pub deps: Deps<'a>,
+    pub dirs: Dirs,
     pub paths: Paths,
     key: Key,
     pub state: StationState,
     pub sessions: Sessions,
     pub names: BTreeMap<String, String>,
+    names_at: u64,
     rpc_id: u64,
 }
 
 impl<'a> Station<'a> {
-    pub fn new(cfg: Config, deps: Deps<'a>, paths: Paths, key: Key) -> Station<'a> {
+    pub fn new(cfg: Config, deps: Deps<'a>, dirs: Dirs, paths: Paths, key: Key) -> Station<'a> {
         let state = StationState::load(&paths.state);
         let sessions = Sessions::load(&paths.sessions);
         Station {
             cfg,
             deps,
+            dirs,
             paths,
             key,
             state,
             sessions,
             names: BTreeMap::new(),
+            names_at: 0,
             rpc_id: 0,
         }
     }
@@ -446,15 +623,22 @@ impl<'a> Station<'a> {
         let _ = self.state.save(&self.paths.state);
     }
 
-    fn refresh_rooms(&mut self) {
-        if let Ok(d) = self.call("rooms", json!({})) {
-            for r in d["items"].as_array().into_iter().flatten() {
-                if let Some(id) = r["id"].as_str() {
-                    let name = r["name"].as_str().or(r["key"].as_str()).unwrap_or("");
-                    self.names
-                        .insert(id.to_owned(), name.chars().take(80).collect());
+    /// False when the names could not be read.
+    fn refresh_rooms(&mut self) -> bool {
+        match self.call("rooms", json!({})) {
+            Ok(d) => {
+                self.names.clear();
+                for r in d["items"].as_array().into_iter().flatten() {
+                    if let Some(id) = r["id"].as_str() {
+                        let name = r["name"].as_str().or(r["key"].as_str()).unwrap_or("");
+                        self.names
+                            .insert(id.to_owned(), name.chars().take(80).collect());
+                    }
                 }
+                self.names_at = (self.deps.now)();
+                true
             }
+            Err(_) => false,
         }
     }
 
@@ -469,8 +653,13 @@ impl<'a> Station<'a> {
         )
     }
 
+    /// The folder of one room: a run sees only this one.
+    pub fn room_dir(&self, room: &str) -> PathBuf {
+        self.cfg.workdir.join("rooms").join(room)
+    }
+
     /// The command of one wake, as it would be started.
-    pub fn plan(&self, prompt: &str, resume: Option<&str>) -> Result<RunReq, String> {
+    pub fn plan(&self, prompt: &str, resume: Option<&str>, cwd: &Path) -> Result<RunReq, String> {
         let program = super::spawn::find_program(
             self.cfg.program.as_deref(),
             "claude",
@@ -487,7 +676,7 @@ impl<'a> Station<'a> {
             program,
             args: claude::build_args(prompt, &self.paths.mcp, &self.cfg.settings, resume),
             env,
-            cwd: self.cfg.workdir.clone(),
+            cwd: cwd.to_path_buf(),
             timeout: self.cfg.timeout,
             grace: self.cfg.grace,
         })
@@ -544,65 +733,103 @@ impl<'a> Station<'a> {
     fn run_once(
         &mut self,
         room: &str,
+        cwd: &Path,
         prompt: &str,
         resume: Option<&str>,
-    ) -> Result<(Ended, Option<Verdict>), String> {
-        let req = self.plan(prompt, resume)?;
+    ) -> Result<Ran, String> {
+        let req = self.plan(prompt, resume, cwd)?;
         let now = (self.deps.now)();
         self.state.runs.retain(|t| now.saturating_sub(*t) < 86_400);
         self.state.runs.push(now);
         self.save_state();
-        let out = self.deps.spawn.run(&req);
+        let out = self.deps.spawn.run(&req, self.deps.stop);
         let verdict = claude::parse_verdict(&out.stdout, &out.stderr);
+        let usage_error =
+            verdict.is_none() && matches!(out.ended, Ended::Exited(Some(c)) if c != 0) && {
+                let e = out.stderr.to_lowercase();
+                e.contains("unknown option")
+                    || e.contains("unknown argument")
+                    || e.contains("unrecognized")
+            };
         let how = match (&out.ended, &verdict) {
             (Ended::TimedOut, _) => "timeout".to_owned(),
+            (Ended::Stopped, _) => "stopped".to_owned(),
             (Ended::CouldNotStart(k), _) => format!("not-started:{k}"),
             (Ended::Exited(c), Some(v)) if !v.is_error && *c == Some(0) => "ok".to_owned(),
             (Ended::Exited(c), _) => format!("failed:{}", c.map_or("?".into(), |c| c.to_string())),
         };
         self.log_run(room, &how, verdict.as_ref(), out.elapsed.as_secs());
-        Ok((out.ended, verdict))
+        Ok(Ran {
+            ended: out.ended,
+            verdict,
+            usage_error,
+        })
     }
 
-    /// The handover: the old session writes a short note, then the room starts a new session that reads it.
-    fn rotate(&mut self, room: &str, s: &RoomSession) -> RoomSession {
-        let rel = format!("notes/{}-handover.md", room);
-        let _ = fs::create_dir_all(self.cfg.workdir.join("notes"));
-        let prompt = format!("{} The file: {rel}", claude::HANDOVER_PROMPT);
-        let note = match self.run_once(room, &prompt, s.session.as_deref()) {
-            Ok((Ended::Exited(Some(0)), Some(v)))
-                if !v.is_error && self.cfg.workdir.join(&rel).exists() =>
-            {
-                Some(rel)
+    /// The handover: the old session writes a short note, then the room starts a new session that reads it. `None` = not now (limit, or the old
+    /// session could not write the note): the session simply goes on and the next wake tries again.
+    fn rotate(&mut self, room: &str, s: &RoomSession, dir: &Path) -> Option<RoomSession> {
+        if self.limit_hit((self.deps.now)()).is_some() || self.deps.stop.load(Ordering::SeqCst) {
+            return None;
+        }
+        let note = dir.join(NOTE);
+        let _ = fs::remove_file(&note);
+        let _ = fs::create_dir_all(dir.join("notes"));
+        let prompt = format!("{} The file: {NOTE}", claude::HANDOVER_PROMPT);
+        let ran = self
+            .run_once(room, dir, &prompt, s.session.as_deref())
+            .ok()?;
+        match (&ran.ended, &ran.verdict) {
+            (Ended::Exited(Some(0)), Some(v)) if !v.is_error && note.exists() => {
+                Some(RoomSession {
+                    session: None,
+                    wakes: 0,
+                    started: (self.deps.now)(),
+                    note: Some(NOTE.to_owned()),
+                })
             }
             _ => None,
-        };
-        RoomSession {
-            session: None,
-            wakes: 0,
-            started: (self.deps.now)(),
-            note,
         }
     }
 
-    /// One wake of one room. Returns how it ended, in a word.
-    fn wake_room(&mut self, room: &str, entries: &[String]) -> Result<&'static str, String> {
+    /// One wake of one room.
+    fn wake_room(&mut self, room: &str, entries: &[String]) -> Result<Outcome, String> {
+        let key_file = match &self.cfg.key {
+            KeySource::File(p) => Some(p.clone()),
+            KeySource::Env(_) => None,
+        };
+        check_workdir(&self.cfg.workdir, &self.dirs, key_file.as_deref())?;
+        let dir = self.room_dir(room);
+        fs::create_dir_all(&dir)
+            .map_err(|e| format!("cannot create the room folder: {}", e.kind()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+        }
         let mut s = self.sessions.get(room);
         if s.session.is_some() && s.wakes >= self.cfg.session_max_wakes {
-            s = self.rotate(room, &s);
-            self.sessions.put(room, s.clone());
+            if let Some(ns) = self.rotate(room, &s, &dir) {
+                s = ns;
+                self.sessions.put(room, s.clone());
+                let _ = self.sessions.save(&self.paths.sessions);
+            }
         }
-        let note = s.note.clone();
+        let note = s.note.clone().filter(|n| claude::plain_note(n));
         let prompt = claude::wake_prompt(room, entries, note.as_deref());
         let mut resume = s.session.clone();
         let mut fresh_fallback_used = false;
         let mut retried = false;
         loop {
-            let (ended, v) = self.run_once(room, &prompt, resume.as_deref())?;
-            match (&ended, &v) {
-                (Ended::TimedOut, _) => return Ok("timeout"),
-                (Ended::CouldNotStart(_), _) => return Ok("not-started"),
-                (_, Some(v)) if v.login_problem => return Ok("login"),
+            let ran = self.run_once(room, &dir, &prompt, resume.as_deref())?;
+            if ran.usage_error {
+                return Ok(Outcome::TooOld);
+            }
+            match (&ran.ended, &ran.verdict) {
+                (Ended::Stopped, _) => return Ok(Outcome::Stopped),
+                (Ended::TimedOut, _) => return Ok(Outcome::Timeout),
+                (Ended::CouldNotStart(_), _) => return Ok(Outcome::NotStarted),
+                (_, Some(v)) if v.login_problem => return Ok(Outcome::Login),
                 (_, Some(v)) if v.session_missing && resume.is_some() && !fresh_fallback_used => {
                     // the session is gone (cleaned up, other machine): a fresh run is the fallback, and its session replaces the lost one
                     fresh_fallback_used = true;
@@ -610,13 +837,16 @@ impl<'a> Station<'a> {
                     continue;
                 }
                 (Ended::Exited(Some(0)), Some(v)) if !v.is_error => {
-                    let keep = v.session_id.clone().or(resume.clone());
-                    let continued = resume.is_some() && keep.as_deref() == resume.as_deref();
+                    let continued = resume.is_some();
                     self.sessions.put(
                         room,
                         RoomSession {
-                            session: keep,
-                            wakes: if continued { s.wakes + 1 } else { 1 },
+                            session: v.session_id.clone().or(resume.clone()),
+                            wakes: if continued {
+                                s.wakes.saturating_add(1)
+                            } else {
+                                1
+                            },
                             started: if continued {
                                 s.started
                             } else {
@@ -626,13 +856,14 @@ impl<'a> Station<'a> {
                         },
                     );
                     let _ = self.sessions.save(&self.paths.sessions);
-                    return Ok("ok");
+                    return Ok(Outcome::Ok);
                 }
-                _ if !retried => {
+                // a run that already did something (it may have posted) is not repeated; one that never got going is, once
+                (_, v) if !retried && v.as_ref().and_then(|v| v.turns).unwrap_or(0) == 0 => {
                     retried = true;
                     continue;
                 }
-                _ => return Ok("failed"),
+                _ => return Ok(Outcome::Failed),
             }
         }
     }
@@ -651,10 +882,9 @@ impl<'a> Station<'a> {
             rep.waiting = Some("paused (`stonewave agent station resume` ends the pause)".into());
             return rep;
         }
-        let now = (self.deps.now)();
         let mut pages = 0;
-        let baseline = self.state.next_seq.is_none();
         loop {
+            let baseline = self.state.next_seq.is_none();
             let since = self.state.next_seq.unwrap_or(0);
             let data = match self.call("inbox", json!({ "since_seq": since, "limit": PAGE })) {
                 Ok(d) => d,
@@ -662,29 +892,46 @@ impl<'a> Station<'a> {
                     rep.fatal = Some(m);
                     return rep;
                 }
-                Err(WaveErr::Later(m, _)) | Err(WaveErr::Other(m)) => {
+                Err(WaveErr::Later(m, secs)) => {
                     rep.waiting = Some(m);
+                    rep.backoff = true;
+                    rep.wait_secs = secs;
+                    return rep;
+                }
+                Err(WaveErr::Other(m)) => {
+                    rep.waiting = Some(m);
+                    rep.backoff = true;
                     return rep;
                 }
             };
             let items: Vec<Value> = data["items"].as_array().cloned().unwrap_or_default();
             let next = data["next_seq"].as_u64().unwrap_or(since).max(since);
+            let full = (items.len() as u64) >= PAGE;
             if baseline {
                 // the first start: what is old stays old; nothing is woken for it
                 self.state.next_seq = Some(next);
                 self.save_state();
-                if (items.len() as u64) < PAGE {
+                pages += 1;
+                if !full || pages >= MAX_BASELINE_PAGES {
                     return rep;
                 }
                 continue;
             }
-            if items.iter().any(|i| {
-                i["room_id"]
-                    .as_str()
-                    .is_some_and(|r| !self.names.contains_key(r))
-            }) && !self.cfg.rooms.is_empty()
-            {
-                self.refresh_rooms();
+            // room names are only needed when rooms were named; a name that cannot be read holds the page back instead of skipping its entries
+            if !self.cfg.rooms.is_empty() {
+                let unknown = items.iter().any(|i| {
+                    i["room_id"]
+                        .as_str()
+                        .is_some_and(|r| !self.names.contains_key(r))
+                });
+                let stale = (self.deps.now)().saturating_sub(self.names_at) > NAMES_MAX_AGE;
+                if (unknown || stale) && !self.refresh_rooms() && (unknown || self.names.is_empty())
+                {
+                    rep.waiting =
+                        Some("cannot read the room names from Wave; will try again".into());
+                    rep.backoff = true;
+                    return rep;
+                }
             }
             // who is woken, room by room in the order of the first entry
             let mut order: Vec<String> = Vec::new();
@@ -693,60 +940,76 @@ impl<'a> Station<'a> {
                 match classify(it, &self.cfg.rooms, &self.names) {
                     Verdict2::Skip(why) => rep.skipped.push(why),
                     Verdict2::Wake { room, entry } => {
+                        if self.state.done.contains(&entry) {
+                            continue;
+                        }
                         let seq = it["seq"].as_u64().unwrap_or(next);
                         let e = by_room.entry(room.clone()).or_insert_with(|| {
                             order.push(room.clone());
                             (Vec::new(), seq)
                         });
-                        if e.0.len() < 10 {
-                            e.0.push(entry);
-                        }
+                        e.0.push(entry);
                     }
                 }
             }
             let mut cursor = next;
             for room in order {
                 let (entries, first_seq) = by_room.remove(&room).unwrap_or_default();
+                let held = first_seq.saturating_sub(1).max(since);
+                if self.deps.stop.load(Ordering::SeqCst) {
+                    rep.waiting = Some("stopping".into());
+                    cursor = held;
+                    break;
+                }
                 if let Some(why) = self.limit_hit((self.deps.now)()) {
                     rep.waiting = Some(why);
-                    cursor = cursor.min(first_seq.saturating_sub(1)).max(since);
+                    cursor = held;
                     break;
                 }
                 match self.wake_room(&room, &entries) {
-                    Ok("login") => {
+                    Ok(Outcome::Login) => {
                         rep.fatal = Some("Claude Code is not logged in for this user (or its login ran out); log in once with `claude auth login`".into());
-                        cursor = cursor.min(first_seq.saturating_sub(1)).max(since);
+                        cursor = held;
                         break;
                     }
-                    Ok(how) => {
-                        if matches!(how, "timeout" | "failed" | "not-started") {
-                            let why = match how {
-                                "timeout" => "time limit",
-                                "not-started" => "the engine could not be started",
+                    Ok(Outcome::TooOld) => {
+                        rep.fatal = Some(format!(
+                            "this Claude Code does not know a flag the station needs; the station needs Claude Code {}.{}.{} or newer",
+                            claude::MIN_VERSION.0,
+                            claude::MIN_VERSION.1,
+                            claude::MIN_VERSION.2
+                        ));
+                        cursor = held;
+                        break;
+                    }
+                    Ok(Outcome::Stopped) => {
+                        rep.waiting = Some("stopping".into());
+                        cursor = held;
+                        break;
+                    }
+                    Ok(o) => {
+                        if matches!(o, Outcome::Timeout | Outcome::Failed | Outcome::NotStarted) {
+                            let why = match o {
+                                Outcome::Timeout => "time limit",
+                                Outcome::NotStarted => "the engine could not be started",
                                 _ => "the engine ended with an error",
                             };
                             self.post_failure(&room, why);
                         }
-                        rep.woke.push((room.clone(), how.to_owned()));
+                        self.state.remember(&entries);
+                        rep.woke.push((room.clone(), o.word().to_owned()));
                     }
                     Err(m) => {
                         rep.fatal = Some(m);
-                        cursor = cursor.min(first_seq.saturating_sub(1)).max(since);
+                        cursor = held;
                         break;
                     }
                 }
             }
             self.state.next_seq = Some(cursor);
-            self.state.runs.retain(|t| {
-                now.saturating_sub(*t) < 86_400 || (self.deps.now)().saturating_sub(*t) < 86_400
-            });
             self.save_state();
             pages += 1;
-            if rep.waiting.is_some()
-                || rep.fatal.is_some()
-                || (items.len() as u64) < PAGE
-                || pages >= MAX_PAGES
-            {
+            if rep.waiting.is_some() || rep.fatal.is_some() || !full || pages >= MAX_PAGES {
                 return rep;
             }
         }
@@ -773,7 +1036,7 @@ impl<'a> Station<'a> {
             }
         ));
         o.push_str(&format!(
-            "work folder  {}\n",
+            "work folder  {} (one folder per room inside)\n",
             super::dirs::text(&self.cfg.workdir)
         ));
         o.push_str(&format!(
@@ -791,12 +1054,21 @@ impl<'a> Station<'a> {
             "limits       {} min per wake, {} turns, {} per wake, {} wakes per hour, {} per day, one at a time; a room's session ends after {} wakes\n",
             self.cfg.timeout.as_secs() / 60,
             self.cfg.settings.max_turns,
-            self.cfg.settings.budget_usd.map_or("no cost cap".to_owned(), |b| format!("{b:.2} USD (an estimate)")),
+            self.cfg
+                .settings
+                .budget_usd
+                .map_or("no cost cap".to_owned(), |b| format!(
+                    "{b:.2} USD (an estimate)"
+                )),
             self.cfg.per_hour,
             self.cfg.per_day,
             self.cfg.session_max_wakes
         ));
-        match self.plan(&prompt, Some("SESSION-ID-OF-THIS-ROOM")) {
+        match self.plan(
+            &prompt,
+            Some("SESSION-ID-OF-THIS-ROOM"),
+            &self.room_dir(fake_room),
+        ) {
             Ok(r) => {
                 o.push_str(&format!(
                     "\nthe command of a wake that continues the room's session:\n  {}\n",
@@ -811,7 +1083,7 @@ impl<'a> Station<'a> {
             }
             Err(e) => o.push_str(&format!("\ncannot plan a wake: {e}\n")),
         }
-        o.push_str("\nno command tools (--restricted, Bash and web denied), one MCP server (wave), nothing is started by --dry-run\n");
+        o.push_str("\nno command tools (--restricted, only file tools, Bash and web denied), one MCP server (wave), nothing is started by --dry-run\n");
         o
     }
 }
@@ -832,11 +1104,11 @@ fn shell_words(program: &Path, args: &[String]) -> String {
 }
 
 /// Sets the paths and the MCP file up and checks the folder. Called before the first cycle.
-pub fn prepare(st: &Station<'_>, dirs: &Dirs) -> Result<Vec<String>, String> {
-    fs::create_dir_all(&dirs.state).map_err(|e| {
+pub fn prepare(st: &Station<'_>) -> Result<Vec<String>, String> {
+    fs::create_dir_all(&st.dirs.state).map_err(|e| {
         format!(
             "cannot create {}: {}",
-            super::dirs::text(&dirs.state),
+            super::dirs::text(&st.dirs.state),
             e.kind()
         )
     })?;
@@ -844,7 +1116,7 @@ pub fn prepare(st: &Station<'_>, dirs: &Dirs) -> Result<Vec<String>, String> {
         KeySource::File(p) => Some(p.as_path()),
         KeySource::Env(_) => None,
     };
-    let warnings = check_workdir(&st.cfg.workdir, dirs, key_file)?;
+    let warnings = check_workdir(&st.cfg.workdir, &st.dirs, key_file)?;
     st.write_mcp_file()
         .map_err(|e| format!("cannot write the MCP file: {}", e.kind()))?;
     Ok(warnings)

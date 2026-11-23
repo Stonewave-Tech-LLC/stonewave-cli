@@ -1,8 +1,8 @@
 //! Claude Code as an engine of the station: the command of one wake, what its answer means, and the fixed texts it is given.
 //!
-//! One wake = `claude -p <fixed text with ids> --resume <session of this room>` in the agent's own folder (F-136, D-254):
+//! One wake = `claude -p <fixed text with ids> --resume <session of this room>` in the agent's own folder for that room:
 //!
-//! - **No command tools.** `--restricted` (Claude Code 2.1.248 and newer) removes the tools that run commands or code and WebFetch and keeps
+//! - **No command tools.** `--restricted` (Claude Code 2.1.248 and newer; the station asks for 2.1.259, which `--permission-prompts` needs) removes the tools that run commands or code and WebFetch and keeps
 //!   the file tools inside the working folder. `--allowedTools` alone would not do: Claude runs a set of read-only commands (`cat`, `ls`, `git` ...)
 //!   in every permission mode, so a run could read the key file. `--permission-prompts none` denies whatever would ask a person.
 //! - **Only Wave's tools.** `--strict-mcp-config --mcp-config <file>` loads one server, `wave`, and nothing a folder brings along (a `.mcp.json`
@@ -20,6 +20,9 @@ use super::engine::KEY_VAR;
 /// The name the Wave server has inside Claude Code (tools show up as `mcp__wave__<tool>`).
 pub const SERVER: &str = "wave";
 
+/// What a wake may do besides Wave's tools: look at and change files in the working folder.
+/// The built-in tools that exist at all in a wake (`--tools`): file tools only. Wave's tools come from the MCP file.
+pub const BUILTIN_TOOLS: &str = "Read,Edit,Glob,Grep";
 /// What a wake may do besides Wave's tools: look at and change files in the working folder.
 pub const ALLOWED_TOOLS: &str = "mcp__wave,Read,Edit,Glob,Grep";
 /// Said out loud as well, so a mistake in another flag cannot bring one of these back.
@@ -93,6 +96,8 @@ pub fn build_args(
         "dontAsk".into(),
         "--permission-prompts".into(),
         "none".into(),
+        "--tools".into(),
+        BUILTIN_TOOLS.into(),
         "--allowedTools".into(),
         ALLOWED_TOOLS.into(),
         "--disallowedTools".into(),
@@ -129,6 +134,31 @@ pub struct Verdict {
     /// The login of the engine is gone or refused.
     pub login_problem: bool,
     pub stop: Option<String>,
+}
+
+/// The oldest Claude Code the station starts: `--restricted` came with 2.1.248, `--permission-prompts` with 2.1.259.
+pub const MIN_VERSION: (u32, u32, u32) = (2, 1, 259);
+
+/// `2.1.321 (Claude Code)` -> (2, 1, 321).
+pub fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
+    let word = text.split_whitespace().next()?;
+    let mut it = word.split('.').map(|p| p.parse::<u32>().ok());
+    Some((it.next()??, it.next()??, it.next()??))
+}
+
+pub fn version_ok(text: &str) -> bool {
+    parse_version(text).is_some_and(|v| v >= MIN_VERSION)
+}
+
+/// A handover note is a plain relative path under `notes/` in a room's folder.
+pub fn plain_note(s: &str) -> bool {
+    s.strip_prefix("notes/").is_some_and(|r| {
+        (1..=80).contains(&r.len())
+            && !r.contains("..")
+            && !r.contains('/')
+            && r.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    })
 }
 
 /// A session id as Claude writes it: lower case hex and dashes.
@@ -212,6 +242,11 @@ mod tests {
             Some("0a1b2c3d-0000-4000-8000-000000000001")
         );
         assert_eq!(after("--output-format").as_deref(), Some("json"));
+        assert_eq!(
+            after("--tools").as_deref(),
+            Some("Read,Edit,Glob,Grep"),
+            "only the file tools exist"
+        );
         let allowed = after("--allowedTools").unwrap();
         let denied = after("--disallowedTools").unwrap();
         assert!(
@@ -232,6 +267,42 @@ mod tests {
                 !a.iter().any(|x| x.contains(bad)),
                 "{bad} must never appear"
             );
+        }
+    }
+
+    #[test]
+    fn the_version_must_be_new_enough_for_the_flags() {
+        assert_eq!(
+            parse_version(
+                "2.1.321 (Claude Code)
+"
+            ),
+            Some((2, 1, 321))
+        );
+        assert!(
+            version_ok("2.1.321 (Claude Code)")
+                && version_ok("2.1.259")
+                && version_ok("2.2.0")
+                && version_ok("3.0.0")
+        );
+        assert!(!version_ok("2.1.258") && !version_ok("2.0.999") && !version_ok("1.9.9"));
+        assert!(!version_ok("") && !version_ok("claude") && !version_ok("2.1"));
+    }
+
+    #[test]
+    fn a_note_path_is_plain_and_under_notes() {
+        assert!(plain_note("notes/handover.md"));
+        for bad in [
+            "../notes/x.md",
+            "notes/../x.md",
+            "/etc/passwd",
+            "notes/a/b.md",
+            "x.md",
+            "notes/",
+            "notes/a b.md",
+            "notes/x;rm",
+        ] {
+            assert!(!plain_note(bad), "{bad}");
         }
     }
 

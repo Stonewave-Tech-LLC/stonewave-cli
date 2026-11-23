@@ -1,7 +1,7 @@
 # The station: waking a coding agent by continuing its session
 
 `stonewave agent station run` keeps one **long session per room** for a coding agent and continues it when a person of the company
-mentions the agent in Wave (F-136, D-254). Context carries over from wake to wake, the way one long working session would; it is not a
+mentions the agent in Wave. Context carries over from wake to wake, the way one long working session would; it is not a
 fresh process with an empty head on every mention. This page is the reference: what it does, how to run it, what it will never do, and what
 has and has not been tested.
 
@@ -15,11 +15,15 @@ Slice 1 supports **Claude Code**. Codex, Grok Build and Gemini follow, each only
    was told to serve (`--rooms`; default: every room the agent may read). Everything else is skipped, and the station says how many and why, never what.
 3. For each room it continues that room's session: `claude -p <fixed text with ids> --resume <session>`. The first wake of a room starts a session,
    the next ones continue it. If Claude Code no longer has the session, one fresh run takes its place (fallback).
-4. The run answers in Wave itself (tool `post`). If a run ends with an error twice, or runs out of time, the station writes **one fixed line**
-   into that room ("I could not finish ... Nothing was done. Mention me again") and moves on. A login problem stops the station instead (the mention
-   is kept and asked for again once `claude auth login` works).
+4. The run answers in Wave itself (tool `post`). A run that never got going (no turn at all) is tried once more; one that already worked and then hit a
+   limit is not repeated (it may have answered). If a wake ends with an error or runs out of time, the station writes **one fixed line** into that room
+   ("I could not finish ... Nothing was done. Mention me again") and moves on. A login problem, or a Claude Code that does not know a flag the station
+   needs, stops the station instead (the mention is kept and asked for again once that is fixed).
 5. After `--session-max-wakes` wakes (default 200) the room's session ends on purpose: the old session writes a short handover note into
-   `notes/<room>-handover.md` in the working folder, and the next wake starts a new session that reads it.
+   `notes/handover.md` in the room's folder, and the next wake starts a new session that reads it. If no fresh note comes (limit reached, the old
+   session did not write it), the session simply goes on and the next wake tries again.
+6. An entry is woken for once: the station remembers the ids it has handled, so a page that is read again (because a room had to wait for a free
+   slot) does not wake the same room twice. A room that waits is woken as soon as a slot is free.
 
 One session per **room**, not one for everything: a shared session would carry what was said in a narrow room into answers in a wide one.
 
@@ -28,13 +32,13 @@ One session per **room**, not one for everything: a shared session would carry w
 | | |
 |---|---|
 | Tools | Wave's tools (one MCP server, `wave`), and reading and changing files inside the working folder. **No shell, no web.** |
-| How | `--restricted` (Claude Code 2.1.248 and newer), `--strict-mcp-config` with a file that names the key variable, `--permission-mode dontAsk --permission-prompts none`, `--allowedTools`/`--disallowedTools`, `--max-turns`, `--max-budget-usd` |
-| Folder | The agent's own folder (`--workdir`, default `~/wave-agents/<agent>`). Refused: your home folder, the folder that holds keys, the state folder, `~/.claude`, `~/.ssh`, a folder with a link that leads outside it |
+| How | `--restricted` and `--tools Read,Edit,Glob,Grep` (only the file tools exist; Claude Code 2.1.259 or newer, which the station checks before it starts), `--strict-mcp-config` with a file that names the key variable, `--permission-mode dontAsk --permission-prompts none`, `--allowedTools`/`--disallowedTools`, `--max-turns`, `--max-budget-usd` |
+| Folder | The agent's own folder (`--workdir`, default `~/wave-agents/<agent>`) and, inside it, **one folder per room** (`rooms/<room>`): a wake runs in its room's folder and sees only that one, so what one room's session writes is not in reach of another room's. Shared instructions go into a `CLAUDE.md` of the parent folder (Claude Code reads parent folders too). Refused: your home folder, the folders that hold keys or logins (`~/.config`, `~/.local`, `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.claude`, the state folder), a path with `..`, a link that leads to one of them or out of the folder; places are compared by their real place, and checked again before every wake |
 | Prompt | A fixed text with ids. **The text of a message never goes into a command.** The run reads it through Wave's tools, where text from outside the company comes wrapped |
 | Environment | Only what the program needs to find its login and its network, plus `WAVE_AGENT_KEY`. Other keys, tokens and cloud credentials of the user stay out |
-| Time | 20 minutes per wake (`--timeout-min`), then the whole process group is asked to end, and after 30 seconds ended for good |
-| Limits | 40 turns, 2 USD (an estimate by Claude Code), 10 wakes per hour, 50 per day, one wake at a time |
-| Stop | `stonewave agent station pause` (no new wake; a running one finishes), `resume`; Ctrl-C or SIGTERM stops the station |
+| Time | 20 minutes per wake (`--timeout-min`), then the run is asked to end (on Linux and macOS its whole process group; on Windows its process tree by id), and after 30 seconds ended for good. Whatever a run leaves behind in its group is ended with it |
+| Limits | 40 turns, 2 USD (an estimate by Claude Code; it can be exceeded), 10 wakes per hour, 50 per day, one wake at a time, and **one station per agent** (a lock file in the state folder; a second `station run` for the same agent is refused) |
+| Stop | `stonewave agent station pause` (no new wake; a running one finishes), `resume`. Ctrl-C or SIGTERM (Linux, macOS) also ends a wake that is going, then the station stops; the mention it was working on stays and is picked up on the next start. On Windows Ctrl-C ends the console's processes the usual way |
 
 Why `--restricted` and not just `--allowedTools`: Claude Code runs a set of read-only commands (`cat`, `ls`, `git` ...) in every permission mode, so a run
 could `cat` the key file. And why a strict MCP file: `claude -p` loads a project's `.mcp.json` without asking, and `${WAVE_AGENT_KEY}` is expanded in server
@@ -104,11 +108,12 @@ All in the same private folders as the key (`~/.config/wave`, `~/.local/state/wa
 
 | File | Holds |
 |---|---|
-| `<agent>.station.json` | the inbox position and the times of the wakes of the last day (for the limits) |
+| `<agent>.station.json` | the inbox position, the times of the wakes of the last day (for the limits) and the ids of the entries already woken for (so a page that is read again does not wake twice) |
 | `<agent>.sessions.json` | per room: session id, number of wakes, handover note path. **No text.** |
 | `<agent>.mcp.json` | the MCP file of a wake: the address and the *name* of the key variable. **No key** |
 | `<agent>.runs.log` | one line per run: time, room, how it ended, seconds, turns, estimated cost. **No text** |
 | `<agent>.station.paused` | exists while paused |
+| `<agent>.station.lock` | exists while a station runs; kept fresh every 15 seconds (a lock older than 90 seconds is taken over) |
 
 ## What was tested, and what was not
 

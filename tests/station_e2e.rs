@@ -118,9 +118,14 @@ fn inbox(items: Vec<serde_json::Value>, next: u64) -> serde_json::Value {
 
 /// A stand-in for `claude`: writes its arguments, its environment and its folder to a file, and answers like `-p --output-format json`.
 fn fake_claude(dir: &Path, record: &Path) -> PathBuf {
+    fake_claude_version(dir, record, "2.1.321 (Claude Code)")
+}
+
+/// The same, answering `--version` with the given text (the station asks before it starts anything).
+fn fake_claude_version(dir: &Path, record: &Path, version: &str) -> PathBuf {
     let p = dir.join("claude");
     let script = format!(
-        "#!/bin/sh\n{{ echo \"PWD=$(pwd)\"; for a in \"$@\"; do echo \"ARG=$a\"; done; env | sed 's/=.*//' | sed 's/^/ENV=/'; echo \"KEYVALUE=$WAVE_AGENT_KEY\"; echo '---'; }} >> '{}'\n\
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '{version}'; exit 0; fi\n{{ echo \"PWD=$(pwd)\"; for a in \"$@\"; do echo \"ARG=$a\"; done; env | sed 's/=.*//' | sed 's/^/ENV=/'; echo \"KEYVALUE=$WAVE_AGENT_KEY\"; echo '---'; }} >> '{}'\n\
          echo '{{\"type\":\"result\",\"is_error\":false,\"session_id\":\"{SID}\",\"total_cost_usd\":0.01,\"num_turns\":2,\"terminal_reason\":\"completed\",\"result\":\"SECRET ANSWER\"}}'\n",
         record.display()
     );
@@ -208,9 +213,11 @@ fn a_person_mentions_the_agent_twice_and_the_second_wake_continues_the_session()
         assert!(
             r.contains(&format!(
                 "PWD={}",
-                std::fs::canonicalize(&work).unwrap().display()
+                std::fs::canonicalize(work.join("rooms").join("room-1"))
+                    .unwrap()
+                    .display()
             )),
-            "runs in its own folder: {r}"
+            "runs in the folder of its room: {r}"
         );
         for flag in [
             "ARG=--restricted",
@@ -286,6 +293,24 @@ fn the_dry_run_starts_nothing_and_asks_nobody() {
     );
     assert!(!record.exists());
     assert!(wave.seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_claude_code_that_is_too_old_is_refused_before_anything_is_asked() {
+    let home = Home::new();
+    let work = home.0.join("wave-agents").join("demo");
+    let record = home.0.join("record.txt");
+    let claude = fake_claude_version(&home.0, &record, "2.1.100 (Claude Code)");
+    let wave = serve(vec![inbox(vec![], 1)]);
+    let o = station(&home, &wave, &claude, &work, &[]);
+    let t = text(&o);
+    assert_eq!(o.status.code(), Some(2), "{t}");
+    assert!(t.contains("too old") && t.contains("2.1.259"), "{t}");
+    assert!(
+        wave.seen.lock().unwrap().is_empty(),
+        "nothing was asked of Wave"
+    );
+    assert!(!record.exists());
 }
 
 #[test]

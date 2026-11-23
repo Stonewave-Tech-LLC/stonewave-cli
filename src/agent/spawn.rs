@@ -2,11 +2,13 @@
 //!
 //! The station never goes through a shell and never hands a run the whole environment of the user: [`clean_env`] lets through only what
 //! the program needs to find its own login and its network, plus the one variable the station adds (the agent's key).
-//! A run that takes longer than its time limit is ended: the whole group first politely, then for good.
+//! A run that takes longer than its time limit, or that the station is told to stop for, is ended: the whole group first politely, then for good.
 
+use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,7 +17,7 @@ pub const OUT_MAX: usize = 4 * 1024 * 1024;
 /// How long a run gets to end after it was asked to, before it is ended for good.
 pub const GRACE: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RunReq {
     pub program: PathBuf,
     pub args: Vec<String>,
@@ -25,10 +27,28 @@ pub struct RunReq {
     pub grace: Duration,
 }
 
+/// The environment holds the key, so it is never printed, not even by a `{:?}`.
+impl fmt::Debug for RunReq {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RunReq")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field(
+                "env",
+                &self.env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            )
+            .field("cwd", &self.cwd)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ended {
     Exited(Option<i32>),
     TimedOut,
+    /// The station was told to stop while the run was going.
+    Stopped,
     CouldNotStart(String),
 }
 
@@ -40,9 +60,9 @@ pub struct RunOut {
     pub elapsed: Duration,
 }
 
-/// Starting a program. Tests replace it with a recorder.
+/// Starting a program. Tests replace it with a recorder. `stop` is looked at while the program runs.
 pub trait Spawn {
-    fn run(&self, req: &RunReq) -> RunOut;
+    fn run(&self, req: &RunReq, stop: &AtomicBool) -> RunOut;
 }
 
 pub struct RealSpawn;
@@ -64,8 +84,13 @@ const PASS: &[&str] = &[
     "TMP",
     "USERPROFILE",
     "USERNAME",
+    "HOMEDRIVE",
+    "HOMEPATH",
     "LOCALAPPDATA",
     "APPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
     "SYSTEMROOT",
     "SYSTEMDRIVE",
     "COMSPEC",
@@ -83,15 +108,16 @@ const PASS: &[&str] = &[
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "NODE_EXTRA_CA_CERTS",
-    // the login of Claude Code (its folder, a token for unattended jobs, an API key)
+    // the login of Claude Code (its folder, a token for unattended jobs, an API key) and where it finds Git Bash on Windows
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_GIT_BASH_PATH",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
 ];
 
-/// The environment of a run: the allowed variables of `get_all`, then `extra` (the key).
+/// The environment of a run: the allowed variables of `all`, then `extra` (the key).
 pub fn clean_env(
     all: impl IntoIterator<Item = (String, String)>,
     extra: &[(String, String)],
@@ -143,9 +169,19 @@ fn end_for_good(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
+/// What a run left behind in its group (a grandchild that kept the pipes open) is ended too.
+#[cfg(unix)]
+fn clean_up_group(child: &std::process::Child) {
+    signal_group(child.id(), libc::SIGKILL);
+}
+
+#[cfg(not(unix))]
+fn clean_up_group(_: &std::process::Child) {}
+
 #[cfg(not(unix))]
 fn ask_to_end(child: &mut std::process::Child) {
-    // the child's own tree, by its process id; nothing is ended by name
+    // the child's own tree, by its process id; nothing is ended by name. Without /F this only works for programs with a window or console;
+    // the hard end after the grace period is the one that always works.
     let _ = Command::new("taskkill")
         .args(["/PID", &child.id().to_string(), "/T"])
         .stdout(Stdio::null())
@@ -164,7 +200,7 @@ fn end_for_good(child: &mut std::process::Child) {
 }
 
 impl Spawn for RealSpawn {
-    fn run(&self, req: &RunReq) -> RunOut {
+    fn run(&self, req: &RunReq, stop: &AtomicBool) -> RunOut {
         let started = Instant::now();
         let mut cmd = Command::new(&req.program);
         cmd.args(&req.args)
@@ -193,7 +229,7 @@ impl Spawn for RealSpawn {
         let out = child.stdout.take().map(drain);
         let err = child.stderr.take().map(drain);
         let mut asked: Option<Instant> = None;
-        let mut timed_out = false;
+        let mut why: Option<Ended> = None;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(s)) => break Some(s),
@@ -201,10 +237,16 @@ impl Spawn for RealSpawn {
                 Err(_) => break None,
             }
             let now = Instant::now();
-            if !timed_out && now.duration_since(started) >= req.timeout {
-                timed_out = true;
-                asked = Some(now);
-                ask_to_end(&mut child);
+            if why.is_none() {
+                if stop.load(Ordering::SeqCst) {
+                    why = Some(Ended::Stopped);
+                } else if now.duration_since(started) >= req.timeout {
+                    why = Some(Ended::TimedOut);
+                }
+                if why.is_some() {
+                    asked = Some(now);
+                    ask_to_end(&mut child);
+                }
             } else if let Some(t) = asked {
                 if now.duration_since(t) >= req.grace {
                     end_for_good(&mut child);
@@ -213,6 +255,8 @@ impl Spawn for RealSpawn {
             }
             thread::sleep(Duration::from_millis(50));
         };
+        // a program that left a helper behind holding the pipes open must not keep the station waiting
+        clean_up_group(&child);
         let take = |h: Option<thread::JoinHandle<Vec<u8>>>| -> String {
             h.and_then(|h| h.join().ok())
                 .map(|b| String::from_utf8_lossy(&b).into_owned())
@@ -221,11 +265,7 @@ impl Spawn for RealSpawn {
         let stdout = take(out);
         let stderr = take(err);
         RunOut {
-            ended: if timed_out {
-                Ended::TimedOut
-            } else {
-                Ended::Exited(status.and_then(|s| s.code()))
-            },
+            ended: why.unwrap_or(Ended::Exited(status.and_then(|s| s.code()))),
             stdout,
             stderr,
             elapsed: started.elapsed(),
@@ -282,7 +322,7 @@ pub mod fake {
     }
 
     impl Spawn for Recorder {
-        fn run(&self, req: &RunReq) -> RunOut {
+        fn run(&self, req: &RunReq, _stop: &AtomicBool) -> RunOut {
             self.reqs.borrow_mut().push(req.clone());
             self.answers
                 .borrow_mut()
@@ -327,6 +367,10 @@ mod tests {
         }
     }
 
+    fn go(r: &RunReq) -> RunOut {
+        RealSpawn.run(r, &AtomicBool::new(false))
+    }
+
     #[test]
     fn the_environment_is_cleaned_and_the_key_is_added() {
         let dir = tmp("env");
@@ -343,7 +387,7 @@ mod tests {
             ],
             &[("WAVE_AGENT_KEY".into(), "wak_x".into())],
         );
-        let o = RealSpawn.run(&r);
+        let o = go(&r);
         assert_eq!(o.ended, Ended::Exited(Some(0)));
         assert!(o.stdout.contains("key=wak_x other= aws="), "{}", o.stdout);
         assert!(!o.stdout.contains("leak"));
@@ -359,7 +403,7 @@ mod tests {
         let dir = tmp("slow");
         let p = script(&dir, "sleep 30 & sleep 30; echo done");
         let t = Instant::now();
-        let o = RealSpawn.run(&req(p, &dir, Duration::from_millis(300)));
+        let o = go(&req(p, &dir, Duration::from_millis(300)));
         assert_eq!(o.ended, Ended::TimedOut);
         assert!(
             t.elapsed() < Duration::from_secs(5),
@@ -374,19 +418,55 @@ mod tests {
         let dir = tmp("stubborn");
         let p = script(&dir, "trap '' TERM; while true; do sleep 1; done");
         let t = Instant::now();
-        let o = RealSpawn.run(&req(p, &dir, Duration::from_millis(200)));
+        let o = go(&req(p, &dir, Duration::from_millis(200)));
         assert_eq!(o.ended, Ended::TimedOut);
         assert!(t.elapsed() < Duration::from_secs(6));
+    }
+
+    #[test]
+    fn a_stop_while_a_run_is_going_ends_it_at_once() {
+        let dir = tmp("stop");
+        let p = script(&dir, "sleep 30");
+        let stop = AtomicBool::new(false);
+        let r = req(p, &dir, Duration::from_secs(600));
+        let t = Instant::now();
+        let o = thread::scope(|s| {
+            let h = s.spawn(|| RealSpawn.run(&r, &stop));
+            thread::sleep(Duration::from_millis(300));
+            stop.store(true, Ordering::SeqCst);
+            h.join().unwrap()
+        });
+        assert_eq!(o.ended, Ended::Stopped);
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "ended in time: {:?}",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_helper_that_outlives_the_run_does_not_keep_the_station_waiting() {
+        let dir = tmp("helper");
+        let p = script(&dir, "sleep 30 &\necho done");
+        let t = Instant::now();
+        let o = go(&req(p, &dir, Duration::from_secs(60)));
+        assert_eq!(o.ended, Ended::Exited(Some(0)));
+        assert!(o.stdout.contains("done"));
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "did not wait for the helper: {:?}",
+            t.elapsed()
+        );
     }
 
     #[test]
     fn output_is_capped_and_a_missing_program_is_said_plainly() {
         let dir = tmp("big");
         let p = script(&dir, "head -c 6000000 /dev/zero | tr '\\0' 'x'");
-        let o = RealSpawn.run(&req(p, &dir, Duration::from_secs(20)));
+        let o = go(&req(p, &dir, Duration::from_secs(20)));
         assert_eq!(o.ended, Ended::Exited(Some(0)));
         assert_eq!(o.stdout.len(), OUT_MAX);
-        let o = RealSpawn.run(&req(dir.join("nope"), &dir, Duration::from_secs(5)));
+        let o = go(&req(dir.join("nope"), &dir, Duration::from_secs(5)));
         assert!(matches!(o.ended, Ended::CouldNotStart(_)));
     }
 }
@@ -419,5 +499,22 @@ mod env_tests {
             &[("WAVE_AGENT_KEY".into(), "new".into())],
         );
         assert_eq!(env, vec![("WAVE_AGENT_KEY".to_owned(), "new".to_owned())]);
+    }
+
+    #[test]
+    fn a_request_never_prints_the_key() {
+        let r = RunReq {
+            program: "claude".into(),
+            args: vec!["-p".into()],
+            env: vec![("WAVE_AGENT_KEY".into(), "wak_secret-secret-secret".into())],
+            cwd: "/w".into(),
+            timeout: Duration::from_secs(1),
+            grace: Duration::from_secs(1),
+        };
+        let t = format!("{r:?}");
+        assert!(
+            t.contains("WAVE_AGENT_KEY") && !t.contains("secret-secret"),
+            "{t}"
+        );
     }
 }
