@@ -1,10 +1,10 @@
 # The release gate for a Windows program, run on the REAL file before a release is published (see docs/release.md):
 # prints what Windows says about its signature and what the installer will compare, and fails when the installer would refuse it.
 #
-#   powershell -File scripts/check-windows-signature.ps1 -Path stonewave.exe [-Pin <thumbprint of the issuing authority>] [-Version 0.2.0]
+#   powershell -File scripts/check-windows-signature.ps1 -Path stonewave.exe -Pin <thumbprint of the issuing authority> [-Version 0.2.0]
 #
 # It uses the installer's own functions (install/cli/install.ps1.in), so what it says is what `irm .../install.ps1 | iex` will do.
-# Nothing is installed or run. Without -Pin the authority found in the chain is shown and not checked.
+# Nothing is installed or run. -Pin is required: a gate that does not check the authority must not say "ok".
 param(
     [Parameter(Mandatory = $true)][string]$Path,
     [string]$Pin = '',
@@ -55,17 +55,15 @@ $fail = $false
 if ($sig.Status -ne 'Valid') { $fail = $true }
 if (-not $subjectOk) { $fail = $true }
 if (-not $chain.Ok) { $fail = $true }
-if ($Pin) {
-    $pins = @($Pin.ToUpperInvariant() -split '[,\s]+' | Where-Object { $_ })
-    try {
-        $what = Test-SignerPins $cert $chain $SignerSubject $pins @()
-        Write-Host "installer would accept: $what"
-    } catch {
-        Write-Host "installer would REFUSE: $($_.Exception.Message)"
-        $fail = $true
-    }
-} else {
-    Write-Host 'no -Pin given: the authority is not checked (the authorities above are the candidates)'
+if (-not $Pin) { Write-Host 'RESULT: -Pin is required (the thumbprint of the issuing authority); without it the authority is not checked and the gate must not say ok'; exit 2 }
+$pins = @($Pin.ToUpperInvariant() -split '[,\s]+' | Where-Object { $_ })
+if ($pins.Count -eq 0 -or @($pins | Where-Object { $_ -notmatch '^[0-9A-F]{40}$' }).Count -gt 0) { throw '-Pin needs one or more 40-hex thumbprints (comma separated)' }
+try {
+    $what = Test-SignerPins $cert $chain $SignerSubject $pins @()
+    Write-Host "installer would accept: $what"
+} catch {
+    Write-Host "installer would REFUSE: $($_.Exception.Message)"
+    $fail = $true
 }
 if ($Version -and $LegacyLeaf.ContainsKey($Version)) {
     Write-Host "legacy leaf pin for ${Version}: $($LegacyLeaf[$Version])  ($(if ($cert.Thumbprint.ToUpperInvariant() -eq $LegacyLeaf[$Version]) { 'this file' } else { 'NOT this file' }))"
