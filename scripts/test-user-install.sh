@@ -369,6 +369,57 @@ if [ -n "$(cd "$here" && git status --porcelain --untracked-files=no 2>/dev/null
     check "a dirty tree is refused" [ $code -ne 0 ]
 fi
 
+# --built-from: the programs come from an earlier commit, the installers from the one we are on; only installers, scripts, tests and docs may differ
+if command -v git >/dev/null 2>&1; then
+    G="$T/gitrepo"
+    mkdir -p "$G/scripts" "$G/install/cli" "$G/src" "$G/docs"
+    cp "$here/scripts/release-bundle.sh" "$G/scripts/"
+    cp "$here/install/cli/"* "$G/install/cli/"
+    cp "$here/Cargo.toml" "$G/"
+    echo 'fn main() {}' >"$G/src/main.rs"
+    echo one >"$G/docs/a.md"
+    gitc() { git -C "$G" -c user.name=t -c user.email=t@t -c commit.gpgsign=false "$@"; }
+    gitc init -q .
+    gitc add -A && gitc commit -q -m one
+    first=$(gitc rev-parse --short=8 HEAD)
+    printf '#!/bin/sh\necho "stonewave %s (%s)"\n' "$ver" "$first" >"$T/fake-first"
+    chmod 755 "$T/fake-first"
+    echo two >"$G/docs/a.md"
+    echo '# a later comment' >>"$G/install/cli/install.sh.in"
+    gitc add -A && gitc commit -q -m two
+    second=$(gitc rev-parse --short=8 HEAD)
+    gb() { sh "$G/scripts/release-bundle.sh" "$@" 2>&1; }
+    out=$(gb "$T/gb1" --x86_64-linux "$T/fake-first"); code=$?
+    check "without --built-from the programs must say the commit we are on" [ $code -ne 0 ]
+    out=$(gb "$T/gb2" --x86_64-linux "$T/fake-first" --built-from "$first"); code=$?
+    check "--built-from an earlier commit with only installers and docs changed since" [ $code -eq 0 ]
+    has "built-from says so" "$out" "programs built from $first, installers from $second"
+    has "manifest names the commit of the programs" "$(cat "$T/gb2/$ver/manifest.txt")" "commit $first"
+    check "and the installer taken from the later commit" grep -q '# a later comment' "$T/gb2/install.sh"
+    out=$(gb "$T/gb3" --x86_64-linux "$T/fake-first" --built-from "$second"); code=$?
+    check "a program that does not say the commit it is declared from is refused" [ $code -ne 0 ]
+    out=$(gb "$T/gb4" --x86_64-linux "$T/fake-first" --built-from nothex12); code=$?
+    check "a bad commit is refused" [ $code -ne 0 ]
+    out=$(gb "$T/gb5" --x86_64-linux "$T/fake-first" --built-from 00000000); code=$?
+    check "an unknown commit is refused" [ $code -ne 0 ]
+    # a change of the program since: refused
+    echo '// changed' >>"$G/src/main.rs"
+    gitc add -A && gitc commit -q -m three
+    out=$(gb "$T/gb6" --x86_64-linux "$T/fake-first" --built-from "$first"); code=$?
+    check "a source file changed since: refused" [ $code -ne 0 ]
+    has "names the file" "$out" "src/main.rs"
+    # a commit that is not behind HEAD
+    gitc checkout -q --orphan other && gitc commit -q -m orphan --allow-empty
+    orphan=$(gitc rev-parse --short=8 HEAD)
+    gitc checkout -q -f master 2>/dev/null || gitc checkout -q -f main 2>/dev/null || gitc checkout -q -f "$second"
+    printf '#!/bin/sh\necho "stonewave %s (%s)"\n' "$ver" "$orphan" >"$T/fake-orphan"
+    chmod 755 "$T/fake-orphan"
+    gitc checkout -q -f "$second" 2>/dev/null
+    out=$(gb "$T/gb7" --x86_64-linux "$T/fake-orphan" --built-from "$orphan"); code=$?
+    check "a commit that is not an ancestor of HEAD is refused" [ $code -ne 0 ]
+    has "not an ancestor" "$out" "not an ancestor"
+fi
+
 # the bundle made here installs through the installer, end to end
 H6="$T/h6"
 mkdir -p "$H6"
