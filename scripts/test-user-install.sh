@@ -96,6 +96,11 @@ has "add to path" "$out" "added this line to $H/.bashrc"
 check "the rc file has the line once" [ "$(grep -c 'added by the Stonewave installer' "$H/.bashrc")" = 1 ]
 out=$(run --add-to-path)
 has "add to path twice" "$out" "already has the Stonewave PATH line"
+# the line is in the file but this shell has not read it: no question, no second line, and it is said as it is
+out=$(run)
+has "line there, shell not reloaded" "$out" "already has the Stonewave PATH line"
+hasnt "line there: no 'not on your PATH yet'" "$out" "is not on your PATH yet"
+check "still once after a plain run" [ "$(grep -c 'added by the Stonewave installer' "$H/.bashrc")" = 1 ]
 check "still once" [ "$(grep -c 'added by the Stonewave installer' "$H/.bashrc")" = 1 ]
 check "the line is the plain one" grep -Fq 'export PATH="$HOME/.local/bin:$PATH"' "$H/.bashrc"
 # on the path: nothing to say
@@ -131,6 +136,12 @@ if command -v script >/dev/null 2>&1; then
             has "no tells what to do" "$(cat "$T/q-$answer.txt")" 'export PATH='
         fi
     done
+    # the line is there and the shell has not read it: a re-run on a terminal does not ask again
+    printf 'n
+' | HOME="$T/hq-y" SHELL=/bin/bash PATH="/usr/bin:/bin" script -qec "sh '$S/install.sh' --from-dir '$S'" /dev/null >"$T/q-again.txt" 2>&1
+    hasnt "no second question" "$(cat "$T/q-again.txt")" "Add it to"
+    has "says it is there" "$(cat "$T/q-again.txt")" "already has the Stonewave PATH line"
+    check "and the file still has it once" [ "$(grep -c 'added by the Stonewave installer' "$T/hq-y/.bashrc")" = 1 ]
 fi
 
 # ---------------------------------------------------------------- dry run
@@ -139,6 +150,7 @@ mkdir -p "$H4"
 out=$(HOME="$H4" PATH="/usr/bin:/bin" sh "$S/install.sh" --from-dir "$S" --dry-run 2>&1 </dev/null)
 has "dry run" "$out" "dry run: would install"
 check "dry run installs nothing" [ ! -e "$H4/.local/bin/stonewave" ]
+check "dry run leaves no folder that it made" [ ! -e "$H4/.local" ]
 
 # ---------------------------------------------------------------- everything that must be refused
 refuse() { # NAME SITE-DIR NEEDLE [extra args]
@@ -153,7 +165,7 @@ refuse() { # NAME SITE-DIR NEEDLE [extra args]
     if [ "$c" -ne 0 ]; then ok; else bad "$name: must fail"; fi
     has "$name" "$o" "$needle"
     if [ -e "$hh/.local/bin/stonewave" ]; then bad "$name: something was installed"; else ok; fi
-    if [ -n "$(ls -A "$hh/.local/bin" 2>/dev/null)" ]; then bad "$name: leftovers in the install folder"; else ok; fi
+    if [ -e "$hh/.local" ]; then bad "$name: the install folder this run made is still there"; else ok; fi
 }
 
 # a changed byte, same size
@@ -221,6 +233,7 @@ cp "$S12/0.2.0/stonewave-0.2.0-$target" "$H5/.local/bin/stonewave"
 out=$(HOME="$H5" PATH="/usr/bin:/bin" sh "$S12/install.sh" --from-dir "$S12" --no-path 2>&1 </dev/null); code=$?
 check "an older latest is refused" [ $code -ne 0 ]
 has "downgrade" "$out" "newer than the latest release 0.1.9"
+has "downgrade says nothing was installed" "$out" "Nothing was installed."
 check "the newer one is still there" [ "$("$H5/.local/bin/stonewave" --version)" = "stonewave 0.2.0 (cafe0123)" ]
 out=$(HOME="$H5" PATH="/usr/bin:/bin" sh "$S12/install.sh" --from-dir "$S12" --no-path --version 0.1.9 2>&1 </dev/null); code=$?
 check "asking for the older one by number is allowed" [ $code -eq 0 ]
@@ -231,6 +244,27 @@ mkrelease "$S12" 0.3.0 abcd0123 "stonewave 0.3.0 (abcd0123)" latest
 out=$(HOME="$H5" PATH="/usr/bin:/bin" sh "$S12/install.sh" --from-dir "$S12" --no-path 2>&1 </dev/null); code=$?
 check "an update works" [ $code -eq 0 ]
 check "to the newest" [ "$("$H5/.local/bin/stonewave" --version)" = "stonewave 0.3.0 (abcd0123)" ]
+
+# a refusal in a deeper folder that did not exist: all that this run made goes, what was there stays
+S13="$T/site-deep"
+mkrelease "$S13" 0.2.0 cafe0123 "stonewave 0.2.0 (deadbeef)" latest
+render "$S13/install.sh"
+H8="$T/h8"
+mkdir -p "$H8/keep"
+out=$(HOME="$H8" PATH="/usr/bin:/bin" sh "$S13/install.sh" --from-dir "$S13" --no-path --bin-dir "$H8/keep/a/b/bin" 2>&1 </dev/null); code=$?
+check "a refusal in a new deep folder fails" [ $code -ne 0 ]
+check "and removes every folder it made, keeps the existing one" sh -c "[ -d '$H8/keep' ] && [ ! -e '$H8/keep/a' ]"
+mkrelease "$S13" 0.2.0 cafe0123 "stonewave 0.2.0 (cafe0123)" latest
+out=$(HOME="$H8" PATH="/usr/bin:/bin" sh "$S13/install.sh" --from-dir "$S13" --no-path --bin-dir "$H8/keep/a/b/bin" 2>&1 </dev/null); code=$?
+check "the same folder is made when the install goes through" [ $code -eq 0 ]
+check "and it holds only the program" [ "$(ls -A "$H8/keep/a/b/bin")" = "stonewave" ]
+# a folder that has something in it is never removed
+H9="$T/h9"
+mkdir -p "$H9/mine/bin"
+printf x >"$H9/mine/bin/other-file"
+mkrelease "$S13" 0.2.0 cafe0123 "stonewave 0.2.0 (deadbeef)" latest
+out=$(HOME="$H9" PATH="/usr/bin:/bin" sh "$S13/install.sh" --from-dir "$S13" --no-path --bin-dir "$H9/mine/bin" 2>&1 </dev/null)
+check "a folder that was there with files in it is left alone" [ "$(ls -A "$H9/mine/bin")" = "other-file" ]
 
 # the version comparison
 STONEWAVE_INSTALL_SOURCED=1 . "$here/install/cli/install.sh.in"
@@ -311,6 +345,30 @@ check "an installer that was not prepared for macOS refuses" [ $code -ne 0 ]
 has "mac unprepared" "$out" "not prepared for macOS"
 out=$(mac_with /nonexistent ABCDE12345); code=$?
 check "no codesign means no install" [ $code -ne 0 ]
+# Gatekeeper's line: only when it is good, never the word "rejected" for a good file, and never a reason to refuse
+cat >"$fakebin/spctl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"${FAKE_SPCTL_LOG:-/dev/null}"
+if [ "${FAKE_SPCTL:-accept}" = accept ]; then
+    printf '%s: accepted\nsource=Notarized Developer ID\norigin=Developer ID Application: Stonewave Tech LLC (ABCDE12345)\n' "$3"
+    exit 0
+fi
+printf '%s: rejected (the code is valid but does not seem to be an app)\norigin=Developer ID Application: Stonewave Tech LLC (ABCDE12345)\n' "$3" >&2
+exit 3
+EOF
+chmod 755 "$fakebin/spctl"
+FAKE_SPCTL_LOG="$T/spctl.log"
+export FAKE_SPCTL_LOG
+: >"$FAKE_SPCTL_LOG"
+out=$(mac); code=$?
+check "an accepted file passes" [ $code -eq 0 ]
+has "gatekeeper accepted" "$out" "gatekeeper: accepted (Notarized Developer ID)"
+check "asks for the install assessment, not the exec one" grep -Fq -- "--type install" "$FAKE_SPCTL_LOG"
+out=$(FAKE_SPCTL=reject mac); code=$?
+check "a Gatekeeper that has no verdict for a bare tool does not stop the install" [ $code -eq 0 ]
+hasnt "no 'rejected' for a good file" "$out" "rejected"
+hasnt "and no gatekeeper line at all then" "$out" "gatekeeper:"
+has "the signature line is still there" "$out" "signature ok (Developer ID, team ABCDE12345)"
 
 # ---------------------------------------------------------------- the bundle script
 B="$T/bundle"
