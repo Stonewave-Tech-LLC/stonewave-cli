@@ -240,6 +240,14 @@ function Install-Stonewave {
     if ($bin -eq '') { $bin = Join-Path $env:LOCALAPPDATA 'Stonewave\bin' }
     if (-not [IO.Path]::IsPathRooted($bin)) { Fail '-BinDir must be a full path' }
     Say "Stonewave CLI installer: $target, into $bin"
+    # the highest folder on the way that does not exist yet: if the install is refused, what this run made is taken away again
+    $madeTop = $null
+    $probe = $bin
+    while ($probe -and -not (Test-Path -LiteralPath $probe)) {
+        $madeTop = $probe
+        $probe = Split-Path -Parent $probe
+    }
+    $kept = $false
     New-Item -ItemType Directory -Force -Path $bin | Out-Null
     $tmp = Join-Path $bin ('.stonewave-install.' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
@@ -258,7 +266,7 @@ function Install-Stonewave {
             if ($installedLine -match '^stonewave ([0-9]+\.[0-9]+\.[0-9]+)') {
                 Say "installed  $installedLine"
                 if ($Version -eq '') {
-                    if (Test-Older $m.Version $Matches[1]) { Fail "you have $($Matches[1]), which is newer than the latest release $($m.Version). To go back, say so: -Version $($m.Version)" }
+                    if (Test-Older $m.Version $Matches[1]) { Fail "you have $($Matches[1]), which is newer than the latest release $($m.Version). To go back, say so: -Version $($m.Version). Nothing was installed." }
                     if ($installedLine -eq $want) {
                         Say 'already up to date'
                         Show-PathHelp $bin
@@ -298,6 +306,7 @@ function Install-Stonewave {
             if ($aside) { Move-Item -LiteralPath $aside -Destination $exe -Force }
             Fail "cannot put $exe in place: $($_.Exception.Message)"
         }
+        $kept = $true
         if ($aside) { Remove-Item -LiteralPath $aside -Force -ErrorAction SilentlyContinue }
         Get-ChildItem -LiteralPath $bin -Filter 'stonewave.exe.old-*' -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
         Say "installed $exe"
@@ -305,6 +314,15 @@ function Install-Stonewave {
         Say 'next: stonewave          (the menu)     stonewave doctor     (a read-only check)'
     } finally {
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not $kept -and $madeTop) {
+            # only empty folders go
+            $d = $bin
+            $stop = Split-Path -Parent $madeTop
+            while ($d -and $d -ne $stop -and (Test-Path -LiteralPath $d) -and -not (Get-ChildItem -LiteralPath $d -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+                Remove-Item -LiteralPath $d -Force -ErrorAction SilentlyContinue
+                $d = Split-Path -Parent $d
+            }
+        }
     }
 }
 

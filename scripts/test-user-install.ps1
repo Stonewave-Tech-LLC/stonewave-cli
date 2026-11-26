@@ -275,6 +275,20 @@ $c = Get-SignerChain $leaf -TestOnlyAcceptUntrustedRoot -Extra @((Cer 'forged'))
     $o = Run
     Expect ($o -match 'dry run: would install') 'a dry run says so'
     Expect (-not (Test-Path "$script:BinDir\stonewave.exe")) 'a dry run installs nothing'
+    Expect (-not (Test-Path $script:BinDir)) 'and leaves no install folder behind that it made'
+    # a deeper folder that did not exist: a refusal takes away what this run made, but not a folder that was there before
+    $d = Reset 'site2b'
+    New-Release $d '0.2.0' 'cafe0123' $donor -Latest
+    $pre = Join-Path $T 'pre-existing'
+    New-Item -ItemType Directory -Force -Path $pre | Out-Null
+    $script:BinDir = Join-Path $pre 'a\b\bin'
+    Remove-Item -LiteralPath (Join-Path $pre 'a') -Recurse -Force -ErrorAction SilentlyContinue
+    $script:says = 'stonewave 0.2.0 (deadbeef)'
+    Throws { Install-Stonewave 6>$null } 'Nothing was installed' 'a refusal in a folder that did not exist'
+    Expect ((Test-Path $pre) -and -not (Test-Path (Join-Path $pre 'a'))) 'removes the folders it made (all of them) and keeps the one that was there'
+    $script:says = 'stonewave 0.2.0 (cafe0123)'
+    [void](Run)
+    Expect (Test-Path "$script:BinDir\stonewave.exe") 'and the same folder is made again when the install goes through'
 
     # refusals: nothing is installed, no leftovers
     function Refused([string]$name, [scriptblock]$prepare, [string]$needle) {
@@ -283,7 +297,7 @@ $c = Get-SignerChain $leaf -TestOnlyAcceptUntrustedRoot -Extra @((Cer 'forged'))
         & $prepare $d
         Throws { Install-Stonewave 6>$null } $needle $name
         Expect (-not (Test-Path "$script:BinDir\stonewave.exe")) "${name}: nothing was installed"
-        Expect (@(Get-ChildItem -Force $script:BinDir -ErrorAction SilentlyContinue).Count -eq 0) "${name}: no leftovers"
+        Expect (-not (Test-Path $script:BinDir)) "${name}: no install folder is left (it did not exist before)"
     }
     Refused 'changed' { param($d) $fs = [IO.File]::Open("$d\0.2.0\stonewave-0.2.0-x86_64-windows.exe", 'Append'); $fs.WriteByte(1); $fs.Close() } 'the size is'
     Refused 'samesize' { param($d) $p = "$d\0.2.0\stonewave-0.2.0-x86_64-windows.exe"; $n = (Get-Item $p).Length; [IO.File]::WriteAllBytes($p, (New-Object byte[] $n)) } 'checksum does not match'
@@ -325,6 +339,7 @@ $c = Get-SignerChain $leaf -TestOnlyAcceptUntrustedRoot -Extra @((Cer 'forged'))
     [void](Run)
     $script:Version = ''
     Throws { Install-Stonewave 6>$null } 'newer than the latest release 0.1.9' 'an older latest is refused'
+    Throws { Install-Stonewave 6>$null } 'Nothing was installed' 'and says that nothing was installed'
     $script:says = 'stonewave 0.1.9 (beef4567)'
     $script:Version = '0.1.9'
     $o = Run

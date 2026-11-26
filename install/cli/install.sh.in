@@ -30,6 +30,9 @@ BASE="https://stonewavetech.com/cli"
 # The Apple team that signs the macOS build (pinned when the release is made, see scripts/release-bundle.sh).
 MAC_TEAM_ID="@MAC_TEAM_ID@"
 
+# what the exit trap needs to know (set in main)
+tmp= bin= made_top= kept=no
+
 say() { printf '  %s\n' "$*"; }
 warn() { printf '  ! %s\n' "$*" >&2; }
 fail() {
@@ -131,10 +134,13 @@ check_macos_signature() {
     cs_team=$(printf '%s\n' "$cs_info" | sed -n 's/^TeamIdentifier=//p' | head -n 1)
     [ -n "$cs_team" ] && [ "$cs_team" = "$MAC_TEAM_ID" ] || fail "the download is signed by another team ($cs_team). Nothing was installed."
     say "signature ok (Developer ID, team $cs_team)"
-    # Gatekeeper's verdict on a bare command-line tool is informational: it often says "not an app" for a program that is notarized
+    # Gatekeeper's word on the notarization is told only when it is good: "--type execute" says "rejected (does not seem to be an app)" for every
+    # bare command-line tool, which reads like a warning about a good file. The gate is the signature check above, not this line.
     if command -v spctl >/dev/null 2>&1; then
-        verdict=$(spctl --assess --type execute -vv "$1" 2>&1 | head -n 2 | tr '\n' ' ' || true)
-        say "gatekeeper: ${verdict:-no answer}"
+        if gk=$(spctl --assess --type install -vv "$1" 2>&1); then
+            gk_source=$(printf '%s\n' "$gk" | sed -n 's/^source=//p' | head -n 1 | tr -cd '[:print:]')
+            say "gatekeeper: accepted${gk_source:+ ($gk_source)}"
+        fi
     fi
 }
 
@@ -158,16 +164,27 @@ ask_yes() {
     case $answer in y | Y | yes | YES | j | J | ja) return 0 ;; *) return 1 ;; esac
 }
 
+# the line that puts $bin on the PATH; fails when the folder name cannot be put into a startup file safely (a quote or a dollar sign would
+# change what the line means)
+path_line() {
+    if [ "$bin" = "$HOME/.local/bin" ]; then
+        printf '%s\n' 'export PATH="$HOME/.local/bin:$PATH"'
+    else
+        printf '%s\n' "$bin" | grep -Eq '^[A-Za-z0-9_./ +@:,=-]+$' || return 1
+        printf 'export PATH="%s:$PATH"\n' "$bin"
+    fi
+}
+
+# is that line already in the startup file $1? Then there is nothing to ask: the shell has just not read it yet.
+path_line_present() {
+    pl=$(path_line) || return 1
+    [ -f "$1" ] && grep -qxF -- "$pl" "$1"
+}
+
 add_to_path() {
     rc=$(shell_rc)
-    if [ "$bin" = "$HOME/.local/bin" ]; then
-        line='export PATH="$HOME/.local/bin:$PATH"'
-    else
-        # a folder with a quote or a dollar sign in it would change what the line means
-        printf '%s\n' "$bin" | grep -Eq '^[A-Za-z0-9_./ +@:,=-]+$' || fail "the folder name has characters that cannot be put into a startup file safely; add it to PATH yourself"
-        line="export PATH=\"$bin:\$PATH\""
-    fi
-    if [ -f "$rc" ] && grep -q '# added by the Stonewave installer' "$rc"; then
+    line=$(path_line) || fail "the folder name has characters that cannot be put into a startup file safely; add it to PATH yourself"
+    if path_line_present "$rc"; then
         say "$rc already has the Stonewave PATH line"
         return 0
     fi
@@ -190,6 +207,16 @@ Stonewave CLI installer for one user (no root, no sudo).
   --bin-dir DIR     install here instead of ~/.local/bin
   --from-dir DIR    take manifest and program from a folder instead of the internet (same checks)
 USAGE
+}
+
+# the exit trap: the temporary folder goes, and a folder this run made for the program is not left behind when nothing was installed
+cleanup() {
+    [ -z "$tmp" ] || rm -rf "$tmp"
+    if [ "$kept" != yes ] && [ -n "$made_top" ]; then
+        cl_stop=$(dirname "$made_top")
+        cl_dir=$bin
+        while [ "$cl_dir" != "$cl_stop" ] && rmdir "$cl_dir" 2>/dev/null; do cl_dir=$(dirname "$cl_dir"); done
+    fi
 }
 
 main() {
@@ -246,10 +273,16 @@ main() {
     case "$bin" in /*) ;; *) fail "--bin-dir must be a full path" ;; esac
 
     say "Stonewave CLI installer: $target, into $bin"
+    # the highest folder on the way that does not exist yet: if the install is refused, what this run made is taken away again
+    made_top= cl_probe=$bin
+    while [ ! -e "$cl_probe" ]; do
+        made_top=$cl_probe
+        cl_probe=$(dirname "$cl_probe")
+    done
+    trap cleanup EXIT
+    trap 'cleanup; exit 130' INT TERM HUP
     mkdir -p "$bin" || fail "cannot make $bin"
     tmp=$(mktemp -d "$bin/.stonewave-install.XXXXXX") || fail "cannot make a temporary folder in $bin"
-    trap 'rm -rf "$tmp"' EXIT
-    trap 'rm -rf "$tmp"; exit 130' INT TERM HUP
 
     if [ -n "$want_version" ]; then
         fetch "$want_version/manifest.txt" "$tmp/manifest.txt"
@@ -269,7 +302,7 @@ main() {
     fi
     if [ -z "$want_version" ] && [ -n "$installed" ]; then
         if [ "$(ver_older "$m_version" "$installed")" = 1 ]; then
-            fail "you have $installed, which is newer than the latest release $m_version. To go back, say so: --version $m_version"
+            fail "you have $installed, which is newer than the latest release $m_version. To go back, say so: --version $m_version. Nothing was installed."
         fi
         if [ "$installed_line" = "stonewave $m_version ($m_commit)" ]; then
             say "already up to date"
@@ -301,6 +334,7 @@ main() {
     fi
     # one step: a running copy keeps working, a failed step leaves the old one
     mv -f "$tmp/$m_file" "$bin/stonewave" || fail "cannot replace $bin/stonewave"
+    kept=yes
     say "installed $bin/stonewave"
     path_help
     say "next: stonewave          (the menu)     stonewave doctor     (a read-only check of a server)"
@@ -308,6 +342,11 @@ main() {
 
 path_help() {
     case ":$PATH:" in *":$bin:"*) return 0 ;; esac
+    rc=$(shell_rc)
+    if path_line_present "$rc"; then
+        say "$rc already has the Stonewave PATH line; open a new terminal (or run: . $rc) to use $bin by name"
+        return 0
+    fi
     if [ "$add_path" = no ]; then
         say "$bin is not on your PATH; run $bin/stonewave or add the folder yourself"
         return 0
@@ -318,7 +357,7 @@ path_help() {
     fi
     if [ "$add_path" = yes ]; then
         add_to_path
-    elif ask_yes "Add it to $(shell_rc)?"; then
+    elif ask_yes "Add it to $rc?"; then
         add_to_path
     else
         say "to use it by name, add this line to your shell startup file:  export PATH=\"$bin:\$PATH\"   (or run again with --add-to-path)"
