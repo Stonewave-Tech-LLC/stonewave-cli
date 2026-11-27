@@ -9,8 +9,8 @@ use crate::style::{ColorMode, pal};
 use crate::ui::{MARGIN, wave_spinner};
 
 use super::model::{
-    AgentRow, App, Confirm, Level, Mode, Screen, Snapshot, Step, Wizard, agent_actions,
-    connect_engines, engine_choosable, engine_note, engine_rows, install_hint,
+    Add, AddStep, AgentRow, App, Confirm, KINDS, Kind, Level, Mode, Screen, Snapshot, Step, Wizard,
+    agent_actions, connect_engines, engine_choosable, engine_note, engine_rows, install_hint,
 };
 use super::service::{self, ServiceState};
 
@@ -346,6 +346,7 @@ fn screen_body(app: &App, p: &P, rows: usize) -> (Vec<String>, &'static str) {
         Screen::Main { cursor } => main_screen(app, p, *cursor, rows),
         Screen::Agent { name, cursor } => agent_screen(app, p, name, *cursor, rows),
         Screen::Wizard(w) => wizard_screen(app, p, w, rows),
+        Screen::Add(a) => add_screen(app, p, a),
         Screen::Output {
             title,
             lines,
@@ -392,6 +393,7 @@ fn main_screen(app: &App, p: &P, cursor: usize, rows: usize) -> (Vec<String>, &'
     if s.agents.is_empty() {
         o.push(p.grey("Noch kein Agent verbunden."));
     }
+    entries.push((false, "Agent hinzufügen …".into()));
     entries.push((false, "Agent verbinden …".into()));
     entries.push((false, "Status".into()));
     entries.push((false, "Beenden".into()));
@@ -403,6 +405,62 @@ fn main_screen(app: &App, p: &P, cursor: usize, rows: usize) -> (Vec<String>, &'
         o.push(p.row(i == cursor, &entries[i].1));
     }
     (o, "↑↓ wählen · Enter öffnen · q beenden")
+}
+
+/// "Agent hinzufügen": the kind, the name, and what is missing for a hosted agent.
+fn add_screen(app: &App, p: &P, a: &Add) -> (Vec<String>, &'static str) {
+    let mut o = vec![p.heading("Agent hinzufügen")];
+    match a.step {
+        AddStep::Kind => {
+            o.push(p.grey("Was für ein Agent soll es sein?"));
+            o.push(String::new());
+            for (i, k) in KINDS.iter().enumerate() {
+                let state = match k {
+                    Kind::Engine(e) => match app.snap.engine(*e) {
+                        Some(r) if r.found => r
+                            .version
+                            .as_ref()
+                            .map_or("gefunden".to_owned(), |v| format!("gefunden ({v})")),
+                        _ => format!("nicht gefunden · {}", install_hint(*e)),
+                    },
+                    Kind::GeminiHosted => "läuft in Wave · hier noch nicht möglich".to_owned(),
+                };
+                o.push(p.row(i == a.cursor, &format!("{:<18} {}", k.label(), state)));
+            }
+            o.extend(message_lines(p, &a.message));
+            o.push(String::new());
+            o.extend(p.note("Claude Code, Codex und Grok laufen auf diesem Computer. Ein gehosteter Agent läuft bei Wave."));
+            (o, "↑↓ wählen · Enter weiter · Esc zurück")
+        }
+        AddStep::Name => {
+            let label = a.kind.map_or("", Kind::label);
+            o.push(p.grey(&format!("{label}: Wie soll der Agent heißen?")));
+            o.push(String::new());
+            o.push(p.field("Name", &a.name, true));
+            o.extend(message_lines(p, &a.message));
+            o.push(String::new());
+            o.extend(p.note("Der Name ist ein Vorschlag für Wave. Du bestätigst ihn dort im Browser; angelegt wird der Agent in Wave, nicht hier."));
+            o.extend(p.note("Höchstens 30 Zeichen."));
+            (o, "tippen · Enter weiter · Esc zurück")
+        }
+        AddStep::Hosted => {
+            o.push(p.grey("Gemini (gehostet)"));
+            o.push(String::new());
+            o.extend(p.paragraph("Ein gehosteter Agent läuft nicht auf diesem Computer, sondern in Wave. Das Menü kann ihn noch nicht anlegen. Auf der Seite von Wave fehlt dafür:"));
+            for l in [
+                "· eine Art „gehostet“ beim Anlegen eines Agenten (heute gibt es „Wave-Agent“ und „Eigener Agent“)",
+                "· die Vorbereitung des Rechners, auf dem der Agent läuft",
+                "· die Google-Anmeldung für Gemini, die auf diesem Rechner abgeschlossen wird",
+            ] {
+                o.extend(p.note(l));
+            }
+            o.push(String::new());
+            o.extend(
+                p.paragraph("Bis dahin richtet ein Betreiber von Wave gehostete Agenten ein."),
+            );
+            (o, "Esc zurück")
+        }
+    }
 }
 
 fn agent_screen(
@@ -581,6 +639,8 @@ fn wizard_screen(app: &App, p: &P, w: &Wizard, rows: usize) -> (Vec<String>, &'s
             "Agent verbinden · Server mit Secret-Store · Schritt {at} von {}",
             steps.len()
         )
+    } else if w.preset {
+        "Agent hinzufügen".to_owned()
     } else {
         "Agent verbinden".to_owned()
     })];
@@ -626,7 +686,17 @@ fn wizard_screen(app: &App, p: &P, w: &Wizard, rows: usize) -> (Vec<String>, &'s
         }
         Step::Connect => {
             let list = connect_engines(&app.snap);
-            if list.is_empty() {
+            if let (true, Some(e)) = (w.preset, w.engine) {
+                let found = app.snap.engine(e).and_then(|r| r.version.clone());
+                o.push(p.kv(
+                    "Programm",
+                    &format!(
+                        "{}{}",
+                        e.label(),
+                        found.map_or(String::new(), |v| format!(" ({v})"))
+                    ),
+                ));
+            } else if list.is_empty() {
                 o.extend(p.paragraph("Auf diesem Computer ist kein Coding-Agent installiert, den das Menü verbinden kann."));
                 o.push(String::new());
                 o.push(p.kv("Installieren", install_hint(Engine::ClaudeCode)));
@@ -645,14 +715,27 @@ fn wizard_screen(app: &App, p: &P, w: &Wizard, rows: usize) -> (Vec<String>, &'s
                     o.push(p.row(i == w.cursor, e.label()));
                 }
             }
-            o.push(String::new());
-            o.extend(p.paragraph("Wenn du Enter drückst:"));
-            for l in [
-                "1. Dein Browser öffnet die Anmeldeseite von Wave (gibt es keinen, steht der Link hier).",
-                "2. Gib dort den Code ein, der hier erscheint. Prüfe, dass dieselben vier Wörter dort stehen, und wähle in Wave den Agenten.",
-                "3. Danach ist dieser Computer verbunden. Den Namen des Agenten musst du nicht tippen.",
-            ] {
-                o.extend(p.note(l));
+            if w.preset {
+                o.push(p.kv("Name", &w.agent()));
+                o.push(String::new());
+                o.extend(p.paragraph("Angelegt wird der Agent in Wave, nicht von diesem Menü. Lege ihn dort zuerst an, falls es ihn noch nicht gibt (Team, Agent hinzufügen, „Eigener Agent“) und drücke dort „Gerät verbinden“. Dann hier Enter:"));
+                for l in [
+                    "1. Dein Browser öffnet die Anmeldeseite von Wave (gibt es keinen, steht der Link hier).",
+                    "2. Gib dort den Code ein, der hier erscheint. Prüfe, dass dieselben vier Wörter dort stehen. Der Name oben ist nur ein Vorschlag.",
+                    "3. Wähle in Wave den Agenten. Danach ist dieser Computer verbunden.",
+                ] {
+                    o.extend(p.note(l));
+                }
+            } else {
+                o.push(String::new());
+                o.extend(p.paragraph("Wenn du Enter drückst:"));
+                for l in [
+                    "1. Dein Browser öffnet die Anmeldeseite von Wave (gibt es keinen, steht der Link hier).",
+                    "2. Gib dort den Code ein, der hier erscheint. Prüfe, dass dieselben vier Wörter dort stehen, und wähle in Wave den Agenten.",
+                    "3. Danach ist dieser Computer verbunden. Den Namen des Agenten musst du nicht tippen.",
+                ] {
+                    o.extend(p.note(l));
+                }
             }
             if let Some((l, m)) = &w.message {
                 o.push(String::new());
