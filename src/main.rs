@@ -13,6 +13,7 @@ mod daemon;
 mod doctor;
 mod flow;
 mod health;
+mod health_checks;
 mod realsys;
 mod relay;
 mod setup;
@@ -55,6 +56,8 @@ struct Args {
     seed: Option<u64>,
     /// `--json`: machine-readable output (doctor only), for agents.
     json: bool,
+    /// `--health`: doctor asks how healthy the server is (failed units, updates, disk, RAID, SMART, ports), not whether it can be connected.
+    health: bool,
     /// `--demo`: connect plays the old made-up screens and talks to nobody.
     demo: bool,
     /// `--account <url>`: where the account lives (default: STONEWAVE_ACCOUNT_URL, then the Stonewave account).
@@ -78,6 +81,7 @@ Usage: stonewave [command] [options]
 
 Commands:
   doctor         Check whether this server can be connected (real, read only)
+                 doctor --health: is this server healthy? (failed units, updates, disk, RAID, SMART, ports; read only, no model)
   agents         The menu of coding agents on this computer (also what `stonewave` alone shows on a terminal); --plain: one plain screen, no questions
   connect        Sign in with your Stonewave account, register this server with Wave and set it up (needs sudo)
   setup          Set up this server: agent user, agent SSH, daemon, audit log (needs sudo; --dry-run only looks)
@@ -87,6 +91,7 @@ Commands:
   agent          Connect a coding agent on this machine to Wave: `stonewave agent --help` (connect, status, rotate, disconnect, run)
 
 Options:
+  --health       doctor: the health group instead of the connect checks (plain text, or JSON with --json)
   --json         doctor, status: print one JSON object instead of the screen (for agents and scripts)
   --account <url>  connect: address of the account (or STONEWAVE_ACCOUNT_URL); https only
   --demo         connect, status: play the made-up screens, talk to nobody
@@ -120,6 +125,7 @@ fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
         user: None,
         seed: None,
         json: false,
+        health: false,
         demo: false,
         account: None,
         relay: None,
@@ -148,6 +154,7 @@ fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "-V" | "--version" => args.command = Command::Version,
             "--no-anim" => args.term.no_anim = true,
             "--json" => args.json = true,
+            "--health" => args.health = true,
             "--demo" => args.demo = true,
             "--account" => args.account = Some(value("--account")?),
             "--relay" => args.relay = Some(value("--relay")?),
@@ -201,6 +208,9 @@ fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
         )
     {
         return Err("--json only works with doctor and status".into());
+    }
+    if args.health && args.command != Command::Doctor {
+        return Err("--health only works with doctor".into());
     }
     if args.json && args.demo {
         return Err("--json shows the real state; it does not combine with --demo".into());
@@ -290,6 +300,19 @@ fn main() -> ExitCode {
         Command::Version => {
             println!("stonewave {VERSION} ({COMMIT})");
             return ExitCode::SUCCESS;
+        }
+        Command::Doctor if args.health => {
+            let host = flow::Host::detect(args.host, args.os, args.user);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let (root, areas) = health_checks::collect(&doctor::SYSTEM, now);
+            if args.json {
+                println!("{}", health_checks::to_json(&host.name, root, now, &areas));
+            } else {
+                print!("{}", health_checks::to_text(&host.name, root, &areas));
+            }
+            return ExitCode::from(health_checks::exit_code(&areas));
         }
         Command::Doctor if args.json => {
             let host = flow::Host::detect(args.host, args.os, args.user);
@@ -477,6 +500,17 @@ mod tests {
         assert!(p(&["--json"]).is_err());
         assert!(p(&["connect", "--json"]).is_err());
         assert!(p(&["setup", "--json"]).is_err());
+    }
+
+    #[test]
+    fn health_is_a_doctor_option() {
+        let a = p(&["doctor", "--health"]).unwrap();
+        assert_eq!(a.command, Command::Doctor);
+        assert!(a.health && !a.json);
+        assert!(p(&["doctor", "--health", "--json"]).unwrap().json);
+        assert!(p(&["status", "--health"]).is_err());
+        assert!(p(&["--health"]).is_err());
+        assert!(p(&["doctor", "--health", "--demo"]).is_err());
     }
 
     #[test]

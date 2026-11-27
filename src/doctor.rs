@@ -21,6 +21,7 @@ use crate::ui::{DETAIL, INDENT, pulse_dot};
 /// Host the daemon will talk to; doctor only checks that port 443 answers.
 pub const OUTBOUND_HOST: &str = "account.stonewavetech.com";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+const SLOW_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 /// OpenSSH from this version has everything the agent SSH needs
 /// (certificates, `ExposeAuthInfo`, principals files, KRLs).
@@ -64,6 +65,11 @@ pub trait Probe: Sync {
     fn exists(&self, path: &str) -> bool;
     /// Output (stdout, else stderr) of a command, or None if it could not run in time.
     fn run(&self, cmd: &str, args: &[&str]) -> Option<String>;
+    /// Like `run`, for commands that may take longer (a package list, a disk that has to answer).
+    /// Same rules: no shell, no input, killed when the time is up.
+    fn run_slow(&self, cmd: &str, args: &[&str]) -> Option<String> {
+        self.run(cmd, args)
+    }
     /// Opens and closes a TCP connection; returns how long it took.
     fn connect(&self, host: &str, port: u16) -> std::result::Result<Duration, String>;
     fn env(&self, name: &str) -> Option<String>;
@@ -85,36 +91,11 @@ impl Probe for System {
     }
 
     fn run(&self, cmd: &str, args: &[&str]) -> Option<String> {
-        let mut child = Command::new(cmd)
-            .args(args)
-            .env("LC_ALL", "C")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .ok()?;
-        let started = Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if started.elapsed() < COMMAND_TIMEOUT => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-            }
-        }
-        // The commands print a few lines at most, so the pipes cannot fill up
-        // while we wait above.
-        let mut out = String::new();
-        child.stdout.take()?.read_to_string(&mut out).ok()?;
-        if out.trim().is_empty() {
-            child.stderr.take()?.read_to_string(&mut out).ok()?;
-        }
-        Some(out.trim().to_owned())
+        run_with_timeout(cmd, args, COMMAND_TIMEOUT)
+    }
+
+    fn run_slow(&self, cmd: &str, args: &[&str]) -> Option<String> {
+        run_with_timeout(cmd, args, SLOW_COMMAND_TIMEOUT)
     }
 
     fn connect(&self, host: &str, port: u16) -> std::result::Result<Duration, String> {
@@ -150,6 +131,62 @@ impl Probe for System {
     fn env(&self, name: &str) -> Option<String> {
         std::env::var(name).ok().filter(|v| !v.is_empty())
     }
+}
+
+/// The most output of one command that is kept (the rest is read and thrown away, so the command never blocks).
+const MAX_OUTPUT: usize = 2 * 1024 * 1024;
+
+/// Reads a pipe to its end on its own thread, so a command with long output (a list of packages) cannot
+/// fill the pipe and wait for us.
+fn drain<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let room = MAX_OUTPUT.saturating_sub(kept.len());
+                    kept.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            }
+        }
+        String::from_utf8_lossy(&kept).into_owned()
+    })
+}
+
+/// Runs a command without a shell and without input; it is killed when `timeout` is up.
+/// Result: its output (stdout, and stderr when stdout is empty), or None if it could not run in time.
+fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut child = Command::new(cmd)
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let out = drain(child.stdout.take()?);
+    let err = drain(child.stderr.take()?);
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                // The readers end when the pipes close; they are left to finish on their own.
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let out = out.join().ok()?;
+    let err = err.join().ok()?;
+    let text = if out.trim().is_empty() { err } else { out };
+    Some(text.trim().to_owned())
 }
 
 // ---------------------------------------------------------------- parsers

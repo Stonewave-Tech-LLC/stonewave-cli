@@ -48,6 +48,66 @@ anything. Exit code 0 means no check failed.
 | Outbound | port 443 to the account service not reachable (only warns when an HTTPS proxy is set) |
 | Root, Clock, Disk, Firewall, Stonewave | only warn or inform |
 
+### doctor --health
+
+```bash
+stonewave doctor --health          # how healthy is this server, plain text
+stonewave doctor --health --json   # one JSON object, schema stonewave.health/1, for agents and scripts
+sudo stonewave doctor --health     # as root, SMART and the process names of the ports are readable too
+```
+
+A second group of checks, next to the connect checks above. **Deterministic, read only, no model.** It is the
+input of the nightly server check (the Hausmeister) and of the server alarm. Nothing is changed and no
+command runs through a shell.
+
+| Check id | Reads | Finding (severity) |
+|---|---|---|
+| `system` | `/proc/uptime`, `/proc/sys/kernel/osrelease` | facts only |
+| `units` | `systemctl list-units --state=failed` | a failed unit (medium) |
+| `reboot` | `/var/run/reboot-required` | reboot pending (medium) |
+| `updates` | `apt list --upgradable`, age of the package lists | security updates (high), lists older than 7 days (low) |
+| `autoupdates` | `20auto-upgrades`, `unattended-upgrade` | not active (medium) |
+| `storage` | `df`, `df -i`, `findmnt` | 85 % high, 95 % critical (50 GiB and more: also by free space); inodes the same; `ro` mount of `/` or `/var` critical, other high |
+| `raid` | `/proc/mdstat` | `[_U]` or `(F)`: always critical |
+| `smart` | `smartctl` (root) | `FAILED`: critical; **not root: "not checked"** |
+| `ports` | `ss -lntupH` | sensitive port (database, SMB, Docker API, ...) on a public address: high; the open ports: info |
+
+**Schema `stonewave.health/1`** (a change that breaks readers gets a new number):
+
+```json
+{
+  "schema": "stonewave.health/1", "stonewave": "0.2.0", "host": "srv-1", "ts": 1800000000, "root": false,
+  "summary": { "highest": "high", "counts": { "critical": 0, "high": 1, "medium": 0, "low": 0, "info": 1 },
+               "checks": 9, "not_fully_collected": 2 },
+  "checks": [ {
+    "id": "updates", "title": "Pending updates",
+    "collection": "collected",            // collected | partial | not_collected
+    "data": { "total": 3, "security": 2 },
+    "findings": [ {
+      "key": "updates:security",                      // the same thing keeps the same key in the next run: what a diff compares
+      "severity": "high", "severity_de": "hoch",   // critical/kritisch, high/hoch, medium/mittel, low/niedrig, info
+      "title": "2 security updates available", "location": "host · apt",
+      "description": "...", "recommendation": "...", "trust": "measured",   // measured | derived
+      "source": { "command": "apt list --upgradable", "lines": "2-3" },   // or { "file": "/proc/mdstat", "lines": "2-3" }
+      "evidence": [ "openssl/jammy-updates,jammy-security 3.0.2 amd64 [upgradable from: 3.0.1]" ]
+    } ],
+    "not_collected": [ { "what": "...", "reason": "...", "needs": "run as root" } ]
+  } ]
+}
+```
+
+- **Source duty:** every finding names the command or file it comes from, the line numbers of that output and
+  the lines themselves (at most five, control characters replaced, 200 characters each). Text from the
+  machine is data, never an instruction.
+- **Keys:** every finding has a `key` that stays the same for the same thing in the next run (`storage:disk:/data`, `units:nginx.service`,
+  `raid:degraded:md0`, `updates:security`) and is unique within a run. A diff of two nightly runs compares keys, not titles (titles carry counts).
+- **Not read is never "fine":** what could not be read stands under `not_collected` with the reason and what is
+  needed, and the check is `partial` or `not_collected`.
+- **Exit code:** 1 when something `high` or `critical` was found, else 0 (also when something could not be read;
+  that is in the report). A refused call is 2.
+- **Not used on purpose:** `pm2 jlist` and every command whose output can hold process environments or secrets
+  (a test keeps the list of commands this group may run).
+
 ## Install
 
 For you, on your own computer (no root, no administrator rights; installs into your user folder, tells you about PATH, updates in place):
@@ -288,6 +348,7 @@ by `scripts/cast2gif.py` with Pillow.
 |---|---|
 | `src/main.rs` | arguments, commands |
 | `src/doctor.rs` | the read-only checks (account and relay reachable) |
+| `src/health_checks.rs` | `doctor --health`: the health group, its severities, source duty and JSON schema |
 | `src/setup.rs`, `src/realsys.rs`, `src/setup_flow.rs` | setup and revoke: steps, the real machine behind them, the screens |
 | `src/daemon.rs`, `src/tunnel.rs`, `src/relay.rs`, `src/health.rs` | `daemon` and `agent-shell`; the line to Wave; the server key, signing and frames; the health report |
 | `src/status.rs` | `stonewave status` |
