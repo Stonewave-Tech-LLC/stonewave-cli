@@ -340,6 +340,8 @@ pub enum Screen {
         cursor: usize,
     },
     Wizard(Box<Wizard>),
+    /// "Agent hinzufügen": which kind, what name, then the sign-in of the wizard.
+    Add(Box<Add>),
     Output {
         title: String,
         lines: Vec<String>,
@@ -360,8 +362,89 @@ pub struct Confirm {
     pub await_: Await,
 }
 
-/// How many entries the main screen has besides the agents: connect, status, quit.
-pub const MAIN_EXTRAS: usize = 3;
+/// How many entries the main screen has besides the agents: add, connect, status, quit.
+pub const MAIN_EXTRAS: usize = 4;
+
+// ------------------------------------------------------------------ "Agent hinzufügen"
+
+/// What kind of agent is added. The coding agents run on this computer and are woken by a station; a hosted agent
+/// runs in Wave itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Engine(Engine),
+    /// Gemini, run by Wave for the company (over ACP).
+    GeminiHosted,
+}
+
+pub const KINDS: [Kind; 4] = [
+    Kind::Engine(Engine::ClaudeCode),
+    Kind::Engine(Engine::Codex),
+    Kind::Engine(Engine::Grok),
+    Kind::GeminiHosted,
+];
+
+impl Kind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Kind::Engine(e) => e.label(),
+            Kind::GeminiHosted => "Gemini (gehostet)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddStep {
+    Kind,
+    Name,
+    /// Gemini (hosted): says what is missing; nothing can be done here yet.
+    Hosted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Add {
+    pub step: AddStep,
+    pub cursor: usize,
+    pub kind: Option<Kind>,
+    pub name: Input,
+    pub message: Option<(Level, String)>,
+}
+
+impl Add {
+    pub fn start() -> Add {
+        Add {
+            step: AddStep::Kind,
+            cursor: 0,
+            kind: None,
+            name: Input::default(),
+            message: None,
+        }
+    }
+}
+
+/// Wave shortens the name it is given to this many characters (`cleanText(agent_name, 30)` in the account).
+pub const AGENT_NAME_MAX: usize = 30;
+
+/// A name to start from: the program and this computer, cut to what Wave keeps.
+pub fn suggested_name(e: Engine, host: &str) -> String {
+    let short = match e {
+        Engine::ClaudeCode => "Claude Code",
+        Engine::Codex => "Codex",
+        Engine::Grok => "Grok",
+        Engine::Other => "Agent",
+    };
+    let host: String = host
+        .chars()
+        .filter(|c| !is_invisible(*c))
+        .take(16)
+        .collect();
+    let host = host.trim();
+    let text = if host.is_empty() {
+        short.to_owned()
+    } else {
+        format!("{short} ({host})")
+    };
+    text.chars().take(AGENT_NAME_MAX).collect()
+}
 
 // ------------------------------------------------------------------ the wizard
 
@@ -437,6 +520,8 @@ pub struct Wizard {
     pub connect_code: i32,
     /// The dry run of this setup was clean: only then the choices are remembered and a service may follow.
     pub preview_ok: bool,
+    /// The wizard was opened by "Agent hinzufügen": the program and the name are chosen already, the sign-in step is the first.
+    pub preset: bool,
     pub notes: Vec<String>,
 }
 
@@ -469,6 +554,7 @@ impl Wizard {
             connect_code: 0,
             preview_ok: false,
             notes: Vec::new(),
+            preset: false,
         }
     }
 
@@ -746,6 +832,7 @@ impl App {
             Screen::Main { cursor } => self.key_main(cursor, key),
             Screen::Agent { name, cursor } => self.key_agent(name, cursor, key),
             Screen::Wizard(w) => self.key_wizard(*w, key),
+            Screen::Add(a) => self.key_add(*a, key),
             Screen::Output {
                 title,
                 lines,
@@ -796,8 +883,9 @@ impl App {
         }
         self.stack.push(Screen::Main { cursor });
         match cursor - agents {
-            0 => self.stack.push(Screen::Wizard(Box::new(Wizard::start()))),
-            1 => {
+            0 => self.stack.push(Screen::Add(Box::new(Add::start()))),
+            1 => self.stack.push(Screen::Wizard(Box::new(Wizard::start()))),
+            2 => {
                 let lines = super::view::status_lines(&self.snap);
                 self.stack.push(Screen::Output {
                     title: "Status".into(),
@@ -1102,6 +1190,82 @@ impl App {
 
     // ---------------------------------------------------------------- the wizard
 
+    /// "Agent hinzufügen": kind, name, then the sign-in of the wizard (which asks Wave for the agent and writes the key).
+    fn key_add(&mut self, mut a: Add, key: Key) -> Vec<Effect> {
+        if key == Key::Esc {
+            match a.step {
+                // the first step closes it
+                AddStep::Kind => return vec![],
+                AddStep::Name | AddStep::Hosted => {
+                    a.step = AddStep::Kind;
+                    a.message = None;
+                    self.stack.push(Screen::Add(Box::new(a)));
+                    return vec![];
+                }
+            }
+        }
+        match a.step {
+            AddStep::Kind => {
+                a.cursor = App::move_cursor(a.cursor, KINDS.len(), key);
+                a.kind = Some(KINDS[a.cursor]);
+                if key == Key::Enter {
+                    match KINDS[a.cursor] {
+                        Kind::Engine(e) => {
+                            let found = self.snap.engine(e).is_some_and(|r| r.found);
+                            if !found {
+                                a.message = Some((
+                                    Level::Warn,
+                                    format!(
+                                        "{} ist hier nicht installiert. Installieren: {}",
+                                        e.label(),
+                                        install_hint(e)
+                                    ),
+                                ));
+                            } else {
+                                a.message = None;
+                                a.name = Input::with(&suggested_name(e, &self.snap.host));
+                                a.step = AddStep::Name;
+                            }
+                        }
+                        Kind::GeminiHosted => {
+                            a.message = None;
+                            a.step = AddStep::Hosted;
+                        }
+                    }
+                } else {
+                    a.message = None;
+                }
+            }
+            AddStep::Name => {
+                if key == Key::Enter {
+                    let name = a.name.value().trim().to_owned();
+                    if name.is_empty() {
+                        a.message = Some((Level::Warn, "Der Agent braucht einen Namen.".into()));
+                    } else if name.chars().count() > AGENT_NAME_MAX {
+                        a.message = Some((
+                            Level::Warn,
+                            format!(
+                                "Höchstens {AGENT_NAME_MAX} Zeichen; Wave kürzt längere Namen."
+                            ),
+                        ));
+                    } else if let Some(Kind::Engine(e)) = a.kind {
+                        let mut w = Wizard::blank(Mode::New, Step::Connect);
+                        w.engine = Some(e);
+                        w.name = Input::with(&name);
+                        w.preset = true;
+                        self.stack.push(Screen::Wizard(Box::new(w)));
+                        return vec![];
+                    }
+                } else if a.name.edit(key) {
+                    a.message = None;
+                }
+            }
+            AddStep::Hosted => {}
+        }
+        self.stack.push(Screen::Add(Box::new(a)));
+        vec![]
+    }
+
     fn key_wizard(&mut self, mut w: Wizard, key: Key) -> Vec<Effect> {
         let mut fx = Vec::new();
         if key == Key::Esc && w.step == Step::Mode && w.more {
@@ -1146,7 +1310,7 @@ impl App {
             }
             Step::Connect => {
                 let list = connect_engines(&self.snap);
-                if list.len() > 1 {
+                if list.len() > 1 && !w.preset {
                     w.cursor = App::move_cursor(w.cursor, list.len(), key).min(list.len() - 1);
                     w.engine = Some(list[w.cursor]);
                 }
@@ -1171,19 +1335,21 @@ impl App {
                                 .filter(|a| a.connected)
                                 .map(|a| (a.name.clone(), a.connected_at.clone()))
                                 .collect();
-                            // the name of the agent is not asked: it is the one the person picks in Wave, and it is read back afterwards
-                            let args = [
-                                "agent",
-                                "connect",
-                                "--engine",
-                                e.name(),
-                                "--no-station",
-                                "--lang",
-                                "de",
-                            ]
-                            .iter()
-                            .map(|s| (*s).to_owned())
-                            .collect();
+                            // Without "Agent hinzufügen" the name is not asked: it is the one the person picks in Wave, and it is read back afterwards.
+                            // With it, the name typed is a suggestion for Wave's page (never a right), and it is read back the same way.
+                            let mut args: Vec<String> = ["agent", "connect", "--engine", e.name()]
+                                .iter()
+                                .map(|s| (*s).to_owned())
+                                .collect();
+                            if w.preset {
+                                args.push("--name".into());
+                                args.push(w.agent());
+                            }
+                            args.extend(
+                                ["--no-station", "--lang", "de"]
+                                    .iter()
+                                    .map(|s| (*s).to_owned()),
+                            );
                             self.awaiting = Await::Connect;
                             fx.push(Effect::Interactive { args });
                         }

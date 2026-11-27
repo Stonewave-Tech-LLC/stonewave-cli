@@ -331,12 +331,23 @@ fn the_main_screen_lists_agents_and_the_three_fixed_entries() {
         "{screen}"
     );
     assert!(
-        screen.contains("Agent verbinden")
+        screen.contains("Agent hinzufügen")
+            && screen.contains("Agent verbinden")
             && screen.contains("Status")
             && screen.contains("Beenden")
     );
-    // down twice: on "Agent verbinden", Enter opens the wizard
+    // "Agent hinzufügen" is the first entry under the agents
+    assert!(
+        screen.find("Agent hinzufügen").unwrap() < screen.find("Agent verbinden").unwrap(),
+        "{screen}"
+    );
+    // down twice: on "Agent hinzufügen", Enter opens it; Esc on its first step closes it
     r.keys(&[Key::Down, Key::Down, Key::Enter]);
+    assert!(matches!(r.app.top(), Screen::Add(_)));
+    r.press(Key::Esc);
+    assert!(matches!(r.app.top(), Screen::Main { .. }));
+    // one more down: on "Agent verbinden", Enter opens the wizard
+    r.keys(&[Key::Down, Key::Enter]);
     assert!(matches!(r.app.top(), Screen::Wizard(_)));
     // Esc on its first step closes it
     r.press(Key::Esc);
@@ -349,7 +360,7 @@ fn q_and_ctrl_c_quit_and_nothing_is_started() {
     r.press(Key::Char('q'));
     assert!(r.app.quit);
     let mut r = Rig::new();
-    r.keys(&[Key::Enter]); // "Agent verbinden"
+    r.keys(&[Key::Down, Key::Enter]); // "Agent verbinden"
     r.press(Key::CtrlC);
     assert!(r.app.quit);
     assert!(r.calls().is_empty());
@@ -360,7 +371,7 @@ fn the_status_screen_needs_no_network_and_lists_what_is_here() {
     let mut s = snap();
     s.agents = vec![row("claude")];
     let mut r = Rig::with(s);
-    r.keys(&[Key::Down, Key::Down, Key::Enter]); // Status
+    r.keys(&[Key::Down, Key::Down, Key::Down, Key::Enter]); // Status
     let screen = r.screen();
     assert!(
         screen.contains("Coding-Agenten auf diesem Computer") && screen.contains("2.1.321"),
@@ -607,13 +618,244 @@ fn disconnecting_signs_off_first_and_only_then_forgets_the_rest() {
     assert!(r.screen().contains("nicht gelungen"));
 }
 
+// ------------------------------------------------------------------ "Agent hinzufügen"
+
+fn add(r: &mut Rig) -> &Add {
+    // on a main screen without agents the first entry is "Agent hinzufügen"
+    r.press(E);
+    match r.app.top() {
+        Screen::Add(a) => a,
+        other => panic!("not the add screen: {other:?}"),
+    }
+}
+
+#[test]
+fn adding_offers_the_three_programs_and_gemini_hosted_and_says_which_are_here() {
+    let mut r = Rig::new();
+    assert_eq!(add(&mut r).step, AddStep::Kind);
+    let screen = r.screen();
+    for text in [
+        "Agent hinzufügen",
+        "Claude Code",
+        "gefunden (2.1.321",
+        "Codex",
+        "Grok Build",
+        "nicht gefunden",
+        "Gemini (gehostet)",
+        "läuft in Wave",
+    ] {
+        assert!(screen.contains(text), "{text}: {screen}");
+    }
+    assert!(r.calls().is_empty(), "nothing starts here");
+}
+
+#[test]
+fn a_program_that_is_not_installed_is_said_and_nothing_goes_on() {
+    let mut r = Rig::new();
+    add(&mut r);
+    r.keys(&[Key::Down, E]); // Codex, not found
+    let a = match r.app.top() {
+        Screen::Add(a) => a.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(a.step, AddStep::Kind);
+    assert!(
+        r.screen().contains("Codex ist hier nicht installiert")
+            && r.screen().contains("npm install -g @openai/codex"),
+        "{}",
+        r.screen()
+    );
+    assert!(r.calls().is_empty());
+}
+
+#[test]
+fn the_name_starts_from_the_program_and_this_computer_and_is_a_suggestion_for_wave() {
+    let mut r = Rig::new();
+    add(&mut r);
+    r.press(E); // Claude Code
+    let a = match r.app.top() {
+        Screen::Add(a) => a.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(a.step, AddStep::Name);
+    assert_eq!(a.name.value(), "Claude Code (box)");
+    let screen = r.screen();
+    assert!(
+        screen.contains("Wie soll der Agent heißen?")
+            && screen.contains("Claude Code (box)")
+            && screen.contains("Vorschlag für Wave"),
+        "{screen}"
+    );
+    assert!(r.calls().is_empty());
+}
+
+#[test]
+fn adding_goes_to_the_sign_in_with_the_name_and_reads_the_agent_back() {
+    let mut r = Rig::new();
+    r.world.sign_in_makes = Some("ops-bot".into());
+    add(&mut r);
+    r.press(E); // Claude Code
+    r.press(Key::CtrlU);
+    r.text("Build Bot");
+    r.press(E);
+    // the wizard is at the sign-in, with the program and the name chosen
+    assert_eq!(r.wizard().step, Step::Connect);
+    assert!(r.wizard().preset);
+    let screen = r.screen();
+    assert!(
+        screen.contains("Agent hinzufügen")
+            && screen.contains("Build Bot")
+            && screen.contains("Claude Code (2.1.321")
+            && screen.contains("Angelegt wird der Agent in Wave, nicht von diesem Menü")
+            && screen.contains("Gerät verbinden"),
+        "{screen}"
+    );
+    assert!(r.calls().is_empty(), "nothing starts before Enter");
+    r.press(E);
+    // the name is one argument (it has a space), only a suggestion for Wave's page
+    assert_eq!(
+        r.calls(),
+        vec![
+            "interactive agent connect --engine claude-code --name Build Bot --no-station --lang de"
+        ]
+    );
+    assert_eq!((r.term.suspended, r.term.resumed), (1, 1));
+    // what Wave called the agent is read back, as in "Agent verbinden"
+    assert_eq!(r.wizard().step, Step::StationAsk);
+    assert!(r.screen().contains("Verbunden: ops-bot"), "{}", r.screen());
+}
+
+#[test]
+fn the_suggestion_can_be_accepted_with_enter() {
+    let mut r = Rig::new();
+    r.world.sign_in_makes = Some("ops-bot".into());
+    add(&mut r);
+    r.keys(&[E, E, E]); // Claude Code, the suggested name, sign in
+    assert_eq!(
+        r.calls(),
+        vec![
+            "interactive agent connect --engine claude-code --name Claude Code (box) --no-station --lang de"
+        ]
+    );
+}
+
+#[test]
+fn an_empty_or_a_long_name_is_refused_before_anything_happens() {
+    let mut r = Rig::new();
+    add(&mut r);
+    r.press(E);
+    r.press(Key::CtrlU);
+    r.press(E);
+    assert!(r.screen().contains("braucht einen Namen"), "{}", r.screen());
+    assert!(matches!(r.app.top(), Screen::Add(_)));
+    r.text(&"x".repeat(31));
+    r.press(E);
+    assert!(
+        r.screen().contains("Höchstens 30 Zeichen"),
+        "{}",
+        r.screen()
+    );
+    assert!(matches!(r.app.top(), Screen::Add(_)));
+    // typing again takes the message away
+    r.press(Key::Backspace);
+    assert!(
+        !r.screen().contains("Höchstens 30 Zeichen: "),
+        "{}",
+        r.screen()
+    );
+    assert!(r.calls().is_empty());
+}
+
+#[test]
+fn the_name_takes_no_invisible_characters() {
+    let mut r = Rig::new();
+    add(&mut r);
+    r.press(E);
+    r.press(Key::CtrlU);
+    r.text("a\u{202e}b\u{200b}c");
+    let a = match r.app.top() {
+        Screen::Add(a) => a.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(a.name.value(), "abc");
+}
+
+#[test]
+fn esc_goes_back_one_step_at_a_time() {
+    let mut r = Rig::new();
+    add(&mut r);
+    r.press(E); // name
+    assert_eq!(
+        match r.app.top() {
+            Screen::Add(a) => a.step,
+            other => panic!("{other:?}"),
+        },
+        AddStep::Name
+    );
+    r.press(Key::Esc);
+    assert_eq!(
+        match r.app.top() {
+            Screen::Add(a) => a.step,
+            other => panic!("{other:?}"),
+        },
+        AddStep::Kind
+    );
+    r.press(Key::Esc);
+    assert!(matches!(r.app.top(), Screen::Main { .. }));
+    // from the sign-in screen, Esc closes it (the choices are made again from the main screen)
+    add(&mut r);
+    r.keys(&[E, E]);
+    assert_eq!(r.wizard().step, Step::Connect);
+    r.press(Key::Esc);
+    assert!(matches!(r.app.top(), Screen::Main { .. }));
+    assert!(r.calls().is_empty());
+}
+
+#[test]
+fn gemini_hosted_says_exactly_what_is_missing_and_starts_nothing() {
+    let mut r = Rig::new();
+    add(&mut r);
+    r.keys(&[Key::Down, Key::Down, Key::Down, E]); // Gemini (hosted)
+    let screen = r.screen();
+    for text in [
+        "Gemini (gehostet)",
+        "läuft nicht auf diesem Computer",
+        "eine Art „gehostet“",
+        "Vorbereitung des Rechners",
+        "Google-Anmeldung",
+        "Betreiber von Wave",
+    ] {
+        assert!(screen.contains(text), "{text}: {screen}");
+    }
+    // Enter does nothing here; Esc goes back to the list
+    r.press(E);
+    assert!(r.calls().is_empty());
+    assert!(matches!(r.app.top(), Screen::Add(_)));
+    r.press(Key::Esc);
+    assert!(
+        r.screen().contains("Was für ein Agent soll es sein?"),
+        "{}",
+        r.screen()
+    );
+}
+
+#[test]
+fn the_suggested_name_is_cut_to_what_wave_keeps() {
+    assert_eq!(suggested_name(Engine::Grok, "mac"), "Grok (mac)");
+    assert_eq!(suggested_name(Engine::Codex, ""), "Codex");
+    let long = suggested_name(Engine::ClaudeCode, "a-very-long-computer-name-indeed");
+    assert!(long.chars().count() <= AGENT_NAME_MAX, "{long}");
+    // no invisible characters from a host name
+    assert_eq!(suggested_name(Engine::Grok, "m\u{202e}ac"), "Grok (mac)");
+}
+
 // ------------------------------------------------------------------ the wizard: the simple way
 
 const E: Key = Key::Enter;
 
 /// Opens the wizard from a main screen without agents and takes the simple way up to the sign-in screen.
 fn to_connect(r: &mut Rig) {
-    r.keys(&[E, E]); // "Agent verbinden", "Neuen Agenten anmelden"
+    r.keys(&[Key::Down, E, E]); // "Agent verbinden" (the second entry), "Neuen Agenten anmelden"
     assert_eq!(r.wizard().step, Step::Connect);
 }
 
@@ -629,7 +871,7 @@ fn signed_in(r: &mut Rig) {
 fn a_first_connect_is_a_few_screens_and_asks_for_no_name() {
     let mut r = Rig::new();
     r.world.sign_in_makes = Some("ops-bot".into());
-    r.keys(&[E]); // "Agent verbinden"
+    r.keys(&[Key::Down, E]); // "Agent verbinden"
     assert_eq!(r.wizard().step, Step::Mode);
     let screen = r.screen();
     // the simple way is first and the chosen one; the server way is not even named here
@@ -685,7 +927,7 @@ fn the_agent_that_was_made_is_found_also_when_it_was_connected_before() {
     s.agents = vec![row("claude")];
     let mut r = Rig::with(s);
     r.world.sign_in_makes = Some("claude".into());
-    r.keys(&[Key::Down, E, E, E]); // Agent verbinden, Neuen Agenten, Anmelden
+    r.keys(&[Key::Down, Key::Down, E, E, E]); // Agent verbinden, Neuen Agenten, Anmelden
     assert_eq!(r.wizard().step, Step::StationAsk);
     // nothing new came out of the sign-in: said, and the person can try again
     let mut r = Rig::new();
@@ -1147,7 +1389,7 @@ fn an_agent_whose_station_is_set_up_again_keeps_its_rooms() {
 #[test]
 fn the_server_way_sits_behind_mehr_and_says_so() {
     let mut r = Rig::new();
-    r.keys(&[E, Key::Down, E]); // Agent verbinden, Mehr …
+    r.keys(&[Key::Down, E, Key::Down, E]); // Agent verbinden, Mehr …
     assert_eq!(r.wizard().step, Step::Mode);
     let screen = r.screen();
     assert!(
@@ -1186,7 +1428,7 @@ fn the_server_way_sits_behind_mehr_and_says_so() {
 
 /// Into the server way: Agent verbinden, Mehr, the server, then the program (Claude Code).
 fn into_server_way(r: &mut Rig) {
-    r.keys(&[E, Key::Down, E, E, E]);
+    r.keys(&[Key::Down, E, Key::Down, E, E, E]);
     assert_eq!(r.wizard().step, Step::Name);
 }
 
@@ -1195,7 +1437,7 @@ fn names_are_checked_in_the_server_way_before_anything_happens() {
     let mut s = snap();
     s.agents = vec![row("claude")];
     let mut r = Rig::with(s);
-    r.keys(&[Key::Down]); // down to "Agent verbinden"
+    r.keys(&[Key::Down, Key::Down]); // down to "Agent verbinden"
     r.keys(&[E, Key::Down, E, E, E]);
     assert_eq!(r.wizard().step, Step::Name);
     assert_eq!(
@@ -1375,16 +1617,26 @@ fn the_loop_draws_every_screen_within_the_terminal_and_ends_on_q() {
             snap: Some(s.clone()),
             ..Fake::default()
         };
+        // the add screen (list, the hosted page, the name), the wizard and the status, then q
         let keys = [
             Key::Down,
-            Key::Enter,
+            Key::Enter, // Agent hinzufügen
+            Key::Down,
+            Key::Down,
+            Key::Down,
+            Key::Enter, // Gemini (hosted)
+            Key::Esc,
+            Key::Up,
+            Key::Up,
+            Key::Up,
+            Key::Enter, // Claude Code: the name
+            Key::Esc,
             Key::Esc,
             Key::Down,
-            Key::Enter,
+            Key::Enter, // Agent verbinden
             Key::Esc,
-            Key::Enter,
             Key::Down,
-            Key::Enter,
+            Key::Enter, // Status
             Key::Esc,
             Key::Char('q'),
         ];

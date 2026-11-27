@@ -33,10 +33,27 @@ the restrictions of the wake command are all in `station run`, and the preview i
 ## The main screen
 
 The agents on this computer (name, program, where the key comes from, whether the station runs, is paused, or only has a service), then **Agent
-verbinden**, **Status** and **Beenden**. The lists are read again every few seconds.
+hinzufügen**, **Agent verbinden**, **Status** and **Beenden**. The lists are read again every few seconds.
 
 An agent's page offers what fits its state: status of the station, a check of the line to Wave, running the station here (in the foreground; Ctrl-C ends
 it and brings you back), pause / resume, stopping or starting the service, setting up or removing the service, and disconnecting.
+
+## "Agent hinzufügen"
+
+The first entry under the agents. Arrow keys and Enter, German screens, Esc goes back one step:
+
+1. **Kind**: Claude Code, Codex, Grok Build, or Gemini (gehostet). A program that is not installed here says so and how to install it; nothing goes on.
+2. **Name**: a suggestion made of the program and this computer ("Claude Code (box)"), changeable, 1 to 30 characters (Wave keeps 30). The name is
+   only **a suggestion for Wave's page** (`stonewave agent connect --name`, `want.agent_name` in the account); the person confirms the agent there. It
+   is never a right, and the menu reads back what the agent is really called.
+3. **Sign in**: the wizard's sign-in step (see below), with the program and the name chosen. Enter starts `stonewave agent connect --engine <program>
+   --name <name> --no-station --lang de`.
+
+**What it cannot do yet** (as far as the account and Wave offer today): it does not create the agent in Wave. The agent has to exist in Wave as an "own
+agent" (Team, Agent hinzufügen) with its connect window open ("Gerät verbinden", 15 minutes); the account's page offers only those. The screen says
+so before Enter. For **Gemini (gehostet)** the menu says exactly what Wave still lacks and starts nothing: a hosted kind when an agent is made, the
+preparation of the machine the agent runs on, and the Google sign-in done on that machine. The spec of that server part is
+`docs/add-agent-server.md`.
 
 ## The wizard "Agent verbinden"
 

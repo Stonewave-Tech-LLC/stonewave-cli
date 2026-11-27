@@ -144,7 +144,7 @@ The **menu** is a full-screen terminal program (banner with the wave, arrow keys
 through connecting one and setting up its station in a few steps, each saying what it will do before it does it. It only starts the commands below
 (and writes one user service file, shown first), so every check they make stays where it is. The text is German. Without a terminal, with
 `--plain`, with `TERM=dumb` or on a terminal smaller than 50x16, the plain menu is used, in which a script cannot trip over a question.
-How it works, step by step: [docs/menu.md](docs/menu.md).
+How it works, step by step: [docs/menu.md](docs/menu.md). **Agent hinzufügen** (kind, name, sign in) goes as far as the account allows today; what Wave still has to offer (making the agent on the confirmation page, hosted agents) is in [docs/add-agent-server.md](docs/add-agent-server.md).
 
 The **station** keeps one long session per room for the agent and continues it on every wake, instead of starting a fresh run for each mention. A wake
 has no shell and no web, one MCP server (Wave), its own working folder and limits for time, turns, cost and count. Slice 1 supports Claude Code.

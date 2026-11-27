@@ -291,6 +291,7 @@ fn the_menu_opens_on_a_terminal_and_gives_it_back_on_q_and_on_ctrl_c() {
         let mut t = Pty::spawn(menu(&home, &bin, None), 40, 100);
         t.expect("Agent verbinden");
         t.send(DOWN);
+        t.send(DOWN); // "Agent hinzufügen", "Agent verbinden", then Status
         t.send(ENTER);
         t.expect("Status");
         t.expect("Claude Code"); // the status screen lists the engines
@@ -360,6 +361,7 @@ fn the_whole_wizard_for_an_agent_whose_key_lives_in_the_environment() {
     let (wave, seen) = serve();
     let mut t = Pty::spawn(menu(&home, &bin, Some(&wave)), 40, 110);
     t.expect("Agent verbinden");
+    t.send(DOWN); // past "Agent hinzufügen" to "Agent verbinden"
     t.send(ENTER);
     t.expect("Wie kommt der Agent zu Wave?");
     t.send(DOWN);
@@ -499,6 +501,7 @@ fn the_wave_address_is_offered_when_nothing_is_known_and_the_first_agent_can_go_
     let (home, bin) = rig();
     let mut t = Pty::spawn(menu(&home, &bin, None), 40, 110);
     t.expect("Agent verbinden");
+    t.send(DOWN); // past "Agent hinzufügen" to "Agent verbinden"
     t.send(ENTER);
     t.expect("Wie kommt der Agent zu Wave?");
     t.send(DOWN);
@@ -617,6 +620,7 @@ fn the_simple_way_opens_the_browser_and_connects_an_agent_without_asking_for_a_n
     c.env("DISPLAY", ":0").env("STONEWAVE_ACCOUNT_URL", &url);
     let mut t = Pty::spawn(c, 40, 110);
     t.expect("Agent verbinden");
+    t.send(DOWN); // past "Agent hinzufügen" to "Agent verbinden"
     t.send(ENTER);
     t.expect("Wie kommt der Agent zu Wave?");
     t.expect("Neuen Agenten anmelden");
