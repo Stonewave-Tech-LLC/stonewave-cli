@@ -123,6 +123,8 @@ pub struct Source {
 
 #[derive(Clone, Debug)]
 pub struct Finding {
+    /// Stable between runs for the same thing (`storage:disk:/data`, `units:nginx.service`): what a diff of two runs compares.
+    pub key: String,
     pub severity: Severity,
     pub title: String,
     /// Where on the machine, e.g. `systemd · nginx.service`.
@@ -254,7 +256,10 @@ fn file_source(path: &str, text: &str, pred: impl Fn(&str) -> bool) -> (Source, 
     )
 }
 
+// One call per finding; the fields read better in a fixed order than behind a builder.
+#[allow(clippy::too_many_arguments)]
 fn finding(
+    key: String,
     severity: Severity,
     trust: Trust,
     title: String,
@@ -264,6 +269,7 @@ fn finding(
     (source, evidence): (Source, Vec<String>),
 ) -> Finding {
     Finding {
+        key,
         severity,
         title,
         location,
@@ -651,6 +657,7 @@ fn units(p: &dyn Probe) -> Area {
             l.split_whitespace().any(|t| t == name.as_str())
         });
         a.findings.push(finding(
+            format!("units:{name}"),
             Severity::Medium,
             Trust::Measured,
             format!("systemd unit {name} failed"),
@@ -696,6 +703,7 @@ fn reboot(p: &dyn Probe) -> Area {
             description.push_str(&format!(" Packages: {}.", packages.join(", ")));
         }
         a.findings.push(finding(
+            "reboot:required".to_owned(),
             Severity::Medium,
             Trust::Measured,
             "Reboot after updates pending".into(),
@@ -740,6 +748,7 @@ fn updates(p: &dyn Probe, now: u64) -> Area {
         let names: Vec<&str> = security.iter().take(12).map(|r| r.0.as_str()).collect();
         let more = if security.len() > 12 { " ..." } else { "" };
         a.findings.push(finding(
+            "updates:security".to_owned(),
             Severity::High,
             Trust::Measured,
             format!("{} security updates available", security.len()),
@@ -757,6 +766,7 @@ fn updates(p: &dyn Probe, now: u64) -> Area {
         .map(|m| (now - m) / 86_400);
     if let Some(days) = lists_age_days.filter(|d| *d > STALE_LISTS_DAYS) {
         a.findings.push(finding(
+            "updates:lists-stale".to_owned(),
             Severity::Low,
             Trust::Derived,
             format!("Package lists are {days} days old"),
@@ -818,6 +828,7 @@ fn autoupdates(p: &dyn Probe) -> Area {
             ),
         };
         a.findings.push(finding(
+            "autoupdates:off".to_owned(),
             Severity::Medium,
             Trust::Derived,
             "No automatic security updates (unattended-upgrades not active)".into(),
@@ -861,6 +872,7 @@ fn storage(p: &dyn Probe) -> Area {
     for r in &rows {
         if let Some(sev) = disk_severity(r.percent, r.free, r.total) {
             a.findings.push(finding(
+                format!("storage:disk:{}", r.mount),
                 sev,
                 Trust::Measured,
                 format!("{} is {} % full ({} free of {})", r.mount, r.percent, human(r.free), human(r.total)),
@@ -878,6 +890,7 @@ fn storage(p: &dyn Probe) -> Area {
             .and_then(|pct| inode_severity(pct).map(|sev| (pct, sev)))
         {
             a.findings.push(finding(
+                format!("storage:inodes:{}", r.mount),
                 sev,
                 Trust::Measured,
                 format!("{}: {pct} % of the inodes used", r.mount),
@@ -913,6 +926,7 @@ fn storage(p: &dyn Probe) -> Area {
                 };
                 read_only.push(target.clone());
                 a.findings.push(finding(
+                    format!("storage:ro:{target}"),
                     sev,
                     Trust::Measured,
                     format!("{target} is mounted read only (ro)"),
@@ -965,6 +979,7 @@ fn raid(p: &dyn Probe) -> Area {
             .take(MAX_EVIDENCE)
             .collect();
         a.findings.push(finding(
+            format!("raid:degraded:{}", r.name),
             Severity::Critical,
             Trust::Measured,
             format!("Software RAID {} is degraded: a member failed", r.name),
@@ -1079,6 +1094,7 @@ fn smart(p: &dyn Probe, root: bool) -> Area {
             || (out.contains("SMART Health Status:") && !out.contains("SMART Health Status: OK"));
         if failed {
             a.findings.push(finding(
+                format!("smart:failed:{dev}"),
                 Severity::Critical,
                 Trust::Measured,
                 format!("SMART reports FAILED for {dev}"),
@@ -1126,6 +1142,7 @@ fn ports(p: &dyn Probe, root: bool) -> Area {
 
     if !public_keys.is_empty() {
         a.findings.push(finding(
+            "ports:public".to_owned(),
             Severity::Info,
             Trust::Measured,
             format!("{} ports listen on all interfaces", public_keys.len()),
@@ -1153,6 +1170,7 @@ fn ports(p: &dyn Probe, root: bool) -> Area {
             .collect();
         let ports_set: Vec<u16> = sensitive.keys().copied().collect();
         a.findings.push(finding(
+            "ports:sensitive".to_owned(),
             Severity::High,
             Trust::Derived,
             format!("Database or file services on all interfaces: {}", list.join(", ")),
@@ -1222,6 +1240,7 @@ fn finding_json(f: &Finding) -> Value {
         source["lines"] = json!(l);
     }
     json!({
+        "key": f.key,
         "severity": f.severity.as_str(),
         "severity_de": f.severity.hausmeister(),
         "title": f.title,
@@ -1529,6 +1548,7 @@ mod tests {
         // one finding has every field
         let f = &v["checks"][8]["findings"][0];
         for k in [
+            "key",
             "severity",
             "severity_de",
             "title",
@@ -1568,6 +1588,95 @@ mod tests {
         assert!(t.contains("smart"));
         assert!(t.contains("not checked"));
         assert!(t.contains("Highest severity: info"));
+    }
+
+    // ---- keys
+
+    #[test]
+    fn every_finding_has_a_key_that_is_the_same_in_the_next_run_and_unique_within_one() {
+        // a server with something in nearly every check
+        let apt = "Listing...\nopenssl/jammy-updates,jammy-security 3.0.2 amd64 [upgradable from: 3.0.1]\n";
+        let df = "Filesystem Type 1-blocks Used Available Capacity Mounted on\n/dev/sdb1 ext4 10000000000 9700000000 300000000 97% /data\n/dev/sdc1 ext4 10000000000 9500000000 500000000 95% /srv\n";
+        let dfi = "Filesystem Type Inodes IUsed IFree IUse% Mounted on\n/dev/sdb1 ext4 1000 900 100 90% /data\n/dev/sdc1 ext4 1000 100 900 10% /srv\n";
+        let ss = "tcp LISTEN 0 128 0.0.0.0:5432 0.0.0.0:* users:((\"postgres\",pid=1,fd=5))\n";
+        let mut f = root_server()
+            .cmd(
+                UNITS,
+                "nginx.service loaded failed failed x\nold.service loaded failed failed y\n",
+            )
+            .file("/var/run/reboot-required", "")
+            .cmd("apt list --upgradable", apt)
+            .cmd(DF, df)
+            .cmd(DFI, dfi)
+            .cmd(
+                "findmnt -rno TARGET,SOURCE,FSTYPE,OPTIONS",
+                "/ /dev/sda1 ext4 ro\n",
+            )
+            .file(
+                "/proc/mdstat",
+                &format!(
+                    "{MDSTAT_BAD}md1 : active raid1 sdb1[1] sda1[0]\n      10 blocks [2/1] [U_]\n"
+                ),
+            )
+            .cmd("smartctl --scan", "/dev/sda -d sat # x\n")
+            .cmd(
+                "smartctl -H -d sat /dev/sda",
+                "SMART overall-health self-assessment test result: FAILED!\n",
+            )
+            .cmd(SS, ss)
+            .cmd(
+                "stat -c %Y /var/lib/apt/lists",
+                &(NOW - 30 * 86_400).to_string(),
+            );
+        f.files.remove("/usr/bin/unattended-upgrade");
+        let keys = |areas: &[Area]| -> Vec<String> {
+            areas
+                .iter()
+                .flat_map(|a| a.findings.iter().map(|f| f.key.clone()))
+                .collect()
+        };
+        let first = keys(&run(&f));
+        let second = keys(&collect(&f, NOW + 3600).1);
+        assert_eq!(
+            first, second,
+            "the same findings carry the same keys an hour later"
+        );
+        let mut sorted = first.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            first.len(),
+            "unique within one run: {first:?}"
+        );
+        for expected in [
+            "units:nginx.service",
+            "units:old.service",
+            "reboot:required",
+            "updates:security",
+            "updates:lists-stale",
+            "autoupdates:off",
+            "storage:disk:/data",
+            "storage:disk:/srv",
+            "storage:inodes:/data",
+            "storage:ro:/",
+            "raid:degraded:md0",
+            "raid:degraded:md1",
+            "smart:failed:/dev/sda",
+            "ports:public",
+            "ports:sensitive",
+        ] {
+            assert!(
+                first.iter().any(|k| k == expected),
+                "{expected} in {first:?}"
+            );
+        }
+        // and the count in the title does not move the key
+        let one_more = apt.to_owned()
+            + "curl/jammy-updates,jammy-security 7.81 amd64 [upgradable from: 7.80]\n";
+        let f2 = healthy().cmd("apt list --upgradable", &one_more);
+        let k = keys(&run(&f2));
+        assert!(k.contains(&"updates:security".to_owned()));
     }
 
     // ---- units

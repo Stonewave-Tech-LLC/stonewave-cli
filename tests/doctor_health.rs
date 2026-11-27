@@ -63,6 +63,10 @@ fn one_json_object_in_the_fixed_schema() {
                 "a finding without a source: {f}"
             );
             assert!(
+                f["key"].as_str().is_some_and(|k| k.contains(':')),
+                "a finding without a key: {f}"
+            );
+            assert!(
                 ["critical", "high", "medium", "low", "info"]
                     .contains(&f["severity"].as_str().unwrap())
             );
